@@ -47,8 +47,36 @@ SUIT_DISPLAY = {
 # PARAMÈTRES COMPTEUR2
 # ============================================================================
 
-COMPTEUR2_SEUIL_B_DEFAULT = 2
+COMPTEUR2_SEUIL_B_DEFAULT = 5
 COMPTEUR2_ACTIVE_DEFAULT  = True
+
+# ============================================================================
+# PARAMÈTRE DF — DÉCALAGE DE PRÉDICTION
+# Quand le jeu N se termine → bot prédit le jeu N+df
+# df=1 par défaut (prédit le jeu suivant immédiatement après la fin du jeu N)
+# ============================================================================
+PREDICTION_DF_DEFAULT = 1
+
+# ============================================================================
+# COMPTEUR9 — ACCUMULATION PAR HEURE + PRÉDICTION SUR ÉCART (SS)
+# Compte les cartes joueur (carte à carte) depuis le dernier reset horaire.
+# Quand count_A - count_B >= SS → prédit le costume B (le plus faible).
+# Reset automatique à chaque heure pile (HH:00:00).
+# ============================================================================
+COMPTEUR9_SS_DEFAULT = 8         # Seuil d'écart entre deux costumes pour prédire
+
+# ============================================================================
+# COMPTEUR8 — ABSENCES CONSÉCUTIVES (miroir exact du Compteur7 pour les absences)
+# Seuil unique : enregistre et notifie quand la série d'absences se TERMINE avec ≥ seuil
+# Même logique que C7 : C7 compte les présences ≥5, C8 compte les absences ≥5
+# ============================================================================
+COMPTEUR8_THRESHOLD = 5          # seuil unique : comme COMPTEUR7_THRESHOLD
+COMPTEUR8_DATA_FILE = 'compteur8_data.json'
+
+# ============================================================================
+# COMPTEUR9 — PRÉDICTIONS SILENCIEUSES (persistance)
+# ============================================================================
+COMPTEUR9_DATA_FILE = 'compteur9_data.json'   # historique des prédictions silencieuses
 
 # ============================================================================
 # PARAMÈTRES DE SÉCURITÉ
