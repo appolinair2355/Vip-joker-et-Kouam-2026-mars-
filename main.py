@@ -10,14 +10,18 @@ from typing import List, Optional, Dict, Set, Tuple
 from datetime import datetime, timedelta
 from telethon import TelegramClient, events, utils
 from telethon.sessions import StringSession
-from telethon.errors import ChatWriteForbiddenError, UserBannedInChannelError
+from telethon.errors import (
+    ChatWriteForbiddenError, UserBannedInChannelError,
+    AuthKeyError, SessionExpiredError, UserDeactivatedBanError
+)
+import aiohttp as _aiohttp
 from aiohttp import web
 from fpdf import FPDF
 
 from config import (
     API_ID, API_HASH, BOT_TOKEN, ADMIN_ID,
-    PREDICTION_CHANNEL_ID, PORT,
-    ALL_SUITS, SUIT_DISPLAY
+    PREDICTION_CHANNEL_ID, PORT, RENDER_EXTERNAL_URL,
+    ALL_SUITS, SUIT_DISPLAY, API_SILENCE_ALERT_MINUTES
 )
 from api_utils import get_latest_results
 from parole import get_parole
@@ -49,6 +53,10 @@ last_prediction_time: Optional[datetime] = None
 prediction_channel_ok = False
 client = None
 suit_block_until: Dict[str, datetime] = {}
+
+# Suivi santé API 1xBet
+last_api_success_time: Optional[datetime] = None
+api_silence_alerted: bool = False  # évite de spammer l'admin
 
 # Historique API des jeux
 game_history: Dict[int, dict] = {}
@@ -2652,15 +2660,20 @@ async def process_game_result(game_number: int, player_suits: Set[str], player_c
     if game_number > current_game_number:
         current_game_number = game_number
 
-    # Vérification dynamique des prédictions
+    # Vérification dynamique des prédictions (TOUJOURS — même partie en cours)
     # Victoire immédiate si costume trouvé, échec seulement si partie terminée
     await check_prediction_result(game_number, player_suits, is_finished)
 
-    # Traiter la file d'attente
+    # Traiter la file d'attente (TOUJOURS — le numéro courant doit être connu)
     await process_prediction_queue(game_number)
 
-    # Comptabilisation (une seule fois par jeu)
-    if game_number not in processed_games:
+    # ─────────────────────────────────────────────────────────────────────────
+    # COMPTEURS : uniquement quand la partie joueur est TERMINÉE (is_finished=True)
+    # Raison : les compteurs basent les prédictions sur la main complète du joueur.
+    # Compter sur une main incomplète (1 seule carte visible) fausserait les seuils
+    # et déclencherait des prédictions sur des données partielles.
+    # ─────────────────────────────────────────────────────────────────────────
+    if is_finished and game_number not in processed_games:
         processed_games.add(game_number)
 
         add_to_history(game_number, player_suits)
@@ -2719,7 +2732,7 @@ async def process_game_result(game_number: int, player_suits: Set[str], player_c
 
 async def api_polling_loop():
     """Boucle principale: interroge l'API 1xBet et traite les résultats."""
-    global game_history, game_result_cache
+    global game_history, game_result_cache, last_api_success_time, api_silence_alerted
 
     logger.info("🔄 Démarrage boucle de polling API (toutes les 4s)...")
     loop = asyncio.get_event_loop()
@@ -2729,6 +2742,8 @@ async def api_polling_loop():
             results = await loop.run_in_executor(None, get_latest_results)
 
             if results:
+                last_api_success_time = datetime.now()
+                api_silence_alerted = False  # réinitialiser l'alerte si l'API répond
                 for result in results:
                     game_number = result['game_number']
                     player_cards = result.get('player_cards', [])
@@ -2851,9 +2866,10 @@ async def auto_watchdog_task():
     Détecte et débloque automatiquement :
       1. Prédictions bloquées au-delà de 15 min (sécurité post-timeout)
       2. Tous les costumes bloqués simultanément (suit_block_until)
-      3. Notifie l'admin à chaque déblocage automatique
+      3. API 1xBet silencieuse depuis trop longtemps → alerte admin
+      4. Notifie l'admin à chaque action
     """
-    global pending_predictions, suit_block_until, prediction_queue
+    global pending_predictions, suit_block_until, prediction_queue, api_silence_alerted
     from config import PREDICTION_TIMEOUT_MINUTES, FORCE_RESTART_THRESHOLD
 
     HARD_TIMEOUT = max(PREDICTION_TIMEOUT_MINUTES + 5, 15)  # 15 min minimum
@@ -2896,17 +2912,51 @@ async def auto_watchdog_task():
                 actions.append("🔓 Tous les costumes étaient bloqués — déblocage forcé")
                 logger.warning("⚠️ Watchdog: tous les costumes bloqués → déblocage automatique")
 
-            # ── 3. Notification admin ────────────────────────────────────────
+            # ── 3. API 1xBet silencieuse (bloquée par le datacenter) ─────────
+            if last_api_success_time is not None and not api_silence_alerted:
+                silence_min = (now - last_api_success_time).total_seconds() / 60
+                if silence_min >= API_SILENCE_ALERT_MINUTES:
+                    api_silence_alerted = True
+                    actions.append(
+                        f"⚠️ API 1xBet silencieuse depuis {int(silence_min)} min\n"
+                        f"Cause probable : IP du serveur bloquée par 1xBet.\n"
+                        f"Le bot fonctionne mais ne reçoit plus de données de jeu."
+                    )
+                    logger.error(f"❌ Watchdog: API 1xBet muette depuis {int(silence_min)} min")
+
+            # ── 4. Notification admin ────────────────────────────────────────
             if actions and ADMIN_ID:
                 try:
                     admin_entity = await client.get_entity(ADMIN_ID)
-                    msg = "🤖 **WATCHDOG — Déblocage automatique**\n\n" + "\n".join(actions)
+                    msg = "🤖 **WATCHDOG — Alerte automatique**\n\n" + "\n".join(actions)
                     await client.send_message(admin_entity, msg, parse_mode='markdown')
                 except Exception as e:
                     logger.warning(f"Watchdog: impossible de notifier admin: {e}")
 
         except Exception as e:
             logger.error(f"❌ Erreur watchdog: {e}")
+
+
+async def keep_alive_task():
+    """
+    Anti-spin-down pour Render.com (plan gratuit).
+    Ping le propre endpoint /health toutes les 4 minutes pour maintenir le service actif.
+    Utilise RENDER_EXTERNAL_URL si disponible, sinon localhost.
+    """
+    ping_url = f"{RENDER_EXTERNAL_URL}/health" if RENDER_EXTERNAL_URL else f"http://localhost:{PORT}/health"
+    logger.info(f"💓 Keep-alive démarré → {ping_url} (toutes les 4 min)")
+
+    while True:
+        await asyncio.sleep(240)  # 4 minutes
+        try:
+            async with _aiohttp.ClientSession() as session:
+                async with session.get(ping_url, timeout=_aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status == 200:
+                        logger.debug("💓 Keep-alive OK")
+                    else:
+                        logger.warning(f"⚠️ Keep-alive: status {resp.status}")
+        except Exception as e:
+            logger.debug(f"Keep-alive ping ignoré: {e}")
 
 async def perform_full_reset(reason: str):
     global pending_predictions, last_prediction_time
@@ -4623,7 +4673,15 @@ async def start_bot():
     global client, prediction_channel_ok
 
     session = os.getenv('TELEGRAM_SESSION', '')
-    client = TelegramClient(StringSession(session), API_ID, API_HASH)
+    client = TelegramClient(
+        StringSession(session),
+        API_ID,
+        API_HASH,
+        connection_retries=10,
+        retry_delay=3,
+        auto_reconnect=True,
+        request_retries=5,
+    )
 
     try:
         await client.start(bot_token=BOT_TOKEN)
@@ -4647,6 +4705,10 @@ async def start_bot():
         logger.info("🤖 Bot démarré")
         return True
 
+    except (AuthKeyError, SessionExpiredError) as e:
+        logger.error(f"❌ Session Telegram invalide ou expirée: {e}")
+        logger.error("❌ La variable TELEGRAM_SESSION doit être régénérée sur ce serveur.")
+        return False
     except Exception as e:
         logger.error(f"❌ Erreur démarrage: {e}")
         return False
@@ -4678,6 +4740,7 @@ async def main():
                 asyncio.create_task(auto_reset_system())
                 asyncio.create_task(_api_polling_guardian())   # guardian redémarre si crash
                 asyncio.create_task(auto_watchdog_task())      # watchdog déblocage automatique
+                asyncio.create_task(keep_alive_task())         # anti spin-down Render.com
                 asyncio.create_task(bilan_loop())
                 asyncio.create_task(mode_emploi_loop())
                 background_started = True
@@ -4686,6 +4749,8 @@ async def main():
             logger.info(f"📡 Source: 1xBet API (polling toutes les 4s)")
             logger.info(f"📊 Compteur4 seuil: {COMPTEUR4_THRESHOLD}")
             logger.info(f"⏰ Restriction horaire: {'ACTIVE' if PREDICTION_HOURS else 'INACTIVE (24h/24)'}")
+            if RENDER_EXTERNAL_URL:
+                logger.info(f"🌐 Render URL: {RENDER_EXTERNAL_URL}")
 
             retry_delay = 5   # reset après connexion réussie
             await client.run_until_disconnected()
@@ -4694,6 +4759,18 @@ async def main():
         except KeyboardInterrupt:
             logger.info("Arrêt manuel demandé.")
             break
+        except (AuthKeyError, SessionExpiredError) as e:
+            logger.error(f"❌ Session Telegram invalide: {e}")
+            logger.error("❌ TELEGRAM_SESSION invalide sur ce serveur — arrêt définitif.")
+            if ADMIN_ID:
+                try:
+                    await client.send_message(ADMIN_ID,
+                        "🚨 **BOT ARRÊTÉ** — Session Telegram invalide.\n"
+                        "La variable `TELEGRAM_SESSION` doit être régénérée.",
+                        parse_mode='markdown')
+                except Exception:
+                    pass
+            break  # session invalide → inutile de réessayer
         except Exception as e:
             logger.error(f"❌ Erreur boucle principale: {e} — reconnexion dans {retry_delay}s")
 
