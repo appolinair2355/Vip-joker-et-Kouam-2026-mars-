@@ -50,6 +50,12 @@ suit_block_until: Dict[str, datetime] = {}
 
 # Historique API des jeux
 game_history: Dict[int, dict] = {}
+
+# Cache live : stocke TOUS les jeux (en cours + terminés) tels que retournés par l'API.
+# Mis à jour à chaque poll ; sert de filet de sécurité pour les rattrapages.
+# Nettoyé automatiquement après vérification ou quand le cache dépasse 200 entrées.
+game_result_cache: Dict[int, dict] = {}
+
 processed_games: Set[int] = set()  # Jeux déjà comptabilisés (compteur2, compteur4)
 prediction_checked_games: Set[int] = set()  # Jeux dont les prédictions ont été vérifiées
 
@@ -120,7 +126,7 @@ compteur1_history: List[Dict] = []
 MIN_CONSECUTIVE_FOR_STATS = 3
 
 # Gestion des écarts entre prédictions
-MIN_GAP_BETWEEN_PREDICTIONS = 3
+MIN_GAP_BETWEEN_PREDICTIONS = 4
 last_prediction_number_sent = 0
 
 # Historiques
@@ -1537,6 +1543,13 @@ def format_prediction_message(game_number: int, suit: str, status: str = 'en_cou
             f"❌ **Statut:** PERDU 😭"
         )
 
+    elif status == 'expirée_api':
+        return (
+            f"⚠️ **PRÉDICTION #{game_number}**\n\n"
+            f"🎯 **Couleur:** {suit_display}\n"
+            f"🔌 **Statut:** EXPIRÉ — jeu sauté par l'API"
+        )
+
     return ""
 
 async def send_prediction_to_channel(channel_id: int, game_number: int, suit: str,
@@ -1672,6 +1685,9 @@ async def update_prediction_message(game_number: int, status: str, rattrapage: i
 
     if 'gagne' in status:
         logger.info(f"✅ Gagné: #{game_number} (R{rattrapage})")
+    elif status == 'expirée_api':
+        # Jeu sauté par l'API : pas de pénalité (ni blocage costume, ni B incrémenté)
+        logger.warning(f"🔌 Prédiction #{game_number} expirée — jeu sauté par l'API (R{rattrapage})")
     else:
         logger.info(f"❌ Perdu: #{game_number}")
         block_suit(suit, 5)
@@ -1748,80 +1764,122 @@ async def check_prediction_result(game_number: int, player_suits: Set[str], is_f
     Vérifie les prédictions en attente contre les cartes joueur.
     - Victoire immédiate si le costume est trouvé (même partie non finie).
     - Échec (rattrapage) uniquement quand la partie est terminée (is_finished=True).
+    - Catch-up : si le jeu attendu a été sauté par l'API, on récupère depuis l'historique.
     """
+    found = False
 
-    # Vérification directe (game_number == numéro prédit)
+    # ─── Vérification directe (rattrapage=0, game_number == numéro prédit) ───
     if game_number in pending_predictions:
         pred = pending_predictions[game_number]
-        if pred['status'] != 'en_cours':
-            return False
-        target_suit = pred['suit']
+        if pred['status'] == 'en_cours':
+            target_suit = pred['suit']
 
-        # Ne pas re-vérifier si déjà finalisé pour ce jeu
-        if game_number in pred['verified_games']:
-            return False
+            if game_number not in pred['verified_games']:
+                logger.info(f"🔍 Vérif #{game_number} (fini={is_finished}): {target_suit} dans {player_suits}?")
 
-        logger.info(f"🔍 Vérif #{game_number} (fini={is_finished}): {target_suit} dans {player_suits}?")
+                if target_suit in player_suits:
+                    # ✅ Costume trouvé → victoire immédiate
+                    pred['verified_games'].append(game_number)
+                    await update_prediction_message(game_number, 'gagne', 0)
+                    update_prediction_in_history(game_number, target_suit, game_number, 0, 'gagne_r0')
+                    found = True
+                elif is_finished:
+                    # ❌ Partie terminée sans le costume → passer au rattrapage R1
+                    pred['verified_games'].append(game_number)
+                    pred['rattrapage'] = 1
+                    next_check = game_number + 1
+                    logger.info(f"❌ #{game_number} terminé sans {target_suit}, attente R1 #{next_check}")
+                    await update_prediction_progress(game_number, next_check)
+                else:
+                    # ⏳ Partie en cours, costume pas encore là → re-vérifier au prochain poll
+                    logger.debug(f"⏳ #{game_number} en cours, {target_suit} pas encore là")
 
-        if target_suit in player_suits:
-            # ✅ Costume trouvé → victoire immédiate
-            pred['verified_games'].append(game_number)
-            await update_prediction_message(game_number, 'gagne', 0)
-            update_prediction_in_history(game_number, target_suit, game_number, 0, 'gagne_r0')
-            return True
-        elif is_finished:
-            # ❌ Partie terminée, costume absent → passer au rattrapage
-            pred['verified_games'].append(game_number)
-            pred['rattrapage'] = 1
-            next_check = game_number + 1
-            logger.info(f"❌ #{game_number} terminé sans {target_suit}, attente #{next_check}")
-            await update_prediction_progress(game_number, next_check)
-            return False
-        else:
-            # ⏳ Partie en cours, costume pas encore là → on re-vérifiera au prochain poll
-            logger.debug(f"⏳ #{game_number} en cours, {target_suit} absent pour l'instant")
-            return False
-
-    # Vérification rattrapage
+    # ─── Vérification rattrapage (R1/R2/R3) ──────────────────────────────────
     for original_game, pred in list(pending_predictions.items()):
         if pred['status'] != 'en_cours':
             continue
-        target_suit = pred['suit']
         rattrapage = pred.get('rattrapage', 0)
+        if rattrapage == 0:
+            continue  # Géré dans la section directe ci-dessus
+
+        target_suit  = pred['suit']
         expected_game = original_game + rattrapage
 
-        if game_number == expected_game and rattrapage > 0:
-            if game_number in pred['verified_games']:
-                return False
+        # Ignorer les jeux antérieurs au jeu attendu
+        if game_number < expected_game:
+            continue
 
-            logger.info(f"🔍 Vérif R{rattrapage} #{game_number} (fini={is_finished}): {target_suit} dans {player_suits}?")
+        # ── Catch-up : le jeu attendu a peut-être été sauté par l'API ──
+        # On cherche d'abord dans game_result_cache (cache live), puis game_history (terminés).
+        check_game       = expected_game
+        check_suits      = player_suits
+        check_finished   = is_finished
+        api_skipped      = False   # True si le jeu attendu est introuvable dans les deux caches
 
-            if target_suit in player_suits:
-                # ✅ Costume trouvé → victoire immédiate
-                pred['verified_games'].append(game_number)
-                await update_prediction_message(original_game, 'gagne', rattrapage)
-                update_prediction_in_history(original_game, target_suit, game_number, rattrapage, f'gagne_r{rattrapage}')
-                return True
-            elif is_finished:
-                # ❌ Partie terminée, costume absent → rattrapage suivant ou perdu
-                pred['verified_games'].append(game_number)
-                if rattrapage < 3:
-                    pred['rattrapage'] = rattrapage + 1
-                    next_check = original_game + rattrapage + 1
-                    logger.info(f"❌ R{rattrapage} terminé sans {target_suit}, attente #{next_check}")
-                    await update_prediction_progress(original_game, next_check)
-                    return False
-                else:
-                    logger.info(f"❌ R3 terminé sans {target_suit}, prédiction perdue")
-                    await update_prediction_message(original_game, 'perdu', 3)
-                    update_prediction_in_history(original_game, target_suit, game_number, 3, 'perdu')
-                    return False
+        if game_number > expected_game and expected_game not in pred['verified_games']:
+            # 1. Cache live (game_result_cache) — priorité maximale
+            cached = game_result_cache.get(expected_game)
+            if cached and cached.get('is_finished', False):
+                check_suits    = get_player_suits(cached.get('player_cards', []))
+                check_finished = True
+                logger.info(f"🔁 Catch-up R{rattrapage}: #{expected_game} récupéré depuis cache live")
             else:
-                # ⏳ Partie en cours, costume pas encore là → on attend
-                logger.debug(f"⏳ R{rattrapage} #{game_number} en cours, {target_suit} absent pour l'instant")
-                return False
+                # 2. Historique terminés (game_history)
+                hist = game_history.get(expected_game)
+                if hist and hist.get('is_finished', False):
+                    check_suits    = get_player_suits(hist.get('player_cards', []))
+                    check_finished = True
+                    logger.info(f"🔁 Catch-up R{rattrapage}: #{expected_game} récupéré depuis historique")
+                else:
+                    # Jeu introuvable dans les deux caches → API a sauté ce jeu
+                    api_skipped = True
+                    logger.warning(f"🔌 Catch-up R{rattrapage}: #{expected_game} introuvable — API sautée")
 
-    return False
+        # Ne pas re-traiter si ce jeu de vérification est déjà enregistré
+        if check_game in pred['verified_games']:
+            continue
+
+        # ── Jeu sauté par l'API : marquer EXPIRÉ et passer à la suite ──────
+        if api_skipped:
+            pred['verified_games'].append(expected_game)
+            await update_prediction_message(original_game, 'expirée_api', rattrapage)
+            update_prediction_in_history(original_game, target_suit, expected_game, rattrapage, 'expirée_api')
+            # Nettoyer les entrées de cache devenues inutiles
+            game_result_cache.pop(expected_game, None)
+            found = True
+            continue
+
+        logger.info(f"🔍 Vérif R{rattrapage} #{check_game} (fini={check_finished}): {target_suit} dans {check_suits}?")
+
+        if target_suit in check_suits:
+            # ✅ Statut final : GAGNÉ → nettoyer le cache de ce jeu
+            pred['verified_games'].append(check_game)
+            await update_prediction_message(original_game, 'gagne', rattrapage)
+            update_prediction_in_history(original_game, target_suit, check_game, rattrapage, f'gagne_r{rattrapage}')
+            game_result_cache.pop(check_game, None)   # nettoyage cache — statut final trouvé
+            found = True
+
+        elif check_finished:
+            pred['verified_games'].append(check_game)
+            if rattrapage < 3:
+                # Intermédiaire : passage au rattrapage suivant — cache conservé
+                pred['rattrapage'] = rattrapage + 1
+                next_check = original_game + rattrapage + 1
+                logger.info(f"❌ R{rattrapage} terminé sans {target_suit}, attente R{rattrapage+1} #{next_check}")
+                await update_prediction_progress(original_game, next_check)
+            else:
+                # ❌ Statut final : PERDU R3 → nettoyer le cache de ce jeu
+                logger.info(f"❌ R3 terminé sans {target_suit}, prédiction PERDUE #{original_game}")
+                await update_prediction_message(original_game, 'perdu', 3)
+                update_prediction_in_history(original_game, target_suit, check_game, 3, 'perdu')
+                game_result_cache.pop(check_game, None)   # nettoyage cache — statut final trouvé
+                found = True
+
+        else:
+            # ⏳ Partie en cours, costume pas encore là → re-vérifier au prochain poll
+            logger.debug(f"⏳ R{rattrapage} #{check_game} en cours, {target_suit} pas encore là")
+
+    return found
 
 # ============================================================================
 # GESTION DE LA FILE D'ATTENTE
@@ -2198,7 +2256,7 @@ async def process_game_result(game_number: int, player_suits: Set[str], player_c
 
 async def api_polling_loop():
     """Boucle principale: interroge l'API 1xBet et traite les résultats."""
-    global game_history
+    global game_history, game_result_cache
 
     logger.info("🔄 Démarrage boucle de polling API (toutes les 4s)...")
     loop = asyncio.get_event_loop()
@@ -2221,11 +2279,27 @@ async def api_polling_loop():
 
                     is_finished = result.get('is_finished', False)
 
-                    # Mettre à jour l'historique
+                    # Mettre à jour l'historique (jeux terminés uniquement)
                     game_history[game_number] = result
+
+                    # ── Cache live : stocker TOUS les jeux (en cours + terminés) ──
+                    # Un jeu terminé ne régresse jamais → on ne remplace pas is_finished=True
+                    existing = game_result_cache.get(game_number, {})
+                    if not existing.get('is_finished', False):
+                        game_result_cache[game_number] = {
+                            'player_cards': player_cards,
+                            'player_suits': player_suits,
+                            'is_finished': is_finished,
+                        }
 
                     # Victoire immédiate si costume trouvé, échec seulement si partie terminée
                     await process_game_result(game_number, player_suits, player_cards, is_finished)
+
+                # ── Nettoyage du cache live : conserver au max 200 entrées ──
+                if len(game_result_cache) > 200:
+                    cutoff = sorted(game_result_cache.keys())[:-150]  # garder les 150 plus récents
+                    for k in cutoff:
+                        game_result_cache.pop(k, None)
 
                 # Garder l'historique propre (max 500 jeux)
                 if len(game_history) > 500:
@@ -2287,7 +2361,7 @@ async def perform_full_reset(reason: str):
     global pending_predictions, last_prediction_time
     global last_prediction_number_sent, compteur2_trackers, prediction_queue
     global compteur1_trackers, compteur1_history, processed_games, prediction_checked_games
-    global compteur2_seuil_B_per_suit, compteur2_seuil_B
+    global compteur2_seuil_B_per_suit, compteur2_seuil_B, game_result_cache
 
     stats = len(pending_predictions)
     queue_stats = len(prediction_queue)
@@ -2313,6 +2387,7 @@ async def perform_full_reset(reason: str):
     prediction_queue.clear()
     processed_games.clear()
     prediction_checked_games.clear()
+    game_result_cache.clear()
     last_prediction_time = None
     last_prediction_number_sent = 0
     suit_block_until.clear()
