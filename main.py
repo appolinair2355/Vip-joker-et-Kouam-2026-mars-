@@ -3385,13 +3385,35 @@ def get_compteur2_ready_predictions(current_game: int) -> List[tuple]:
         tracker = compteur2_trackers[suit]
         b = compteur2_seuil_B_per_suit.get(suit, compteur2_seuil_B)
         if tracker.check_threshold(b):
-            pred_number = current_game + PREDICTION_DF
-            start_game = tracker.last_increment_game - (tracker.counter - 1)
+            pred_number  = current_game + PREDICTION_DF
+            start_game   = tracker.last_increment_game - (tracker.counter - 1)
             suit_display = SUIT_DISPLAY.get(suit, suit)
+
+            # Contexte C6 : état de l'inverse au moment du déclenchement
+            opposite     = COMPTEUR6_PAIRS.get(suit, '')
+            c6_count     = compteur6_trackers.get(opposite, 0)
+            c6_wj        = compteur6_seuil_Wj
+            opp_display  = SUIT_DISPLAY.get(opposite, opposite)
+
+            if opposite:
+                if c6_count >= c6_wj:
+                    c6_line = (
+                        f"C6: l'inverse ({opp_display}) est a {c6_count}/{c6_wj} "
+                        f"(seuil Wj atteint) => le manquant {suit_display} est confirme."
+                    )
+                else:
+                    c6_line = (
+                        f"C6: l'inverse ({opp_display}) est a seulement {c6_count}/{c6_wj} "
+                        f"(seuil Wj non atteint) => l'inverse {opp_display} sera predit a la place."
+                    )
+            else:
+                c6_line = "C6: pas de paire definie pour ce costume."
+
             reason = (
                 f"Du jeu #{start_game} au jeu #{tracker.last_increment_game}, "
                 f"{suit_display} etait absent {tracker.counter} fois de suite "
-                f"(seuil B={b}). Prediction lancee pour le jeu #{pred_number}."
+                f"(seuil B={b}). Prediction lancee pour le jeu #{pred_number}. "
+                f"{c6_line}"
             )
             ready.append((suit, pred_number, reason))
             tracker.reset(current_game)
@@ -3436,16 +3458,7 @@ async def send_bilan_and_reset_at_1440():
         f"Bilan sur **{total_finalized}** prédiction(s) finalisées.\n"
         f"Le bot repart à neuf dans 20 secondes.\n\n"
     )
-    # Envoi du bilan dans le canal de prédiction
-    try:
-        canal_entity = await resolve_channel(PREDICTION_CHANNEL_ID)
-        if canal_entity:
-            await client.send_message(canal_entity, header + txt, parse_mode='markdown')
-            logger.info("📊 Bilan #1440 envoyé dans le canal de prédiction.")
-    except Exception as e:
-        logger.error(f"❌ Erreur envoi bilan #1440 canal: {e}")
-
-    # Envoi du bilan également à l'administrateur (chat privé)
+    # Bilan #1440 → admin uniquement (chat privé)
     if ADMIN_ID and ADMIN_ID != 0:
         try:
             admin_entity = await client.get_entity(ADMIN_ID)
@@ -5175,6 +5188,19 @@ async def cmd_debloquer(event):
 # RAISON PDF
 # ============================================================================
 
+def pdf_safe(text: str) -> str:
+    """Remplace les symboles de costumes (hors Latin-1) par leur nom texte pour FPDF/Helvetica."""
+    subs = [
+        ('♠️', 'Pique'),  ('❤️', 'Coeur'),  ('♦️', 'Carreau'), ('♣️', 'Trefle'),
+        ('♠', 'Pique'),   ('❤', 'Coeur'),   ('♦', 'Carreau'),  ('♣', 'Trefle'),
+        ('♥', 'Coeur'),   ('\ufe0f', ''),
+        ('Cœur', 'Coeur'), ('Trèfle', 'Trefle'),
+    ]
+    for old, new in subs:
+        text = text.replace(old, new)
+    return text
+
+
 def generate_raison_pdf() -> bytes:
     """Génère un PDF tableau récapitulatif complet des prédictions avec raisons."""
     from collections import Counter as _Counter
@@ -5251,8 +5277,8 @@ def generate_raison_pdf() -> bytes:
         jeu_str  = f"#{pred['predicted_game']}"
         suit_nm  = suit_names.get(suit, suit)
         cptr_str = 'C2' if pred.get('type') == 'compteur2' else 'Auto'
-        reason   = pred.get('reason', '') or '-'
-        reason_s = reason[:52] + ('…' if len(reason) > 52 else '')
+        reason   = pdf_safe(pred.get('reason', '') or '-')
+        reason_s = reason[:52] + ('...' if len(reason) > 52 else '')
         stat_lbl = status_labels.get(status, status)
         ratk     = pred.get('rattrapage_level', 0)
         rat_str  = f"R{ratk}" if ratk else 'R0'
@@ -5354,7 +5380,7 @@ def generate_raison_pdf() -> bytes:
 
         for pred in long_preds:
             suit   = pred.get('suit', '?')
-            reason = pred.get('reason', '') or '-'
+            reason = pdf_safe(pred.get('reason', '') or '-')
             jeu    = pred['predicted_game']
             status = pred.get('status', 'en_cours')
             sr, sg, sb = suit_colors.get(suit, (0,0,0))
@@ -5521,7 +5547,7 @@ async def cmd_bilan(event):
             f"Statut: **{status}**\n"
             f"Fréquence: **toutes les 4h pile** (00h, 04h, 08h, 12h, 16h, 20h)\n\n"
             f"**Usage:**\n"
-            f"`/bilan now` — Envoyer le bilan immédiatement dans le canal\n"
+            f"`/bilan now` — Envoyer le bilan immédiatement dans votre chat privé\n"
             f"`/bilan 0` — Désactiver l'envoi automatique\n"
             f"`/bilan on` — Réactiver l'envoi automatique\n\n"
             + get_bilan_text(),
@@ -5531,10 +5557,13 @@ async def cmd_bilan(event):
     arg = parts[1].strip()
     if arg == 'now':
         txt = get_bilan_text()
-        entity = await resolve_channel(PREDICTION_CHANNEL_ID)
-        if entity:
-            await client.send_message(entity, txt, parse_mode='markdown')
-        await event.respond("✅ Bilan envoyé dans le canal.")
+        if ADMIN_ID and ADMIN_ID != 0:
+            try:
+                admin_entity = await client.get_entity(ADMIN_ID)
+                await client.send_message(admin_entity, txt, parse_mode='markdown')
+            except Exception as e:
+                logger.error(f"❌ Bilan now admin: {e}")
+        await event.respond("✅ Bilan envoyé dans votre chat privé.")
         return
     if arg == 'on':
         bilan_interval_hours = 4
