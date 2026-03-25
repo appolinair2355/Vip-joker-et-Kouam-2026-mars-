@@ -4,6 +4,7 @@ import re
 import logging
 import sys
 import io
+import json
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Set, Tuple
 from datetime import datetime, timedelta
@@ -19,6 +20,7 @@ from config import (
     ALL_SUITS, SUIT_DISPLAY
 )
 from api_utils import get_latest_results
+from parole import get_parole
 
 logging.basicConfig(
     level=logging.INFO,
@@ -186,9 +188,16 @@ def format_hours_config() -> str:
 # ============================================================================
 
 COMPTEUR4_THRESHOLD = 10  # Seuil d'absences consécutives
+COMPTEUR4_DATA_FILE  = 'compteur4_data.json'  # Persistant entre resets (comme C7)
 compteur4_trackers: Dict[str, int] = {'♠': 0, '♥': 0, '♦': 0, '♣': 0}
-compteur4_events: List[Dict] = []  # Événements enregistrés
+compteur4_events: List[Dict] = []  # Événements terminés persistants
 compteur4_pdf_msg_id: Optional[int] = None  # ID du message PDF envoyé à l'admin
+
+# État courant de la série d'absences (pour suivre debut_game, comme C7)
+compteur4_current: Dict[str, dict] = {
+    suit: {'count': 0, 'start_game': None, 'start_time': None, 'alerted': False}
+    for suit in ('♠', '♥', '♦', '♣')
+}
 
 # ============================================================================
 # SYSTÈME COMPTEUR5 - PRÉSENCES CONSÉCUTIVES DE 10+
@@ -213,8 +222,27 @@ COMPTEUR6_PAIRS: Dict[str, str] = {             # Paires inverses
     '♣': '♥', '♥': '♣',
 }
 
+# ============================================================================
+# SYSTÈME COMPTEUR7 — SÉRIES CONSÉCUTIVES (MIN 5) — PERSISTANT ENTRE RESETS
+# ============================================================================
+COMPTEUR7_THRESHOLD = 5                          # Seuil minimum de présences consécutives
+COMPTEUR7_DATA_FILE = 'compteur7_data.json'      # Fichier persistant (survit aux resets)
+HOURLY_DATA_FILE    = 'hourly_suit_data.json'    # Données horaires pour /comparaison
+
+# État courant : pour chaque costume, série en cours
+compteur7_current: Dict[str, dict] = {
+    suit: {'count': 0, 'start_game': None, 'start_time': None}
+    for suit in ('♠', '♥', '♦', '♣')
+}
+compteur7_completed: List[Dict] = []             # Séries terminées (≥ seuil), persistantes
+compteur7_pdf_msg_id: Optional[int] = None       # ID du dernier PDF envoyé à l'admin
+
+# Données horaires cumulées pour /comparaison (heure→costume→nb)
+hourly_suit_data:  Dict[int, Dict[str, int]] = {h: {'♠': 0, '♥': 0, '♦': 0, '♣': 0} for h in range(24)}
+hourly_game_count: Dict[int, int]            = {h: 0 for h in range(24)}
+
 def generate_compteur4_pdf(events_list: List[Dict]) -> bytes:
-    """Génère un PDF avec le tableau des écarts Compteur4."""
+    """Génère un PDF avec le tableau des écarts Compteur4 (format série comme C7)."""
     suit_names_map = {'♠': 'Pique', '♥': 'Coeur', '♦': 'Carreau', '♣': 'Trefle'}
     suit_colors = {
         '♠': (30, 30, 30),
@@ -227,11 +255,10 @@ def generate_compteur4_pdf(events_list: List[Dict]) -> bytes:
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
 
-    # Titre
     pdf.set_font('Helvetica', 'B', 16)
-    pdf.set_fill_color(30, 30, 30)
+    pdf.set_fill_color(120, 30, 0)
     pdf.set_text_color(255, 255, 255)
-    pdf.cell(0, 12, 'BACCARAT AI - Ecarts Compteur 4', ln=True, align='C', fill=True)
+    pdf.cell(0, 12, 'BACCARAT AI - Absences Consecutives Compteur 4', ln=True, align='C', fill=True)
     pdf.ln(4)
 
     pdf.set_font('Helvetica', '', 10)
@@ -239,65 +266,66 @@ def generate_compteur4_pdf(events_list: List[Dict]) -> bytes:
     pdf.cell(0, 6,
         f'Seuil: {COMPTEUR4_THRESHOLD} absences consecutives | '
         f'Genere le {datetime.now().strftime("%d/%m/%Y %H:%M")} | '
-        f'Total: {len(events_list)} ecart(s)',
+        f'Total: {len(events_list)} serie(s) | PERSISTANT',
         ln=True, align='C'
     )
     pdf.ln(6)
 
-    # En-tête du tableau — 5 colonnes
-    col_widths = [38, 22, 32, 36, 62]
-    headers   = ['Date', 'Heure', 'Numero jeu', 'Costume absent', 'Cartes presentes']
+    col_widths = [32, 22, 22, 32, 32, 26]
+    headers    = ['Date', 'Heure', 'Costume', 'Debut', 'Fin', 'Nb fois']
 
     pdf.set_font('Helvetica', 'B', 11)
-    pdf.set_fill_color(50, 50, 50)
+    pdf.set_fill_color(120, 30, 0)
     pdf.set_text_color(255, 255, 255)
     for header, width in zip(headers, col_widths):
         pdf.cell(width, 9, header, border=1, fill=True, align='C')
     pdf.ln()
 
-    # Lignes
     pdf.set_font('Helvetica', '', 11)
     alt = False
     for ev in events_list:
-        absent_suit = ev.get('suit', '')
-        r, g, b = suit_colors.get(absent_suit, (0, 0, 0))
+        suit      = ev.get('suit', '')
+        r, g, b   = suit_colors.get(suit, (0, 0, 0))
+        date_str  = ev['end_time'].strftime('%d/%m/%Y')
+        time_str  = ev['end_time'].strftime('%Hh%M')
+        suit_name = suit_names_map.get(suit, suit)
+        start_str = f"#{ev['start_game']}"
+        end_str   = f"#{ev['end_game']}"
+        count_str = f"{ev['count']}x"
 
-        date_str  = ev['datetime'].strftime('%d/%m/%Y')
-        time_str  = ev['datetime'].strftime('%Hh%M')
-        game_str  = str(ev['game_number'])
-        suit_name = suit_names_map.get(absent_suit, absent_suit)
-        present   = ' | '.join(
-            suit_names_map.get(s, s) for s in ev.get('player_suits', [])
-        ) or '-'
-
-        bg = (245, 245, 245) if alt else (255, 255, 255)
+        bg = (255, 240, 235) if alt else (255, 255, 255)
         pdf.set_fill_color(*bg)
         pdf.set_text_color(0, 0, 0)
 
-        pdf.cell(col_widths[0], 9, date_str,  border=1, fill=alt, align='C')
-        pdf.cell(col_widths[1], 9, time_str,  border=1, fill=alt, align='C')
-        pdf.cell(col_widths[2], 9, game_str,  border=1, fill=alt, align='C')
+        pdf.cell(col_widths[0], 9, date_str, border=1, fill=alt, align='C')
+        pdf.cell(col_widths[1], 9, time_str, border=1, fill=alt, align='C')
 
-        # Colonne costume absent — colorée selon l'enseigne
         pdf.set_text_color(r, g, b)
         pdf.set_font('Helvetica', 'B', 11)
-        pdf.cell(col_widths[3], 9, suit_name, border=1, fill=alt, align='C')
+        pdf.cell(col_widths[2], 9, suit_name, border=1, fill=alt, align='C')
         pdf.set_font('Helvetica', '', 11)
-        pdf.set_text_color(80, 80, 80)
+        pdf.set_text_color(0, 0, 0)
 
-        pdf.cell(col_widths[4], 9, present,   border=1, fill=alt, align='C')
+        pdf.cell(col_widths[3], 9, start_str, border=1, fill=alt, align='C')
+        pdf.cell(col_widths[4], 9, end_str,   border=1, fill=alt, align='C')
+
+        pdf.set_text_color(r, g, b)
+        pdf.set_font('Helvetica', 'B', 12)
+        pdf.cell(col_widths[5], 9, count_str, border=1, fill=alt, align='C')
+        pdf.set_font('Helvetica', '', 11)
+        pdf.set_text_color(0, 0, 0)
+
         pdf.ln()
         alt = not alt
 
     if not events_list:
         pdf.set_text_color(150, 150, 150)
-        pdf.cell(0, 8, 'Aucun ecart enregistre', border=1, align='C')
+        pdf.cell(0, 8, 'Aucune serie d absence enregistree', border=1, align='C')
         pdf.ln()
 
-    # Résumé par costume
     pdf.ln(8)
     pdf.set_font('Helvetica', 'B', 12)
-    pdf.set_fill_color(50, 50, 50)
+    pdf.set_fill_color(120, 30, 0)
     pdf.set_text_color(255, 255, 255)
     pdf.cell(0, 10, 'Resume par costume', ln=True, fill=True, align='C')
     pdf.ln(3)
@@ -309,42 +337,63 @@ def generate_compteur4_pdf(events_list: List[Dict]) -> bytes:
         pdf.set_text_color(r, g, b)
         name = suit_names_map.get(suit, suit)
         cnt  = suit_counts.get(suit, 0)
-        pdf.cell(0, 8, f'  {name} : {cnt} fois le seuil de {COMPTEUR4_THRESHOLD} atteint', ln=True)
+        pdf.cell(0, 8, f'  {name} : {cnt} serie(s) de {COMPTEUR4_THRESHOLD}+ absences', ln=True)
 
-    # Pied de page
     pdf.ln(5)
     pdf.set_font('Helvetica', 'I', 9)
     pdf.set_text_color(130, 130, 130)
-    pdf.cell(0, 6, f'BACCARAT AI - CONFIDENTIEL - {datetime.now().strftime("%d/%m/%Y %H:%M")}', ln=True, align='C')
-
+    pdf.cell(0, 6,
+        f'BACCARAT AI - PERSISTANT - Reset #1440 ne supprime PAS ce fichier - '
+        f'{datetime.now().strftime("%d/%m/%Y %H:%M")}',
+        ln=True, align='C'
+    )
     return bytes(pdf.output())
 
-async def send_compteur4_alert(triggered_suits: List[str], game_number: int):
-    """Envoie une notification texte immédiate à l'admin quand le seuil C4 est atteint."""
+async def send_compteur4_threshold_alert(suit: str, game_number: int, start_game: int):
+    """Envoie une alerte immédiate à l'admin quand le seuil de 10 absences est atteint (série en cours)."""
     if not ADMIN_ID or ADMIN_ID == 0:
         return
     suit_emoji_map = {'♠': '♠️', '♥': '❤️', '♦': '♦️', '♣': '♣️'}
     suit_names_map = {'♠': 'Pique', '♥': 'Cœur', '♦': 'Carreau', '♣': 'Trèfle'}
     try:
         admin_entity = await client.get_entity(ADMIN_ID)
-        now = datetime.now()
-        lines = ["🚨 **COMPTEUR 4 — ABSENT 10 FOIS**", ""]
-        for suit in triggered_suits:
-            emoji = suit_emoji_map.get(suit, suit)
-            lines.append(
-                f"Le {now.strftime('%d/%m/%Y')} A {now.strftime('%Hh%M')} "
-                f"{emoji} Numéro {game_number}"
-            )
-        lines += [
-            "",
-            f"_{suit_names_map.get(triggered_suits[0], triggered_suits[0])} "
-            f"absent **{COMPTEUR4_THRESHOLD} fois consécutives**._",
-            "",
-            "📄 PDF mis à jour ci-dessous."
-        ]
-        await client.send_message(admin_entity, "\n".join(lines), parse_mode='markdown')
+        now   = datetime.now()
+        emoji = suit_emoji_map.get(suit, suit)
+        name  = suit_names_map.get(suit, suit)
+        msg = (
+            f"🚨 **COMPTEUR 4 — SEUIL ATTEINT**\n\n"
+            f"{now.strftime('%d/%m/%Y')} à {now.strftime('%Hh%M')} "
+            f"{emoji} **{COMPTEUR4_THRESHOLD} fois absent** — numéro **{start_game}_{game_number}**\n\n"
+            f"_{name} absent depuis le jeu #{start_game}. La série continue…_"
+        )
+        await client.send_message(admin_entity, msg, parse_mode='markdown')
     except Exception as e:
-        logger.error(f"❌ Erreur send_compteur4_alert: {e}")
+        logger.error(f"❌ Erreur send_compteur4_threshold_alert: {e}")
+
+
+async def send_compteur4_series_alert(series: Dict):
+    """Envoie la notification finale quand une série d'absences Compteur4 se termine."""
+    if not ADMIN_ID or ADMIN_ID == 0:
+        return
+    suit_emoji_map = {'♠': '♠️', '♥': '❤️', '♦': '♦️', '♣': '♣️'}
+    suit_names_map = {'♠': 'Pique', '♥': 'Cœur', '♦': 'Carreau', '♣': 'Trèfle'}
+    try:
+        admin_entity = await client.get_entity(ADMIN_ID)
+        suit     = series['suit']
+        emoji    = suit_emoji_map.get(suit, suit)
+        name     = suit_names_map.get(suit, suit)
+        end_time = series['end_time']
+        msg = (
+            f"🔴 **COMPTEUR 4 — SÉRIE TERMINÉE**\n\n"
+            f"{end_time.strftime('%d/%m/%Y')} à {end_time.strftime('%Hh%M')} "
+            f"{emoji} **{series['count']} fois** du numéro "
+            f"**{series['start_game']}_{series['end_game']}**\n\n"
+            f"_{name} absent {series['count']} fois consécutives._\n\n"
+            f"📄 PDF mis à jour ci-dessous."
+        )
+        await client.send_message(admin_entity, msg, parse_mode='markdown')
+    except Exception as e:
+        logger.error(f"❌ Erreur send_compteur4_series_alert: {e}")
 
 
 async def send_compteur4_pdf():
@@ -372,9 +421,10 @@ async def send_compteur4_pdf():
             compteur4_pdf_msg_id = None
 
         caption = (
-            f"📊 **COMPTEUR4 — PDF mis à jour**\n\n"
-            f"Total écarts enregistrés : **{len(compteur4_events)}**\n"
-            f"Seuil actuel : **{COMPTEUR4_THRESHOLD}** absences consécutives\n"
+            f"🔴 **COMPTEUR4 — PDF mis à jour**\n\n"
+            f"Total séries d'absences enregistrées : **{len(compteur4_events)}**\n"
+            f"Seuil : **≥ {COMPTEUR4_THRESHOLD}** absences consécutives\n"
+            f"⚠️ Ce PDF persiste entre tous les resets\n"
             f"Mis à jour : {datetime.now().strftime('%d/%m/%Y %Hh%M')}"
         )
 
@@ -384,7 +434,7 @@ async def send_compteur4_pdf():
             caption=caption,
             parse_mode='markdown',
             attributes=[],
-            file_name="compteur4_ecarts.pdf"
+            file_name="compteur4_absences.pdf"
         )
         compteur4_pdf_msg_id = sent.id
         logger.info(f"✅ PDF Compteur4 envoyé à l'admin (msg {compteur4_pdf_msg_id})")
@@ -1079,29 +1129,63 @@ async def bilan_loop():
             logger.error(f"❌ Erreur bilan horaire: {e}")
             await asyncio.sleep(60)
 
-def update_compteur4(game_number: int, player_suits: Set[str], player_cards_raw: list) -> List[str]:
-    """Met à jour Compteur4. Retourne la liste des costumes ayant atteint le seuil."""
-    global compteur4_trackers, compteur4_events
+def update_compteur4(game_number: int, player_suits: Set[str], player_cards_raw: list) -> tuple:
+    """
+    Met à jour Compteur4 — logique série complète (comme Compteur7 pour les absences).
+    - Quand un costume est absent, la série monte.
+    - À l'atteinte du seuil, une alerte immédiate est envoyée (série toujours en cours).
+    - Quand le costume réapparaît et que la série était >= seuil, la série est enregistrée.
+    Retourne : (threshold_alerts, completed_series)
+      - threshold_alerts : liste de suits ayant JUSTE atteint le seuil (alerte immédiate)
+      - completed_series : liste de dicts de séries terminées (enregistrer dans PDF)
+    """
+    global compteur4_trackers, compteur4_current, compteur4_events
 
-    triggered = []
+    threshold_alerts  = []
+    completed_series  = []
+    now = datetime.now()
 
     for suit in ALL_SUITS:
+        cur = compteur4_current[suit]
         if suit in player_suits:
+            # Costume présent → fin de série d'absence si série >= seuil
+            if cur['count'] >= COMPTEUR4_THRESHOLD:
+                series = {
+                    'suit':       suit,
+                    'count':      cur['count'],
+                    'start_game': cur['start_game'],
+                    'end_game':   game_number - 1,
+                    'start_time': cur['start_time'],
+                    'end_time':   now,
+                }
+                compteur4_events.append(series)
+                completed_series.append(series)
+                save_compteur4_data()
+                logger.info(
+                    f"🔴 C4: {suit} série d'absence terminée "
+                    f"{series['count']}x (#{series['start_game']}→#{series['end_game']})"
+                )
+            # Reset
+            cur['count']      = 0
+            cur['start_game'] = None
+            cur['start_time'] = None
+            cur['alerted']    = False
             compteur4_trackers[suit] = 0
         else:
-            compteur4_trackers[suit] += 1
-            if compteur4_trackers[suit] == COMPTEUR4_THRESHOLD:
-                ev = {
-                    'datetime': datetime.now(),
-                    'game_number': game_number,
-                    'suit': suit,
-                    'player_suits': list(player_suits),
-                }
-                compteur4_events.append(ev)
-                triggered.append(suit)
-                logger.info(f"📊 Compteur4: {suit} absent {COMPTEUR4_THRESHOLD} fois! (jeu #{game_number})")
+            # Costume absent → incrémenter la série
+            if cur['count'] == 0:
+                cur['start_game'] = game_number
+                cur['start_time'] = now
+            cur['count'] += 1
+            compteur4_trackers[suit] = cur['count']
 
-    return triggered
+            # Alerte immédiate quand on atteint exactement le seuil
+            if cur['count'] == COMPTEUR4_THRESHOLD and not cur['alerted']:
+                cur['alerted'] = True
+                threshold_alerts.append(suit)
+                logger.info(f"🚨 C4: {suit} absent {COMPTEUR4_THRESHOLD} fois! (série continue…)")
+
+    return threshold_alerts, completed_series
 
 
 def update_compteur5(game_number: int, player_suits: Set[str], player_cards_raw: list) -> List[str]:
@@ -1130,16 +1214,24 @@ def update_compteur5(game_number: int, player_suits: Set[str], player_cards_raw:
 # ============================================================================
 
 def update_compteur6(player_suits: Set[str]):
-    """Incrémente le compteur d'apparitions Compteur6 pour chaque costume présent."""
+    """Incrémente le compteur d'apparitions Compteur6 pour chaque costume présent.
+    Le compteur est plafonné à Wj pour ne jamais dépasser le seuil affiché."""
     global compteur6_trackers
     for suit in player_suits:
         if suit in compteur6_trackers:
-            compteur6_trackers[suit] += 1
+            new_val = compteur6_trackers[suit] + 1
+            # Plafond : on ne dépasse jamais Wj (le seuil de déclenchement)
+            compteur6_trackers[suit] = min(new_val, compteur6_seuil_Wj)
+            if new_val >= compteur6_seuil_Wj:
+                logger.info(
+                    f"📊 C6 {suit}: {new_val}x → seuil Wj={compteur6_seuil_Wj} atteint"
+                )
 
 def apply_compteur6(suit: str) -> str:
     """
     Filtre Compteur6 : avant de prédire `suit`, vérifie si son inverse a atteint Wj.
     - Inverse atteint Wj → confirmer la prédiction originale (retourne suit)
+                          → RESET du compteur opposé à 0 (cycle consommé)
     - Inverse pas encore à Wj → prédire l'inverse à la place
     Paires : ❤️ ↔ ♦️  |  ♣️ ↔ ♠️
     """
@@ -1148,8 +1240,10 @@ def apply_compteur6(suit: str) -> str:
         return suit
     count_opposite = compteur6_trackers.get(opposite, 0)
     if count_opposite >= compteur6_seuil_Wj:
+        # Consommer le cycle : remettre l'opposé à 0
+        compteur6_trackers[opposite] = 0
         logger.info(
-            f"🔵 C6: prédit {suit} confirmé — {opposite} apparu {count_opposite}x ≥ Wj={compteur6_seuil_Wj}"
+            f"🔵 C6: prédit {suit} confirmé — {opposite} apparu {count_opposite}x ≥ Wj={compteur6_seuil_Wj} → reset {opposite}=0"
         )
         return suit
     else:
@@ -1158,6 +1252,336 @@ def apply_compteur6(suit: str) -> str:
             f"({opposite} apparu seulement {count_opposite}x < Wj={compteur6_seuil_Wj})"
         )
         return opposite
+
+# ============================================================================
+# COMPTEUR4 — PERSISTANCE (séries d'absences — survit aux resets)
+# ============================================================================
+
+def load_compteur4_data():
+    """Charge les séries d'absences Compteur4 depuis le fichier persistant."""
+    global compteur4_events
+    try:
+        if os.path.exists(COMPTEUR4_DATA_FILE):
+            with open(COMPTEUR4_DATA_FILE, 'r', encoding='utf-8') as f:
+                raw = json.load(f)
+            compteur4_events = []
+            for item in raw:
+                item['start_time'] = datetime.fromisoformat(item['start_time'])
+                item['end_time']   = datetime.fromisoformat(item['end_time'])
+                compteur4_events.append(item)
+            logger.info(f"📂 C4: {len(compteur4_events)} séries chargées depuis disque")
+    except Exception as e:
+        logger.error(f"❌ Chargement C4 échoué: {e}")
+        compteur4_events = []
+
+
+def save_compteur4_data():
+    """Sauvegarde les séries d'absences Compteur4 sur disque (persistance entre resets)."""
+    try:
+        data = []
+        for item in compteur4_events:
+            row = dict(item)
+            row['start_time'] = item['start_time'].isoformat()
+            row['end_time']   = item['end_time'].isoformat()
+            data.append(row)
+        with open(COMPTEUR4_DATA_FILE, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"❌ Sauvegarde C4 échouée: {e}")
+
+
+# ============================================================================
+# COMPTEUR7 — SÉRIES CONSÉCUTIVES PERSISTANTES
+# ============================================================================
+
+def load_compteur7_data():
+    """Charge les séries Compteur7 depuis le fichier persistant (survit aux resets)."""
+    global compteur7_completed
+    try:
+        if os.path.exists(COMPTEUR7_DATA_FILE):
+            with open(COMPTEUR7_DATA_FILE, 'r', encoding='utf-8') as f:
+                raw = json.load(f)
+            compteur7_completed = []
+            for item in raw:
+                item['start_time'] = datetime.fromisoformat(item['start_time'])
+                item['end_time']   = datetime.fromisoformat(item['end_time'])
+                compteur7_completed.append(item)
+            logger.info(f"📂 C7: {len(compteur7_completed)} séries chargées depuis disque")
+    except Exception as e:
+        logger.error(f"❌ Chargement C7 échoué: {e}")
+        compteur7_completed = []
+
+
+def save_compteur7_data():
+    """Sauvegarde les séries Compteur7 sur disque (persistance entre resets)."""
+    try:
+        data = []
+        for item in compteur7_completed:
+            row = dict(item)
+            row['start_time'] = item['start_time'].isoformat()
+            row['end_time']   = item['end_time'].isoformat()
+            data.append(row)
+        with open(COMPTEUR7_DATA_FILE, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"❌ Sauvegarde C7 échouée: {e}")
+
+
+def load_hourly_data():
+    """Charge les données horaires depuis le fichier persistant."""
+    global hourly_suit_data, hourly_game_count
+    try:
+        if os.path.exists(HOURLY_DATA_FILE):
+            with open(HOURLY_DATA_FILE, 'r', encoding='utf-8') as f:
+                saved = json.load(f)
+            for h_str, suits in saved.get('suits', {}).items():
+                h = int(h_str)
+                if 0 <= h <= 23:
+                    for suit, cnt in suits.items():
+                        if suit in hourly_suit_data[h]:
+                            hourly_suit_data[h][suit] = cnt
+            for h_str, cnt in saved.get('totals', {}).items():
+                h = int(h_str)
+                if 0 <= h <= 23:
+                    hourly_game_count[h] = cnt
+            logger.info("📂 Données horaires chargées depuis disque")
+    except Exception as e:
+        logger.error(f"❌ Chargement données horaires: {e}")
+
+
+def save_hourly_data():
+    """Sauvegarde les données horaires sur disque."""
+    try:
+        data = {
+            'suits':  {str(h): dict(suits) for h, suits in hourly_suit_data.items()},
+            'totals': {str(h): cnt for h, cnt in hourly_game_count.items()},
+        }
+        with open(HOURLY_DATA_FILE, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"❌ Sauvegarde données horaires: {e}")
+
+
+def update_compteur7(game_number: int, player_suits: Set[str]) -> List[Dict]:
+    """Met à jour Compteur7. Retourne les séries terminées (≥ seuil) dans ce jeu."""
+    global compteur7_current, compteur7_completed
+    newly_completed = []
+    now = datetime.now()
+
+    for suit in ALL_SUITS:
+        current = compteur7_current[suit]
+        if suit in player_suits:
+            # Costume présent → incrémenter
+            if current['count'] == 0:
+                current['start_game'] = game_number
+                current['start_time'] = now
+            current['count'] += 1
+        else:
+            # Costume absent → vérifier si série terminée
+            if current['count'] >= COMPTEUR7_THRESHOLD:
+                series = {
+                    'suit':       suit,
+                    'count':      current['count'],
+                    'start_game': current['start_game'],
+                    'end_game':   game_number - 1,
+                    'start_time': current['start_time'],
+                    'end_time':   now,
+                }
+                compteur7_completed.append(series)
+                newly_completed.append(series)
+                save_compteur7_data()
+                logger.info(
+                    f"📊 C7: {suit} série terminée "
+                    f"{series['count']}x (#{series['start_game']}→#{series['end_game']})"
+                )
+            # Reset le compteur
+            current['count']      = 0
+            current['start_game'] = None
+            current['start_time'] = None
+
+    return newly_completed
+
+
+def update_hourly_data(player_suits: Set[str]):
+    """Met à jour les compteurs horaires (pour /comparaison)."""
+    h = datetime.now().hour
+    hourly_game_count[h] += 1
+    for suit in player_suits:
+        if suit in hourly_suit_data[h]:
+            hourly_suit_data[h][suit] += 1
+    # Sauvegarde toutes les 10 parties pour ne pas surcharger le disque
+    if hourly_game_count[h] % 10 == 0:
+        save_hourly_data()
+
+
+def generate_compteur7_pdf() -> bytes:
+    """Génère un PDF avec le tableau des séries consécutives Compteur7."""
+    suit_names_map = {'♠': 'Pique', '♥': 'Coeur', '♦': 'Carreau', '♣': 'Trefle'}
+    suit_colors    = {'♠': (30, 30, 30), '♥': (180, 0, 0), '♦': (0, 80, 180), '♣': (0, 120, 0)}
+    events_list    = compteur7_completed
+
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+
+    # Titre
+    pdf.set_font('Helvetica', 'B', 16)
+    pdf.set_fill_color(90, 0, 160)
+    pdf.set_text_color(255, 255, 255)
+    pdf.cell(0, 12, 'BACCARAT AI - Series Consecutives Compteur 7', ln=True, align='C', fill=True)
+    pdf.ln(4)
+
+    pdf.set_font('Helvetica', '', 10)
+    pdf.set_text_color(100, 100, 100)
+    pdf.cell(0, 6,
+        f'Seuil minimum: {COMPTEUR7_THRESHOLD}x | '
+        f'Genere le {datetime.now().strftime("%d/%m/%Y %H:%M")} | '
+        f'Total: {len(events_list)} serie(s) | PERSISTANT',
+        ln=True, align='C'
+    )
+    pdf.ln(6)
+
+    col_widths = [32, 22, 22, 32, 32, 26]
+    headers    = ['Date', 'Heure', 'Costume', 'Debut', 'Fin', 'Nb fois']
+
+    pdf.set_font('Helvetica', 'B', 11)
+    pdf.set_fill_color(90, 0, 160)
+    pdf.set_text_color(255, 255, 255)
+    for header, width in zip(headers, col_widths):
+        pdf.cell(width, 9, header, border=1, fill=True, align='C')
+    pdf.ln()
+
+    pdf.set_font('Helvetica', '', 11)
+    alt = False
+    for ev in events_list:
+        suit       = ev.get('suit', '')
+        r, g, b    = suit_colors.get(suit, (0, 0, 0))
+        date_str   = ev['end_time'].strftime('%d/%m/%Y')
+        time_str   = ev['end_time'].strftime('%Hh%M')
+        suit_name  = suit_names_map.get(suit, suit)
+        start_str  = f"#{ev['start_game']}"
+        end_str    = f"#{ev['end_game']}"
+        count_str  = f"{ev['count']}x"
+
+        bg = (245, 245, 245) if alt else (255, 255, 255)
+        pdf.set_fill_color(*bg)
+        pdf.set_text_color(0, 0, 0)
+
+        pdf.cell(col_widths[0], 9, date_str, border=1, fill=alt, align='C')
+        pdf.cell(col_widths[1], 9, time_str, border=1, fill=alt, align='C')
+
+        pdf.set_text_color(r, g, b)
+        pdf.set_font('Helvetica', 'B', 11)
+        pdf.cell(col_widths[2], 9, suit_name, border=1, fill=alt, align='C')
+        pdf.set_font('Helvetica', '', 11)
+        pdf.set_text_color(0, 0, 0)
+
+        pdf.cell(col_widths[3], 9, start_str, border=1, fill=alt, align='C')
+        pdf.cell(col_widths[4], 9, end_str,   border=1, fill=alt, align='C')
+
+        pdf.set_text_color(r, g, b)
+        pdf.set_font('Helvetica', 'B', 12)
+        pdf.cell(col_widths[5], 9, count_str, border=1, fill=alt, align='C')
+        pdf.set_font('Helvetica', '', 11)
+        pdf.set_text_color(0, 0, 0)
+
+        pdf.ln()
+        alt = not alt
+
+    if not events_list:
+        pdf.set_text_color(150, 150, 150)
+        pdf.cell(0, 8, 'Aucune serie enregistree', border=1, align='C')
+        pdf.ln()
+
+    # Résumé par costume
+    pdf.ln(8)
+    pdf.set_font('Helvetica', 'B', 12)
+    pdf.set_fill_color(90, 0, 160)
+    pdf.set_text_color(255, 255, 255)
+    pdf.cell(0, 10, 'Resume par costume', ln=True, fill=True, align='C')
+    pdf.ln(3)
+
+    from collections import Counter as _Counter
+    suit_counts = _Counter(ev.get('suit', '') for ev in events_list)
+    for suit in ['♠', '♥', '♦', '♣']:
+        r, g, b = suit_colors.get(suit, (0, 0, 0))
+        pdf.set_font('Helvetica', 'B', 11)
+        pdf.set_text_color(r, g, b)
+        name = suit_names_map.get(suit, suit)
+        cnt  = suit_counts.get(suit, 0)
+        pdf.cell(0, 8, f'  {name} : {cnt} serie(s) de {COMPTEUR7_THRESHOLD}+ consecutives', ln=True)
+
+    pdf.ln(5)
+    pdf.set_font('Helvetica', 'I', 9)
+    pdf.set_text_color(130, 130, 130)
+    pdf.cell(0, 6,
+        f'BACCARAT AI - PERSISTANT - Reset #1440 ne supprime PAS ce fichier - '
+        f'{datetime.now().strftime("%d/%m/%Y %H:%M")}',
+        ln=True, align='C'
+    )
+    return bytes(pdf.output())
+
+
+async def send_compteur7_alert(series: Dict):
+    """Envoie une notification à l'admin quand une série Compteur7 se termine."""
+    if not ADMIN_ID or ADMIN_ID == 0:
+        return
+    suit_emoji_map = {'♠': '♠️', '♥': '❤️', '♦': '♦️', '♣': '♣️'}
+    suit_names_map = {'♠': 'Pique', '♥': 'Cœur', '♦': 'Carreau', '♣': 'Trèfle'}
+    try:
+        admin_entity = await client.get_entity(ADMIN_ID)
+        suit     = series['suit']
+        emoji    = suit_emoji_map.get(suit, suit)
+        end_time = series['end_time']
+        msg = (
+            f"📊 **COMPTEUR 7 — SÉRIE TERMINÉE**\n\n"
+            f"{end_time.strftime('%d/%m/%Y')} à {end_time.strftime('%Hh%M')} "
+            f"{emoji} **{series['count']} fois** du numéro "
+            f"**{series['start_game']}_{series['end_game']}**\n\n"
+            f"_{suit_names_map.get(suit, suit)} présent {series['count']} fois consécutives._\n\n"
+            f"📄 PDF mis à jour ci-dessous."
+        )
+        await client.send_message(admin_entity, msg, parse_mode='markdown')
+    except Exception as e:
+        logger.error(f"❌ Erreur send_compteur7_alert: {e}")
+
+
+async def send_compteur7_pdf():
+    """Génère et envoie (ou remplace) le PDF Compteur7 à l'admin."""
+    global compteur7_pdf_msg_id
+    if not ADMIN_ID or ADMIN_ID == 0:
+        return
+    try:
+        pdf_bytes  = generate_compteur7_pdf()
+        pdf_buffer = io.BytesIO(pdf_bytes)
+        pdf_buffer.name = "compteur7_series.pdf"
+        admin_entity = await client.get_entity(ADMIN_ID)
+
+        if compteur7_pdf_msg_id:
+            try:
+                await client.delete_messages(admin_entity, [compteur7_pdf_msg_id])
+            except Exception:
+                pass
+            compteur7_pdf_msg_id = None
+
+        caption = (
+            f"📊 **COMPTEUR7 — PDF mis à jour**\n\n"
+            f"Total séries enregistrées : **{len(compteur7_completed)}**\n"
+            f"Seuil : **≥ {COMPTEUR7_THRESHOLD}** présences consécutives\n"
+            f"⚠️ Ce PDF persiste entre tous les resets\n"
+            f"Mis à jour : {datetime.now().strftime('%d/%m/%Y %Hh%M')}"
+        )
+        sent = await client.send_file(
+            admin_entity, pdf_buffer,
+            caption=caption, parse_mode='markdown',
+            attributes=[], file_name="compteur7_series.pdf"
+        )
+        compteur7_pdf_msg_id = sent.id
+        logger.info(f"✅ PDF Compteur7 envoyé à l'admin")
+    except Exception as e:
+        logger.error(f"❌ Erreur send_compteur7_pdf: {e}")
+        import traceback; logger.error(traceback.format_exc())
+
 
 # ============================================================================
 # NORMALISATION DES COSTUMES
@@ -1380,7 +1804,7 @@ def block_suit(suit: str, minutes: int = 5):
 # ============================================================================
 
 BAR_SIZE = 10          # Taille totale de la barre
-ANIM_INTERVAL = 3.5    # Secondes entre chaque frame (limite Telegram ~1 édit/3s)
+ANIM_INTERVAL = 5.0    # Secondes entre chaque frame — 5s réduit les flood waits Telegram
 
 # Amplitude max totale par rattrapage: R0=2, R1=4, R2=7, R3=10
 BAR_MAX_BY_RATTRAPAGE = [2, 4, 7, 10]
@@ -1674,6 +2098,23 @@ async def notify_b_augmente(suit: str, old_b: int, new_b: int, game_number: int,
     except Exception as e:
         logger.error(f"❌ Notif B augmenté: {e}")
 
+async def send_parole_auto_delete(statut_key: str, game_number: int):
+    """Envoie une parole biblique sur le canal et la supprime automatiquement après 60s."""
+    try:
+        entity = await resolve_channel(PREDICTION_CHANNEL_ID)
+        if not entity:
+            return
+        texte = get_parole(statut_key, game_number, count=1)
+        msg = await client.send_message(entity, texte, parse_mode='markdown')
+        await asyncio.sleep(30)
+        try:
+            await client.delete_messages(entity, [msg.id])
+        except Exception as e:
+            logger.debug(f"Suppression parole #{game_number} ignorée: {e}")
+    except Exception as e:
+        logger.debug(f"send_parole_auto_delete #{game_number}: {e}")
+
+
 async def update_prediction_message(game_number: int, status: str, rattrapage: int = 0):
     if game_number not in pending_predictions:
         return
@@ -1683,13 +2124,16 @@ async def update_prediction_message(game_number: int, status: str, rattrapage: i
     msg_id = pred['message_id']
     new_msg = format_prediction_message(game_number, suit, status, rattrapage=rattrapage)
 
+    # Déterminer la clé de parole selon le statut
+    parole_key = None
     if 'gagne' in status:
         logger.info(f"✅ Gagné: #{game_number} (R{rattrapage})")
+        parole_key = f'gagne_r{rattrapage}'
     elif status == 'expirée_api':
-        # Jeu sauté par l'API : pas de pénalité (ni blocage costume, ni B incrémenté)
         logger.warning(f"🔌 Prédiction #{game_number} expirée — jeu sauté par l'API (R{rattrapage})")
     else:
         logger.info(f"❌ Perdu: #{game_number}")
+        parole_key = 'perdu'
         block_suit(suit, 5)
         # Enregistrer l'événement PERDU
         old_b = compteur2_seuil_B_per_suit.get(suit, compteur2_seuil_B)
@@ -1727,6 +2171,10 @@ async def update_prediction_message(game_number: int, status: str, rattrapage: i
                 await client.edit_message(sec_entity, sec_msg_id, new_msg, parse_mode='markdown')
         except Exception as e:
             logger.error(f"❌ Erreur édition canal secondaire #{game_number}: {e}")
+
+    # Envoyer la parole biblique (auto-supprimée après 60s)
+    if parole_key:
+        asyncio.create_task(send_parole_auto_delete(parole_key, game_number))
 
 async def update_prediction_progress(game_number: int, current_check: int):
     if game_number not in pending_predictions:
@@ -2056,24 +2504,24 @@ async def send_bilan_and_reset_at_1440():
     # ── ÉTAPE 2 : Envoi de tous les PDFs AVANT le reset ─────────────────────
     logger.info("📄 Envoi des PDFs avant reset #1440...")
 
-    # PDF Compteur4
+    # PDF Compteur4 (snapshot — données persistantes, NON effacées au reset)
     try:
         if compteur4_events:
             pdf4 = generate_compteur4_pdf(compteur4_events)
             buf4 = io.BytesIO(pdf4)
-            buf4.name = "compteur4_ecarts_final.pdf"
+            buf4.name = "compteur4_absences_cycle.pdf"
             admin_entity = await client.get_entity(ADMIN_ID)
             await client.send_file(
                 admin_entity, buf4,
                 caption=(
-                    f"📊 **COMPTEUR4 — PDF FINAL DU CYCLE**\n"
-                    f"Total écarts : **{len(compteur4_events)}**\n"
-                    f"_(Sauvegarde avant reset)_"
+                    f"🔴 **COMPTEUR4 — SNAPSHOT FIN DE CYCLE**\n"
+                    f"Total séries d'absences : **{len(compteur4_events)}**\n"
+                    f"⚠️ Ces données sont persistantes — elles ne seront PAS effacées au reset"
                 ),
                 parse_mode='markdown',
-                file_name="compteur4_ecarts_final.pdf"
+                file_name="compteur4_absences_cycle.pdf"
             )
-            logger.info("✅ PDF Compteur4 final envoyé avant reset")
+            logger.info("✅ PDF Compteur4 snapshot envoyé avant reset")
     except Exception as e:
         logger.error(f"❌ PDF Compteur4 avant reset: {e}")
 
@@ -2132,16 +2580,18 @@ async def send_bilan_and_reset_at_1440():
     last_prediction_number_sent = 0
     perdu_pdf_msg_id            = None
 
-    # Événements Compteur4 & 5 (vidés — PDF déjà envoyé)
-    compteur4_events.clear()
+    # Événements Compteur5 (vidés — PDF déjà envoyé)
     compteur5_events.clear()
-    compteur4_pdf_msg_id = None
     compteur5_pdf_msg_id = None
+    # ⚠️ compteur4_events N'EST PAS EFFACÉ — persistant entre cycles (comme C7)
+    compteur4_pdf_msg_id = None
 
     # Compteurs remis à 0
     for suit in ALL_SUITS:
         compteur4_trackers[suit] = 0
         compteur5_trackers[suit] = 0
+        # Reset de la série d'absence courante (l'historique persistant reste intact)
+        compteur4_current[suit] = {'count': 0, 'start_game': None, 'start_time': None, 'alerted': False}
 
     for tracker in compteur2_trackers.values():
         tracker.counter = 0
@@ -2177,11 +2627,12 @@ async def send_bilan_and_reset_at_1440():
                 f"  • {nb_pending} prédiction(s) en attente\n"
                 f"  • {nb_queue} prédiction(s) en file\n"
                 f"  • {nb_history} entrées d'historique\n"
-                f"  • {nb_c4} événement(s) Compteur4\n"
                 f"  • {nb_c5} événement(s) Compteur5\n"
                 f"  • B par costume remis à B admin ({compteur2_seuil_B})\n\n"
-                f"**Préservé :**\n"
+                f"**Préservé (persistant entre cycles) :**\n"
                 f"  • {nb_perdu} pertes historiques (inter-journées)\n"
+                f"  • {len(compteur4_events)} séries Compteur4 (absences persistantes)\n"
+                f"  • Séries Compteur7 (présences persistantes)\n"
                 f"  • B admin : {compteur2_seuil_B}\n"
                 f"  • Seuil Compteur4 : {COMPTEUR4_THRESHOLD}\n"
                 f"  • Seuil Compteur5 : {COMPTEUR5_THRESHOLD}\n"
@@ -2216,10 +2667,13 @@ async def process_game_result(game_number: int, player_suits: Set[str], player_c
         update_compteur1(game_number, player_suits)
         update_compteur2(game_number, player_suits)
 
-        # Compteur4: détecter les écarts de 10
-        triggered_suits = update_compteur4(game_number, player_suits, player_cards_raw)
-        if triggered_suits:
-            asyncio.create_task(send_compteur4_alert(triggered_suits, game_number))
+        # Compteur4: séries d'absences (seuil + série complète, persistant)
+        threshold4, completed4 = update_compteur4(game_number, player_suits, player_cards_raw)
+        for suit in threshold4:
+            cur4 = compteur4_current[suit]
+            asyncio.create_task(send_compteur4_threshold_alert(suit, game_number, cur4['start_game']))
+        for series4 in completed4:
+            asyncio.create_task(send_compteur4_series_alert(series4))
             asyncio.create_task(send_compteur4_pdf())
 
         # Compteur5: détecter les présences consécutives de 10
@@ -2230,6 +2684,15 @@ async def process_game_result(game_number: int, player_suits: Set[str], player_c
 
         # Compteur6: mettre à jour le compteur d'apparitions par costume
         update_compteur6(player_suits)
+
+        # Compteur7: séries consécutives (min 5) — persistant entre resets
+        completed7 = update_compteur7(game_number, player_suits)
+        for series in completed7:
+            asyncio.create_task(send_compteur7_alert(series))
+            asyncio.create_task(send_compteur7_pdf())
+
+        # Données horaires pour /comparaison
+        update_hourly_data(player_suits)
 
         # Prédictions Compteur2
         if compteur2_active:
@@ -2330,12 +2793,18 @@ async def cleanup_stale_predictions():
             age_minutes = (now - sent_time).total_seconds() / 60
             if age_minutes >= PREDICTION_TIMEOUT_MINUTES:
                 stale.append(game_number)
+        else:
+            # BUG FIX : sent_time=None → prédiction jamais nettoyée → bot bloqué.
+            # Fallback : utiliser l'heure actuelle comme référence — on la retire immédiatement.
+            logger.warning(f"🧹 #{game_number} sans sent_time — forcé en timeout")
+            stale.append(game_number)
 
     for game_number in stale:
         pred = pending_predictions.get(game_number)
         if pred:
             suit = pred.get('suit', '?')
             logger.warning(f"🧹 #{game_number} ({suit}) expiré (timeout)")
+            stop_animation(game_number)
             try:
                 prediction_entity = await resolve_channel(PREDICTION_CHANNEL_ID)
                 if prediction_entity and pred.get('message_id'):
@@ -2356,6 +2825,88 @@ async def auto_reset_system():
         except Exception as e:
             logger.error(f"❌ Erreur auto_reset: {e}")
             await asyncio.sleep(30)
+
+# ─── Watchdog global : déblocage automatique ────────────────────────────────
+
+_api_polling_task: Optional[asyncio.Task] = None
+
+async def _api_polling_guardian():
+    """Lance api_polling_loop et la redémarre automatiquement si elle s'arrête."""
+    global _api_polling_task
+    while True:
+        try:
+            logger.info("🔄 Démarrage/redémarrage api_polling_loop via guardian")
+            _api_polling_task = asyncio.create_task(api_polling_loop())
+            await _api_polling_task
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"❌ Guardian: api_polling_loop crash inattendu: {e}")
+        logger.warning("⚠️ api_polling_loop terminée — redémarrage dans 5s")
+        await asyncio.sleep(5)
+
+async def auto_watchdog_task():
+    """
+    Watchdog global — s'exécute toutes les 60s.
+    Détecte et débloque automatiquement :
+      1. Prédictions bloquées au-delà de 15 min (sécurité post-timeout)
+      2. Tous les costumes bloqués simultanément (suit_block_until)
+      3. Notifie l'admin à chaque déblocage automatique
+    """
+    global pending_predictions, suit_block_until, prediction_queue
+    from config import PREDICTION_TIMEOUT_MINUTES, FORCE_RESTART_THRESHOLD
+
+    HARD_TIMEOUT = max(PREDICTION_TIMEOUT_MINUTES + 5, 15)  # 15 min minimum
+
+    while True:
+        await asyncio.sleep(60)
+        try:
+            now = datetime.now()
+            actions = []
+
+            # ── 1. Prédictions bloquées au-delà du hard timeout ─────────────
+            hard_stale = []
+            for game_number, pred in list(pending_predictions.items()):
+                sent_time = pred.get('sent_time')
+                if sent_time is None or (now - sent_time).total_seconds() / 60 >= HARD_TIMEOUT:
+                    hard_stale.append(game_number)
+
+            if hard_stale:
+                for gn in hard_stale:
+                    pred = pending_predictions.pop(gn, None)
+                    if pred:
+                        stop_animation(gn)
+                        suit = pred.get('suit', '?')
+                        actions.append(f"🧹 Prédiction #{gn} ({suit}) forcée hors mémoire")
+                        try:
+                            entity = await resolve_channel(PREDICTION_CHANNEL_ID)
+                            if entity and pred.get('message_id'):
+                                sd = SUIT_DISPLAY.get(suit, suit)
+                                await client.edit_message(
+                                    entity, pred['message_id'],
+                                    f"⏰ **PRÉDICTION #{gn}**\n🎯 {sd}\n⌛ **EXPIRÉE (watchdog)**",
+                                    parse_mode='markdown')
+                        except Exception:
+                            pass
+
+            # ── 2. Tous les costumes simultanément bloqués ──────────────────
+            blocked_suits = [s for s in ALL_SUITS if s in suit_block_until and now < suit_block_until[s]]
+            if len(blocked_suits) == len(ALL_SUITS):
+                suit_block_until.clear()
+                actions.append("🔓 Tous les costumes étaient bloqués — déblocage forcé")
+                logger.warning("⚠️ Watchdog: tous les costumes bloqués → déblocage automatique")
+
+            # ── 3. Notification admin ────────────────────────────────────────
+            if actions and ADMIN_ID:
+                try:
+                    admin_entity = await client.get_entity(ADMIN_ID)
+                    msg = "🤖 **WATCHDOG — Déblocage automatique**\n\n" + "\n".join(actions)
+                    await client.send_message(admin_entity, msg, parse_mode='markdown')
+                except Exception as e:
+                    logger.warning(f"Watchdog: impossible de notifier admin: {e}")
+
+        except Exception as e:
+            logger.error(f"❌ Erreur watchdog: {e}")
 
 async def perform_full_reset(reason: str):
     global pending_predictions, last_prediction_time
@@ -2381,6 +2932,7 @@ async def perform_full_reset(reason: str):
 
     for suit in ALL_SUITS:
         compteur4_trackers[suit] = 0
+        compteur4_current[suit] = {'count': 0, 'start_game': None, 'start_time': None, 'alerted': False}
 
     stop_all_animations()
     pending_predictions.clear()
@@ -2537,42 +3089,50 @@ async def cmd_compteur4(event):
             if sub == 'reset':
                 for suit in ALL_SUITS:
                     compteur4_trackers[suit] = 0
+                    compteur4_current[suit] = {'count': 0, 'start_game': None, 'start_time': None, 'alerted': False}
                 compteur4_events.clear()
-                await event.respond("🔄 **Compteur4 reset** — Compteurs et historique effacés")
+                save_compteur4_data()
+                await event.respond("🔄 **Compteur4 reset** — Compteurs, séries courantes et historique effacés")
                 return
 
         # Affichage statut
+        suit_names  = {'♠': 'Pique', '♥': 'Cœur', '♦': 'Carreau', '♣': 'Trèfle'}
+        suit_emoji  = {'♠': '♠️', '♥': '❤️', '♦': '♦️', '♣': '♣️'}
         lines = [
-            f"📊 **COMPTEUR4 — ÉCARTS** (seuil: {COMPTEUR4_THRESHOLD})",
-            f"",
-            f"**Absences consécutives actuelles:**",
+            f"🔴 **COMPTEUR4** — Absences consécutives (seuil ≥ {COMPTEUR4_THRESHOLD})\n",
+            "**En cours :**",
         ]
 
+        any_active = False
         for suit in ALL_SUITS:
-            count = compteur4_trackers.get(suit, 0)
-            name = SUIT_DISPLAY.get(suit, suit)
-            bar_len = min(count, COMPTEUR4_THRESHOLD)
-            bar = "█" * bar_len + "░" * (COMPTEUR4_THRESHOLD - bar_len)
-            pct = f"{count}/{COMPTEUR4_THRESHOLD}"
-            alert = " 🚨" if count >= COMPTEUR4_THRESHOLD else ""
-            lines.append(f"{name}: [{bar}] {pct}{alert}")
+            cur   = compteur4_current[suit]
+            count = cur['count']
+            name  = SUIT_DISPLAY.get(suit, suit)
+            if count > 0:
+                any_active = True
+                bar = "█" * min(count, 12) + ("…" if count > 12 else "")
+                alert = " 🚨" if count >= COMPTEUR4_THRESHOLD else ""
+                lines.append(f"  {name}: [{bar}] {count}x (depuis #{cur['start_game']}){alert}")
+            else:
+                lines.append(f"  {name}: —")
 
-        lines.append(f"\n**Événements enregistrés:** {len(compteur4_events)}")
+        if not any_active:
+            lines.append("  _(aucune série en cours)_")
 
-        if compteur4_events:
-            suit_emoji_map = {'♠': '♠️', '♥': '❤️', '♦': '♦️', '♣': '♣️'}
-            lines.append(f"\n**Derniers écarts enregistrés :**")
-            for ev in compteur4_events[-5:][::-1]:
-                emoji = suit_emoji_map.get(ev['suit'], ev['suit'])
-                dt    = ev['datetime']
+        total = len(compteur4_events)
+        lines.append(f"\n**Séries terminées enregistrées :** {total}")
+        if total > 0:
+            for s in compteur4_events[-5:]:
+                emo = suit_emoji.get(s['suit'], s['suit'])
+                end_date = s['end_time'].strftime('%d/%m %Hh%M')
                 lines.append(
-                    f"  • Le {dt.strftime('%d/%m/%Y')} A {dt.strftime('%Hh%M')} "
-                    f"{emoji} Numéro {ev['game_number']}"
+                    f"  • {end_date} — {emo} **{s['count']}x** "
+                    f"(#{s['start_game']}→#{s['end_game']})"
                 )
+            lines.append("_(5 dernières — /compteur4 pdf pour le tableau complet)_")
 
-        lines.append(f"\n**Usage:**\n`/compteur4 pdf` — Envoyer le PDF\n`/compteur4 seuil N` — Changer le seuil (actuel: {COMPTEUR4_THRESHOLD})\n`/compteur4 reset` — Réinitialiser")
-
-        await event.respond("\n".join(lines))
+        lines.append(f"\nUsage: `/compteur4` `pdf` `seuil N` `reset`")
+        await event.respond("\n".join(lines), parse_mode='markdown')
 
     except Exception as e:
         logger.error(f"Erreur cmd_compteur4: {e}")
@@ -2708,6 +3268,339 @@ async def cmd_compteur6(event):
 
     except Exception as e:
         logger.error(f"Erreur cmd_compteur6: {e}")
+        await event.respond(f"❌ Erreur: {e}")
+
+
+async def cmd_compteur7(event):
+    """Affiche le statut du Compteur7 (séries consécutives) et permet de l'administrer."""
+    global compteur7_current, compteur7_completed, COMPTEUR7_THRESHOLD
+    if event.is_group or event.is_channel:
+        return
+    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+        await event.respond("🔒 Admin uniquement")
+        return
+    try:
+        raw   = event.message.message.strip()
+        parts = raw.split()
+        sub   = parts[1].lower() if len(parts) > 1 else ''
+
+        # /compteur7 pdf — envoyer le PDF manuellement
+        if sub == 'pdf':
+            await send_compteur7_pdf()
+            await event.respond("📄 PDF Compteur7 envoyé.")
+            return
+
+        # /compteur7 seuil N — changer le seuil
+        if sub == 'seuil' and len(parts) > 2:
+            try:
+                val = int(parts[2])
+                if val < 2:
+                    await event.respond("❌ Seuil minimum : 2")
+                    return
+                old = COMPTEUR7_THRESHOLD
+                COMPTEUR7_THRESHOLD = val
+                await event.respond(
+                    f"✅ **Seuil Compteur7:** {old} → {val}\n"
+                    f"Détection à partir de **{val}** présences consécutives"
+                )
+            except ValueError:
+                await event.respond("❌ Usage: `/compteur7 seuil 5`")
+            return
+
+        # /compteur7 reset — effacer l'historique persistant
+        if sub == 'reset':
+            compteur7_completed.clear()
+            for suit in ALL_SUITS:
+                compteur7_current[suit] = {'count': 0, 'start_game': None, 'start_time': None}
+            save_compteur7_data()
+            await event.respond("🔄 **Compteur7 reset** — historique effacé du disque")
+            return
+
+        # Affichage statut
+        suit_names = {'♠': 'Pique', '♥': 'Cœur', '♦': 'Carreau', '♣': 'Trèfle'}
+        lines = [f"📊 **COMPTEUR7** — Séries consécutives (seuil ≥ {COMPTEUR7_THRESHOLD})\n"]
+
+        lines.append("**En cours :**")
+        any_active = False
+        for suit in ALL_SUITS:
+            cur   = compteur7_current[suit]
+            count = cur['count']
+            name  = SUIT_DISPLAY.get(suit, suit)
+            if count > 0:
+                any_active = True
+                bar = "█" * min(count, 12) + ("…" if count > 12 else "")
+                lines.append(f"  {name}: [{bar}] {count}x (depuis #{cur['start_game']})")
+            else:
+                lines.append(f"  {name}: —")
+
+        if not any_active:
+            lines.append("  _(aucune série en cours)_")
+
+        total = len(compteur7_completed)
+        lines.append(f"\n**Séries terminées enregistrées :** {total}")
+        if total > 0:
+            for s in compteur7_completed[-5:]:
+                sn       = suit_names.get(s['suit'], s['suit'])
+                end_date = s['end_time'].strftime('%d/%m %Hh%M')
+                lines.append(
+                    f"  • {end_date} — {s['suit']} **{s['count']}x** "
+                    f"(#{s['start_game']}→#{s['end_game']})"
+                )
+            lines.append("_(5 dernières — /compteur7 pdf pour le tableau complet)_")
+
+        lines.append(f"\nUsage: `/compteur7` `pdf` `seuil N` `reset`")
+        await event.respond("\n".join(lines), parse_mode='markdown')
+
+    except Exception as e:
+        logger.error(f"Erreur cmd_compteur7: {e}")
+        await event.respond(f"❌ Erreur: {e}")
+
+
+async def cmd_comparaison(event):
+    """Analyse intelligente et naturelle des apparitions de costumes par heure de la journée."""
+    if event.is_group or event.is_channel:
+        return
+    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+        await event.respond("🔒 Admin uniquement")
+        return
+    try:
+        suit_names = {'♠': 'Pique', '♥': 'Cœur', '♦': 'Carreau', '♣': 'Trèfle'}
+        suit_emoji = {'♠': '♠️', '♥': '❤️', '♦': '♦️', '♣': '♣️'}
+
+        # ── Heures ayant assez de données ────────────────────────────────────
+        active_hours = sorted([h for h in range(24) if hourly_game_count[h] >= 3])
+        total_games  = sum(hourly_game_count[h] for h in active_hours)
+
+        if total_games < 10:
+            await event.respond(
+                "📊 **COMPARAISON HORAIRE**\n\n"
+                "⏳ Pas encore assez de données (minimum 10 parties nécessaires).\n"
+                "L'analyse sera disponible après quelques heures de collecte.\n\n"
+                f"Parties enregistrées actuellement : **{total_games}**"
+            )
+            return
+
+        # ── Calcul des taux par heure ─────────────────────────────────────────
+        taux: Dict[str, Dict[int, float]] = {}
+        for suit in ALL_SUITS:
+            taux[suit] = {}
+            for h in active_hours:
+                cnt   = hourly_suit_data[h].get(suit, 0)
+                tot_h = hourly_game_count[h]
+                taux[suit][h] = round(cnt / tot_h * 100, 1) if tot_h > 0 else 0.0
+
+        # Taux global
+        overall: Dict[str, float] = {}
+        for suit in ALL_SUITS:
+            ts = sum(hourly_suit_data[h].get(suit, 0) for h in active_hours)
+            overall[suit] = round(ts / total_games * 100, 1) if total_games > 0 else 0.0
+
+        suit_order = sorted(ALL_SUITS, key=lambda s: overall[s], reverse=True)
+
+        # ── Fonction utilitaire : grouper des heures consécutives en plages ──
+        def group_hours_into_ranges(hours_list: List[int]) -> List[List[int]]:
+            """Regroupe [12,13,14,17,18] en [[12,13,14],[17,18]]"""
+            if not hours_list:
+                return []
+            sorted_h = sorted(hours_list)
+            groups, grp = [], [sorted_h[0]]
+            for h in sorted_h[1:]:
+                if h == grp[-1] + 1:
+                    grp.append(h)
+                else:
+                    groups.append(grp)
+                    grp = [h]
+            groups.append(grp)
+            return groups
+
+        def format_range(grp: List[int]) -> str:
+            if len(grp) == 1:
+                return f"{grp[0]:02d}h"
+            return f"{grp[0]:02d}h à {grp[-1] + 1:02d}h"
+
+        # ── Données Compteur7 (séries de présences) par heure ─────────────────
+        c7_by_hour: Dict[int, List[Dict]] = {h: [] for h in range(24)}
+        for s in compteur7_completed:
+            h = s['end_time'].hour
+            c7_by_hour[h].append(s)
+
+        # ── Données Compteur4 (séries d'absences) par heure ──────────────────
+        c4_by_hour: Dict[int, List[Dict]] = {h: [] for h in range(24)}
+        for s in compteur4_events:
+            h = s['end_time'].hour
+            c4_by_hour[h].append(s)
+
+        # ── En-tête du rapport ────────────────────────────────────────────────
+        current_h = datetime.now().hour
+        now_str   = datetime.now().strftime('%d/%m/%Y à %Hh%M')
+        lines = [
+            f"📊 **ANALYSE COMPARAISON INTELLIGENTE**",
+            f"📅 {now_str} — {total_games} parties analysées",
+            f"⏰ {len(active_hours)} tranches horaires actives\n",
+        ]
+
+        # ── Analyse par costume ───────────────────────────────────────────────
+        for suit in suit_order:
+            name      = suit_names[suit]
+            emoji     = suit_emoji[suit]
+            avg       = overall[suit]
+            ht        = taux[suit]
+            threshold_strong = avg + 8
+            threshold_weak   = avg - 8
+
+            # Heures fortes et faibles
+            strong_hours = sorted([h for h in active_hours if ht.get(h, 0) >= threshold_strong],
+                                   key=lambda h: ht[h], reverse=True)
+            weak_hours   = sorted([h for h in active_hours if ht.get(h, 0) <= threshold_weak],
+                                   key=lambda h: ht[h])
+
+            strong_sorted_asc = sorted(strong_hours)
+            weak_sorted_asc   = sorted(weak_hours)
+
+            strong_groups = group_hours_into_ranges(strong_sorted_asc)
+            weak_groups   = group_hours_into_ranges(weak_sorted_asc)
+
+            # Meilleure plage forte (la plus longue)
+            best_strong_grp = max(strong_groups, key=len) if strong_groups else None
+            best_weak_grp   = max(weak_groups,   key=len) if weak_groups   else None
+
+            lines.append(f"━━━━━━━━━━━━━━━")
+            lines.append(f"{emoji} **{name}** — moyenne globale : **{avg:.0f}%**")
+
+            # Message principal en langage naturel
+            if best_strong_grp and best_weak_grp:
+                strong_pct_avg = round(sum(ht.get(h, 0) for h in best_strong_grp) / len(best_strong_grp))
+                weak_pct_avg   = round(sum(ht.get(h, 0) for h in best_weak_grp) / len(best_weak_grp))
+                lines.append(
+                    f"  📌 Aujourd'hui **{name}** apparaît bien de **{format_range(best_strong_grp)}** "
+                    f"({strong_pct_avg}%), mais arrivé sur "
+                    f"**{format_range(best_weak_grp)}** il a baissé — devient **rare** ({weak_pct_avg}%)"
+                )
+            elif best_strong_grp:
+                strong_pct_avg = round(sum(ht.get(h, 0) for h in best_strong_grp) / len(best_strong_grp))
+                lines.append(
+                    f"  📌 **{name}** est fort de **{format_range(best_strong_grp)}** "
+                    f"({strong_pct_avg}%) — pas de zone faible notable"
+                )
+            elif best_weak_grp:
+                weak_pct_avg = round(sum(ht.get(h, 0) for h in best_weak_grp) / len(best_weak_grp))
+                lines.append(
+                    f"  📌 **{name}** devient rare de **{format_range(best_weak_grp)}** "
+                    f"({weak_pct_avg}%) — pas de zone forte notable"
+                )
+            else:
+                lines.append(f"  📌 **{name}** apparaît de manière régulière toute la journée ({avg:.0f}%)")
+
+            # Toutes les plages fortes
+            if strong_groups:
+                strong_details = []
+                for grp in sorted(strong_groups, key=len, reverse=True)[:3]:
+                    avg_t = round(sum(ht.get(h, 0) for h in grp) / len(grp))
+                    strong_details.append(f"{format_range(grp)} ({avg_t}%)")
+                lines.append(f"  ✅ **Zones favorables :** {' | '.join(strong_details)}")
+
+            # Toutes les plages faibles
+            if weak_groups:
+                weak_details = []
+                for grp in sorted(weak_groups, key=len, reverse=True)[:3]:
+                    avg_t = round(sum(ht.get(h, 0) for h in grp) / len(grp))
+                    weak_details.append(f"{format_range(grp)} ({avg_t}%)")
+                lines.append(f"  ❄️ **Zones rares :** {' | '.join(weak_details)}")
+
+            # Données C7 (séries de présences longues) pour ce costume
+            c7_suit = [s for s in compteur7_completed if s['suit'] == suit]
+            if c7_suit:
+                by_h: Dict[int, int] = {}
+                for s7 in c7_suit:
+                    h7 = s7['end_time'].hour
+                    by_h[h7] = by_h.get(h7, 0) + 1
+                top_c7_h = max(by_h, key=by_h.get)
+                lines.append(
+                    f"  🔥 Séries longues souvent terminées vers **{top_c7_h:02d}h** "
+                    f"({by_h[top_c7_h]}x enregistré)"
+                )
+
+            # Données C4 (séries d'absences longues) pour ce costume
+            c4_suit = [s for s in compteur4_events if s['suit'] == suit]
+            if c4_suit:
+                by_h4: Dict[int, int] = {}
+                for s4 in c4_suit:
+                    h4 = s4['end_time'].hour
+                    by_h4[h4] = by_h4.get(h4, 0) + 1
+                top_c4_h = max(by_h4, key=by_h4.get)
+                lines.append(
+                    f"  ⚠️ Longues absences souvent terminées vers **{top_c4_h:02d}h** "
+                    f"({by_h4[top_c4_h]}x enregistré)"
+                )
+
+        # ── Situation en temps réel ───────────────────────────────────────────
+        lines.append(f"\n━━━━━━━━━━━━━━━")
+        lines.append(f"🕐 **Situation MAINTENANT ({current_h:02d}h)**")
+        if current_h in active_hours:
+            ranked = sorted(ALL_SUITS, key=lambda s: taux[s].get(current_h, 0), reverse=True)
+            best   = ranked[0]
+            worst  = ranked[-1]
+            best_p = taux[best].get(current_h, 0)
+            worst_p= taux[worst].get(current_h, 0)
+            trend_lines = []
+            for s in ranked:
+                p    = taux[s].get(current_h, 0)
+                diff = round(p - overall[s], 1)
+                sign = "▲" if diff > 2 else ("▼" if diff < -2 else "▶")
+                trend_lines.append(
+                    f"  {suit_emoji[s]} {suit_names[s]}: **{p:.0f}%** {sign} ({'+' if diff >= 0 else ''}{diff}% vs moy.)"
+                )
+            lines.extend(trend_lines)
+            lines.append(
+                f"\n  🏆 Le plus favorable maintenant : {suit_emoji[best]} **{suit_names[best]}** ({best_p:.0f}%)"
+            )
+            lines.append(
+                f"  ⛔ Le plus rare maintenant : {suit_emoji[worst]} **{suit_names[worst]}** ({worst_p:.0f}%)"
+            )
+
+            # Prévision heure suivante
+            next_h = (current_h + 1) % 24
+            if next_h in active_hours:
+                best_next = max(ALL_SUITS, key=lambda s: taux[s].get(next_h, 0))
+                lines.append(
+                    f"\n  📈 Dans 1h ({next_h:02d}h) : favorable pour "
+                    f"{suit_emoji[best_next]} **{suit_names[best_next]}** "
+                    f"({taux[best_next].get(next_h, 0):.0f}%)"
+                )
+        else:
+            lines.append(f"  ℹ️ Pas encore assez de données pour {current_h:02d}h")
+
+        # ── Conseils globaux du jour ──────────────────────────────────────────
+        lines.append(f"\n━━━━━━━━━━━━━━━")
+        lines.append(f"💡 **CONSEILS STRATÉGIQUES DU JOUR**")
+        for suit in suit_order:
+            name  = suit_names[suit]
+            emoji = suit_emoji[suit]
+            ht    = taux[suit]
+            if not active_hours:
+                continue
+            sorted_desc = sorted(active_hours, key=lambda h: ht.get(h, 0), reverse=True)
+            top_h   = sorted_desc[0]
+            top_t   = ht.get(top_h, 0)
+            low_h   = sorted_desc[-1]
+            low_t   = ht.get(low_h, 0)
+            delta   = round(top_t - low_t)
+
+            # Phrase conseil
+            if delta >= 20:
+                conseil = f"Forte variation — privilégier **{top_h:02d}h** ({top_t:.0f}%), éviter **{low_h:02d}h** ({low_t:.0f}%)"
+            elif delta >= 10:
+                conseil = f"Variation modérée — meilleur créneau **{top_h:02d}h** ({top_t:.0f}%)"
+            else:
+                conseil = f"Comportement stable — peut être joué à tout moment"
+
+            lines.append(f"  {emoji} **{name}** : {conseil}")
+
+        await event.respond("\n".join(lines), parse_mode='markdown')
+
+    except Exception as e:
+        logger.error(f"Erreur cmd_comparaison: {e}")
+        import traceback; logger.error(traceback.format_exc())
         await event.respond(f"❌ Erreur: {e}")
 
 
@@ -3148,7 +4041,8 @@ async def cmd_help(event):
         f"`/queue` — File d'attente\n"
         f"`/status` — Statut complet\n"
         f"`/history` — Historique\n"
-        f"`/reset` — Reset manuel\n\n"
+        f"`/reset` — Reset manuel\n"
+        f"`/debloquer` — 🔓 Déblocage d'urgence (prédictions/costumes bloqués)\n\n"
         f"🤖 Baccarat AI | Source: 1xBet API"
     )
     await event.respond(help_text)
@@ -3163,6 +4057,43 @@ async def cmd_reset(event):
     await event.respond("🔄 Reset en cours...")
     await perform_full_reset("Reset manuel")
     await event.respond("✅ Reset effectué!")
+
+
+async def cmd_debloquer(event):
+    """Déblocage d'urgence : vide pending_predictions, suit_block_until et prediction_queue."""
+    global pending_predictions, suit_block_until, prediction_queue
+    if event.is_group or event.is_channel:
+        return
+    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+        await event.respond("🔒 Admin uniquement")
+        return
+
+    lines = []
+
+    nb_pending = len(pending_predictions)
+    if nb_pending:
+        for gn, pred in list(pending_predictions.items()):
+            stop_animation(gn)
+        pending_predictions.clear()
+        lines.append(f"🧹 {nb_pending} prédiction(s) bloquée(s) supprimée(s)")
+
+    nb_blocked = len([s for s in suit_block_until if datetime.now() < suit_block_until[s]])
+    if nb_blocked:
+        suit_block_until.clear()
+        lines.append(f"🔓 {nb_blocked} costume(s) débloqué(s)")
+
+    nb_queue = len(prediction_queue)
+    if nb_queue:
+        prediction_queue.clear()
+        lines.append(f"🗑️ {nb_queue} prédiction(s) en file supprimée(s)")
+
+    if lines:
+        rapport = "✅ **DÉBLOCAGE D'URGENCE**\n\n" + "\n".join(lines) + "\n\n🟢 Bot actif et prêt."
+    else:
+        rapport = "✅ Rien à débloquer — bot déjà actif."
+
+    logger.warning(f"🔓 Déblocage manuel: {'; '.join(lines) if lines else 'rien'}")
+    await event.respond(rapport, parse_mode='markdown')
 
 
 # ============================================================================
@@ -3675,6 +4606,7 @@ def setup_handlers():
     client.add_event_handler(cmd_status, events.NewMessage(pattern=r'^/status$'))
     client.add_event_handler(cmd_history, events.NewMessage(pattern=r'^/history$'))
     client.add_event_handler(cmd_reset, events.NewMessage(pattern=r'^/reset$'))
+    client.add_event_handler(cmd_debloquer, events.NewMessage(pattern=r'^/debloquer$'))
     client.add_event_handler(cmd_help, events.NewMessage(pattern=r'^/help$'))
     client.add_event_handler(cmd_pourquoi, events.NewMessage(pattern=r'^/pourquoi'))
     client.add_event_handler(cmd_perdus, events.NewMessage(pattern=r'^/perdus$'))
@@ -3683,6 +4615,8 @@ def setup_handlers():
     client.add_event_handler(cmd_emploi, events.NewMessage(pattern=r'^/emploi'))
     client.add_event_handler(cmd_compteur5, events.NewMessage(pattern=r'^/compteur5'))
     client.add_event_handler(cmd_compteur6, events.NewMessage(pattern=r'^/compteur6'))
+    client.add_event_handler(cmd_compteur7, events.NewMessage(pattern=r'^/compteur7'))
+    client.add_event_handler(cmd_comparaison, events.NewMessage(pattern=r'^/comparaison'))
 
 
 async def start_bot():
@@ -3695,6 +4629,11 @@ async def start_bot():
         await client.start(bot_token=BOT_TOKEN)
         setup_handlers()
         initialize_trackers()
+
+        # Charger données persistantes Compteur4, Compteur7 et données horaires
+        load_compteur4_data()
+        load_compteur7_data()
+        load_hourly_data()
 
         if PREDICTION_CHANNEL_ID:
             try:
@@ -3714,37 +4653,58 @@ async def start_bot():
 
 
 async def main():
-    try:
-        if not await start_bot():
-            return
+    # ── Démarrage du serveur web (une seule fois) ──
+    app = web.Application()
+    app.router.add_get('/health', lambda r: web.Response(text="OK"))
+    app.router.add_get('/', lambda r: web.Response(text="BACCARAT AI 🤖 Running | Source: 1xBet API"))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    await site.start()
+    logger.info(f"🌐 Web server port {PORT}")
 
-        asyncio.create_task(auto_reset_system())
-        asyncio.create_task(api_polling_loop())
-        asyncio.create_task(bilan_loop())
-        asyncio.create_task(mode_emploi_loop())
+    # ── Boucle de reconnexion automatique ──
+    background_started = False
+    retry_delay = 5
+    while True:
+        try:
+            if not await start_bot():
+                logger.error("❌ start_bot() a échoué — nouvelle tentative dans 30s")
+                await asyncio.sleep(30)
+                continue
 
-        app = web.Application()
-        app.router.add_get('/health', lambda r: web.Response(text="OK"))
-        app.router.add_get('/', lambda r: web.Response(text="BACCARAT AI 🤖 Running | Source: 1xBet API"))
+            # Tâches de fond : démarrées UNE SEULE FOIS après le premier start_bot réussi
+            if not background_started:
+                asyncio.create_task(auto_reset_system())
+                asyncio.create_task(_api_polling_guardian())   # guardian redémarre si crash
+                asyncio.create_task(auto_watchdog_task())      # watchdog déblocage automatique
+                asyncio.create_task(bilan_loop())
+                asyncio.create_task(mode_emploi_loop())
+                background_started = True
 
-        runner = web.AppRunner(app)
-        await runner.setup()
-        site = web.TCPSite(runner, '0.0.0.0', PORT)
-        await site.start()
+            logger.info(f"📏 Écart: {MIN_GAP_BETWEEN_PREDICTIONS}")
+            logger.info(f"📡 Source: 1xBet API (polling toutes les 4s)")
+            logger.info(f"📊 Compteur4 seuil: {COMPTEUR4_THRESHOLD}")
+            logger.info(f"⏰ Restriction horaire: {'ACTIVE' if PREDICTION_HOURS else 'INACTIVE (24h/24)'}")
 
-        logger.info(f"🌐 Web server port {PORT}")
-        logger.info(f"📏 Écart: {MIN_GAP_BETWEEN_PREDICTIONS}")
-        logger.info(f"📡 Source: 1xBet API (polling toutes les 4s)")
-        logger.info(f"📊 Compteur4 seuil: {COMPTEUR4_THRESHOLD}")
-        logger.info(f"⏰ Restriction horaire: {'ACTIVE' if PREDICTION_HOURS else 'INACTIVE (24h/24)'}")
+            retry_delay = 5   # reset après connexion réussie
+            await client.run_until_disconnected()
+            logger.warning("⚠️ Telegram déconnecté — reconnexion dans 5s...")
 
-        await client.run_until_disconnected()
+        except KeyboardInterrupt:
+            logger.info("Arrêt manuel demandé.")
+            break
+        except Exception as e:
+            logger.error(f"❌ Erreur boucle principale: {e} — reconnexion dans {retry_delay}s")
 
-    except Exception as e:
-        logger.error(f"❌ Erreur main: {e}")
-    finally:
-        if client and client.is_connected():
-            await client.disconnect()
+        await asyncio.sleep(retry_delay)
+        retry_delay = min(retry_delay * 2, 120)   # backoff exponentiel max 2 min
+
+        try:
+            if client and client.is_connected():
+                await client.disconnect()
+        except Exception:
+            pass
 
 
 if __name__ == '__main__':

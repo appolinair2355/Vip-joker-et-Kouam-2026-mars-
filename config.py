@@ -10,16 +10,16 @@ import os
 # TELEGRAM API CREDENTIALS
 # ============================================================================
 
-API_ID = int(os.environ.get("API_ID", 29177661))
-API_HASH = os.environ.get("API_HASH", "a8639172fa8d35dbfd8ea46286d349ab")
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8442253971:AAEisYucgZ49Ej2b-mK9_6DhNrqh9WOc_XU")
+API_ID = int(os.environ.get("API_ID") or 29177661)
+API_HASH = os.environ.get("API_HASH") or "a8639172fa8d35dbfd8ea46286d349ab"
+BOT_TOKEN = os.environ.get("BOT_TOKEN") or "8442253971:AAEisYucgZ49Ej2b-mK9_6DhNrqh9WOc_XU"
 
 # ============================================================================
 # ADMIN ET CANAUX
 # ============================================================================
 
-ADMIN_ID = int(os.environ.get("ADMIN_ID", 1190237801))
-PREDICTION_CHANNEL_ID = int(os.environ.get("PREDICTION_CHANNEL_ID", -1003329818758))
+ADMIN_ID = int(os.environ.get("ADMIN_ID") or 1190237801)
+PREDICTION_CHANNEL_ID = int(os.environ.get("PREDICTION_CHANNEL_ID") or -1003329818758)
 
 # ============================================================================
 # PARAMÈTRES DU SERVEUR WEB
