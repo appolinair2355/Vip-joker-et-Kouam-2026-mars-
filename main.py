@@ -7,7 +7,7 @@ import io
 import json
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Set, Tuple
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from telethon import TelegramClient, events, utils
 from telethon.sessions import StringSession
 from telethon.errors import (
@@ -17,6 +17,7 @@ from telethon.errors import (
 import aiohttp as _aiohttp
 from aiohttp import web
 from fpdf import FPDF
+from fpdf.enums import XPos, YPos
 
 from config import (
     API_ID, API_HASH, BOT_TOKEN, ADMIN_ID,
@@ -26,7 +27,9 @@ from config import (
     COMPTEUR9_SS_DEFAULT,
     COMPTEUR8_THRESHOLD, COMPTEUR8_DATA_FILE,
     COMPTEUR9_DATA_FILE,
+    DATABASE_URL,
 )
+import db as db
 from api_utils import get_latest_results
 from parole import get_parole
 
@@ -90,37 +93,46 @@ bilan_1440_sent: bool = False  # Évite le double envoi au jeu #1440
 
 # Heures favorables automatique vers le canal
 heures_favorables_active: bool = True  # Annonce toutes les 3h pile
-mode_emploi_sent_games: set = set()    # Jeux déjà traités pour l'envoi du mode d'emploi
+
+comparaison_nb_jours: int = 3          # Nombre de jours à comparer (modifiable par admin)
 
 # Mode d'emploi automatique vers le canal de prédiction
 MODE_EMPLOI_DEFAULT = """📌 *BOT BACCARAT — MODE D'EMPLOI*
 
-🎯 Le bot prédit l'enseigne du joueur en temps réel :
+Le bot analyse les manches en temps réel et prédit l'enseigne que le joueur recevra :
 ♠️ Pique · ♦️ Carreau · ♣️ Trèfle · ❤️ Cœur
 
 ━━━━━━━━━━━━━━━━━━━━━━
-🕹️ *Comment jouer ?*
-1️⃣ Repérez le numéro de manche affiché par le bot sur votre bookmaker.
-2️⃣ Misez sur → *« Le joueur reçoit une carte enseigne »* et choisissez l'enseigne indiquée.
-3️⃣ En cas d'échec, le bot génère un rattrapage (R1, R2, R3) — augmentez la mise selon le plan.
+🟢 *DÉBUTANTS*
+
+1️⃣ Repérez le numéro de manche affiché sur votre bookmaker.
+2️⃣ Misez sur *« Le joueur reçoit une carte [enseigne indiquée] »*.
+3️⃣ Suivez la couleur de la barre affichée par le bot :
+
+🟦 *Barre bleue — R0* : mise de départ (niveau initial)
+🟩 *Barre verte — R1* : 1er rattrapage — augmentez la mise
+🟨 *Barre jaune — R2* : 2ème rattrapage — augmentez encore
+🟥 *Barre rouge — R3* : 3ème rattrapage — niveau maximum
+
+4️⃣ Dès un gain, revenez immédiatement à la barre bleue (R0).
+
+• Démarrez toujours par la mise la plus basse.
+• Ne franchissez jamais le niveau rouge (R3).
 
 ━━━━━━━━━━━━━━━━━━━━━━
-🟢 *DÉBUTANTS — Comment miser ?*
-• Commencez toujours par la mise la plus basse.
-• À chaque échec, passez au niveau suivant (R1, R2, R3...).
-• Dès un gain, revenez immédiatement à votre mise de départ.
-• Ne sautez jamais un niveau et ne dépassez pas 6 niveaux.
+🔵 *PROFESSIONNELS*
 
-🔵 *PROS — Pas grand chose à vous expliquer.*
-Vous connaissez déjà la gestion de mise.
-Faites confiance au signal du bot et gérez votre bankroll comme à votre habitude.
+Vous maîtrisez déjà la gestion de mise — Kouamé n'a pas grand-chose à vous apprendre.
+Fiez-vous simplement à la couleur de la barre et gérez votre bankroll comme à votre habitude.
 
 ━━━━━━━━━━━━━━━━━━━━━━
 🧠 *Règles essentielles*
-• Misez après un *PERDU ❌* sur les prédictions suivantes, de préférence à la prochaine heure favorable affichée par le bot.
-• Ne jamais dépasser 6 niveaux.
-• Toujours revenir au début après un gain.
-• Maximum 4 séries par jour."""
+• Ne dépassez jamais le niveau R3 (barre rouge).
+• Revenez systématiquement au R0 (barre bleue) après chaque gain.
+• Limitez-vous à quatre séries par jour.
+
+━━━━━━━━━━━━━━━━━━━━━━
+Pour en savoir plus ou paiement écrivez directement 👉🏻 @Kouam2025_bot"""
 
 mode_emploi_text: str = MODE_EMPLOI_DEFAULT        # Texte modifiable par l'admin
 mode_emploi_interval_hours: int = 0               # Désactivé — envoi basé sur jeu #480/#960/#1440
@@ -150,6 +162,12 @@ animation_tasks: Dict[int, asyncio.Task] = {}
 # Canaux secondaires
 DISTRIBUTION_CHANNEL_ID = None
 COMPTEUR2_CHANNEL_ID = None
+
+# Compteur 11 — Perdu hier → prédit demain
+compteur11_perdu_hier:   List[Dict] = []   # [{game_number, suit, date}] prédictions perdues HIER
+compteur11_perdu_today:  List[Dict] = []   # [{game_number, suit, date}] prédictions perdues AUJOURD'HUI
+compteur11_triggered:    set = set()        # Jeux déjà déclenchés ce cycle (évite doublons)
+COMPTEUR11_FILE = 'compteur11_data.json'
 
 # ============================================================================
 # SYSTÈME DE RESTRICTION HORAIRE
@@ -292,7 +310,7 @@ def generate_compteur4_pdf(events_list: List[Dict]) -> bytes:
     pdf.set_font('Helvetica', 'B', 16)
     pdf.set_fill_color(120, 30, 0)
     pdf.set_text_color(255, 255, 255)
-    pdf.cell(0, 12, 'BACCARAT AI - Absences Consecutives Compteur 4', ln=True, align='C', fill=True)
+    pdf.cell(0, 12, 'BACCARAT AI - Absences Consecutives Compteur 4', new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C', fill=True)
     pdf.ln(4)
 
     pdf.set_font('Helvetica', '', 10)
@@ -300,8 +318,7 @@ def generate_compteur4_pdf(events_list: List[Dict]) -> bytes:
     pdf.cell(0, 6,
         f'Seuil: {COMPTEUR4_THRESHOLD} absences consecutives | '
         f'Genere le {datetime.now().strftime("%d/%m/%Y %H:%M")} | '
-        f'Total: {len(events_list)} serie(s) | PERSISTANT',
-        ln=True, align='C'
+        f'Total: {len(events_list)} serie(s) | PERSISTANT', new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C'
     )
     pdf.ln(6)
 
@@ -361,7 +378,7 @@ def generate_compteur4_pdf(events_list: List[Dict]) -> bytes:
     pdf.set_font('Helvetica', 'B', 12)
     pdf.set_fill_color(120, 30, 0)
     pdf.set_text_color(255, 255, 255)
-    pdf.cell(0, 10, 'Resume par costume', ln=True, fill=True, align='C')
+    pdf.cell(0, 10, 'Resume par costume', new_x=XPos.LMARGIN, new_y=YPos.NEXT, fill=True, align='C')
     pdf.ln(3)
     from collections import Counter
     suit_counts = Counter(ev.get('suit', '') for ev in events_list)
@@ -371,15 +388,14 @@ def generate_compteur4_pdf(events_list: List[Dict]) -> bytes:
         pdf.set_text_color(r, g, b)
         name = suit_names_map.get(suit, suit)
         cnt  = suit_counts.get(suit, 0)
-        pdf.cell(0, 8, f'  {name} : {cnt} serie(s) de {COMPTEUR4_THRESHOLD}+ absences', ln=True)
+        pdf.cell(0, 8, f'  {name} : {cnt} serie(s) de {COMPTEUR4_THRESHOLD}+ absences', new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
     pdf.ln(5)
     pdf.set_font('Helvetica', 'I', 9)
     pdf.set_text_color(130, 130, 130)
     pdf.cell(0, 6,
         f'BACCARAT AI - PERSISTANT - Reset #1440 ne supprime PAS ce fichier - '
-        f'{datetime.now().strftime("%d/%m/%Y %H:%M")}',
-        ln=True, align='C'
+        f'{datetime.now().strftime("%d/%m/%Y %H:%M")}', new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C'
     )
     return bytes(pdf.output())
 
@@ -499,7 +515,7 @@ def generate_compteur5_pdf(events_list: List[Dict]) -> bytes:
     pdf.set_font('Helvetica', 'B', 16)
     pdf.set_fill_color(0, 100, 50)
     pdf.set_text_color(255, 255, 255)
-    pdf.cell(0, 12, 'BACCARAT AI - Presences Consecutives Compteur 5', ln=True, align='C', fill=True)
+    pdf.cell(0, 12, 'BACCARAT AI - Presences Consecutives Compteur 5', new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C', fill=True)
     pdf.ln(4)
 
     pdf.set_font('Helvetica', '', 10)
@@ -507,8 +523,7 @@ def generate_compteur5_pdf(events_list: List[Dict]) -> bytes:
     pdf.cell(0, 6,
         f'Seuil: {COMPTEUR5_THRESHOLD} presences consecutives | '
         f'Genere le {datetime.now().strftime("%d/%m/%Y %H:%M")} | '
-        f'Total: {len(events_list)} evenement(s)',
-        ln=True, align='C'
+        f'Total: {len(events_list)} evenement(s)', new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C'
     )
     pdf.ln(6)
 
@@ -563,7 +578,7 @@ def generate_compteur5_pdf(events_list: List[Dict]) -> bytes:
     pdf.set_font('Helvetica', 'B', 12)
     pdf.set_fill_color(0, 100, 50)
     pdf.set_text_color(255, 255, 255)
-    pdf.cell(0, 10, 'Resume par costume', ln=True, fill=True, align='C')
+    pdf.cell(0, 10, 'Resume par costume', new_x=XPos.LMARGIN, new_y=YPos.NEXT, fill=True, align='C')
     pdf.ln(3)
     from collections import Counter as _Counter
     suit_counts = _Counter(ev.get('suit', '') for ev in events_list)
@@ -573,12 +588,12 @@ def generate_compteur5_pdf(events_list: List[Dict]) -> bytes:
         pdf.set_text_color(r, g, b)
         name = suit_names_map.get(suit, suit)
         cnt  = suit_counts.get(suit, 0)
-        pdf.cell(0, 8, f'  {name} : {cnt} fois le seuil de {COMPTEUR5_THRESHOLD} atteint', ln=True)
+        pdf.cell(0, 8, f'  {name} : {cnt} fois le seuil de {COMPTEUR5_THRESHOLD} atteint', new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
     pdf.ln(5)
     pdf.set_font('Helvetica', 'I', 9)
     pdf.set_text_color(130, 130, 130)
-    pdf.cell(0, 6, f'BACCARAT AI - CONFIDENTIEL - {datetime.now().strftime("%d/%m/%Y %H:%M")}', ln=True, align='C')
+    pdf.cell(0, 6, f'BACCARAT AI - CONFIDENTIEL - {datetime.now().strftime("%d/%m/%Y %H:%M")}', new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C')
 
     return bytes(pdf.output())
 
@@ -852,7 +867,7 @@ def generate_perdu_pdf(events: List[Dict]) -> bytes:
         pdf.set_font('Helvetica', 'B', 12)
         pdf.set_fill_color(r, g, b)
         pdf.set_text_color(255, 255, 255)
-        pdf.cell(0, 10, title, ln=True, fill=True, align='C')
+        pdf.cell(0, 10, title, new_x=XPos.LMARGIN, new_y=YPos.NEXT, fill=True, align='C')
         pdf.ln(3)
         pdf.set_text_color(0, 0, 0)
 
@@ -860,15 +875,14 @@ def generate_perdu_pdf(events: List[Dict]) -> bytes:
     pdf.set_font('Helvetica', 'B', 16)
     pdf.set_fill_color(139, 0, 0)
     pdf.set_text_color(255, 255, 255)
-    pdf.cell(0, 12, 'BACCARAT AI - Analyse Complete des Pertes', ln=True, align='C', fill=True)
+    pdf.cell(0, 12, 'BACCARAT AI - Analyse Complete des Pertes', new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C', fill=True)
     pdf.ln(4)
     pdf.set_font('Helvetica', '', 10)
     pdf.set_text_color(100, 100, 100)
     pdf.cell(0, 6,
         f'Genere le {datetime.now().strftime("%d/%m/%Y %H:%M")} | '
         f'Total: {len(events)} perte(s) | '
-        f'Dates analysees: {len(date_analysis["dates_analysees"])}',
-        ln=True, align='C'
+        f'Dates analysees: {len(date_analysis["dates_analysees"])}', new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C'
     )
     pdf.ln(6)
 
@@ -933,7 +947,7 @@ def generate_perdu_pdf(events: List[Dict]) -> bytes:
     else:
         pdf.set_text_color(150, 150, 150)
         pdf.set_font('Helvetica', '', 10)
-        pdf.cell(0, 8, 'Pas encore assez de donnees par date.', ln=True)
+        pdf.cell(0, 8, 'Pas encore assez de donnees par date.', new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
     # ── Analyse par heure (fréquence cross-dates) ────────────────────────────
     section_header('Frequence des Heures de Perte (toutes dates confondues)', 100, 50, 0)
@@ -968,7 +982,7 @@ def generate_perdu_pdf(events: List[Dict]) -> bytes:
     else:
         pdf.set_text_color(150, 150, 150)
         pdf.set_font('Helvetica', '', 10)
-        pdf.cell(0, 8, 'Aucune donnee disponible.', ln=True)
+        pdf.cell(0, 8, 'Aucune donnee disponible.', new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
     # ── Analyse par jour de la semaine ───────────────────────────────────────
     section_header('Pertes par Jour de la Semaine', 80, 0, 120)
@@ -989,7 +1003,7 @@ def generate_perdu_pdf(events: List[Dict]) -> bytes:
     else:
         pdf.set_text_color(150, 150, 150)
         pdf.set_font('Helvetica', '', 10)
-        pdf.cell(0, 8, 'Aucune donnee disponible.', ln=True)
+        pdf.cell(0, 8, 'Aucune donnee disponible.', new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
     # ── Seuils B par costume ─────────────────────────────────────────────────
     section_header('Seuils B actuels par Costume', 70, 70, 70)
@@ -997,7 +1011,7 @@ def generate_perdu_pdf(events: List[Dict]) -> bytes:
     pdf.set_text_color(0, 0, 0)
     for suit in ['♠', '♥', '♦', '♣']:
         b_val = compteur2_seuil_B_per_suit.get(suit, compteur2_seuil_B)
-        pdf.cell(0, 8, f'  {suit_names.get(suit, suit)}: B = {b_val}', ln=True)
+        pdf.cell(0, 8, f'  {suit_names.get(suit, suit)}: B = {b_val}', new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
     # ── Recommandation finale ────────────────────────────────────────────────
     section_header('RECOMMANDATION - Plages Horaires Conseilees', 0, 100, 0)
@@ -1007,22 +1021,22 @@ def generate_perdu_pdf(events: List[Dict]) -> bytes:
         danger_ranges = _group_hours_into_ranges(date_analysis['danger_hours'])
         pdf.set_font('Helvetica', 'B', 11)
         pdf.set_text_color(180, 0, 0)
-        pdf.cell(0, 8, '  Plages a EVITER :', ln=True)
+        pdf.cell(0, 8, '  Plages a EVITER :', new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         pdf.set_font('Helvetica', '', 10)
         for s, e in danger_ranges:
             nb = max(date_analysis['hour_freq'].get(h, 0) for h in range(s, e + 1))
             label = f'{s:02d}h00 - {e+1:02d}h00' if s != e else f'{s:02d}h00 - {s+1:02d}h00'
-            pdf.cell(0, 8, f'    X  {label}  (pertes sur {nb} date(s))', ln=True)
+            pdf.cell(0, 8, f'    X  {label}  (pertes sur {nb} date(s))', new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         pdf.ln(3)
 
     if date_analysis.get('safe_ranges'):
         pdf.set_font('Helvetica', 'B', 11)
         pdf.set_text_color(0, 120, 0)
-        pdf.cell(0, 8, '  Plages RECOMMANDEES :', ln=True)
+        pdf.cell(0, 8, '  Plages RECOMMANDEES :', new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         pdf.set_font('Helvetica', '', 10)
         for s, e in date_analysis['safe_ranges']:
             label = f'{s:02d}h00 - {e+1:02d}h00' if s != e else f'{s:02d}h00 - {s+1:02d}h00'
-            pdf.cell(0, 8, f'    OK  {label}', ln=True)
+            pdf.cell(0, 8, f'    OK  {label}', new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         pdf.ln(4)
 
     pdf.set_font('Helvetica', 'I', 10)
@@ -1034,7 +1048,7 @@ def generate_perdu_pdf(events: List[Dict]) -> bytes:
     pdf.ln(5)
     pdf.set_font('Helvetica', 'I', 9)
     pdf.set_text_color(150, 150, 150)
-    pdf.cell(0, 6, "Ce PDF est envoye uniquement a l'administrateur - CONFIDENTIEL", ln=True, align='C')
+    pdf.cell(0, 6, "Ce PDF est envoye uniquement a l'administrateur - CONFIDENTIEL", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C')
 
     return bytes(pdf.output())
 
@@ -1173,15 +1187,114 @@ async def bilan_loop():
             logger.error(f"❌ Erreur bilan_loop: {e}")
             await asyncio.sleep(60)
 
-def compute_heures_favorables(min_games: int = 5, seuil_bonus: float = 0.08) -> List[Dict]:
+def compute_heures_favorables_by_winrate(min_preds: int = 10) -> List[Dict]:
+    """
+    Calcule les heures favorables à partir du win-rate des prédictions par tranche horaire.
+    Retourne une liste {heure, win_rate, nb_preds} pour les heures avec win_rate >= 60%.
+    Nécessite au moins 10 prédictions résolues par heure pour être fiable.
+    """
+    from collections import defaultdict
+    wins_by_hour:  Dict[int, int] = defaultdict(int)
+    total_by_hour: Dict[int, int] = defaultdict(int)
+
+    for pred in prediction_history:
+        status = pred.get('status', '')
+        if status.startswith('gagne') or status == 'perdu':  # traiter seulement les prédictions résolues
+            ts = pred.get('predicted_at')
+            if not ts:
+                continue
+            h = ts.hour if isinstance(ts, datetime) else 0
+            total_by_hour[h] += 1
+            if status.startswith('gagne'):
+                wins_by_hour[h] += 1
+
+    results = []
+    for h in range(24):
+        nb = total_by_hour[h]
+        if nb < min_preds:
+            continue
+        wr = wins_by_hour[h] / nb
+        if wr >= 0.60:
+            results.append({'heure': h, 'win_rate': round(wr * 100, 1), 'nb_preds': nb})
+
+    results.sort(key=lambda x: x['win_rate'], reverse=True)
+    return results
+
+
+def group_heures_into_intervals(heures: List[int]) -> List[str]:
+    """
+    Regroupe une liste d'heures en intervalles consécutifs.
+    Ex: [12, 13, 14, 17, 22] → ["12h–15h", "17h–18h", "22h–23h"]
+    """
+    if not heures:
+        return []
+    heures = sorted(set(heures))
+    intervals = []
+    start = heures[0]
+    end   = heures[0]
+    for h in heures[1:]:
+        if h == end + 1:
+            end = h
+        else:
+            intervals.append(f"{start:02d}h–{end+1:02d}h")
+            start = end = h
+    intervals.append(f"{start:02d}h–{end+1:02d}h")
+    return intervals
+
+
+def generate_heures_favorables_canal() -> str:
+    """
+    Génère un message simplifié pour le canal de prédiction :
+    - Affiche UNIQUEMENT les créneaux horaires (pas de détails % ni de costumes)
+    - Indique la prochaine fenêtre favorable à venir
+    Les détails complets sont réservés à l'administrateur.
+    """
+    SIGNATURE = "\n\n_En Dieu nous comptons, Sossou Kouamé prediction 🔥_"
+    now_ci = datetime.now(timezone.utc).replace(tzinfo=None)  # Côte d'Ivoire = UTC+0
+    now_h  = now_ci.hour
+
+    stat_results = compute_heures_favorables()
+    all_heures   = sorted(e['heure'] for e in stat_results)
+    total_games  = sum(hourly_game_count[h] for h in range(24))
+
+    lines = ["⏰ *Heures favorables* _(heure de Côte d'Ivoire)_\n"]
+
+    if total_games < 100:
+        lines.append(f"_⏳ Analyse en cours ({total_games}/100 jeux)..._")
+        return "\n".join(lines) + SIGNATURE
+
+    if not all_heures:
+        lines.append("_Aucun créneau significatif détecté pour l'instant._")
+        return "\n".join(lines) + SIGNATURE
+
+    # Canal : seulement les intervalles, aucun détail
+    intervals = group_heures_into_intervals(all_heures)
+    lines.append("🟢 *Créneaux favorables :* " + " · ".join(intervals))
+
+    upcoming = [h for h in all_heures if h > now_h] or all_heures
+    nxt   = upcoming[0]
+    diff  = (nxt - now_h) % 24
+    nxt_i = group_heures_into_intervals([nxt])[0]
+    if diff == 0:
+        lines.append(f"⏩ *Prochain créneau : {nxt_i}* _maintenant_")
+    elif diff == 1:
+        lines.append(f"⏩ *Prochain créneau : {nxt_i}* _dans 1h_")
+    else:
+        lines.append(f"⏩ *Prochain créneau : {nxt_i}* _dans {diff}h_")
+
+    return "\n".join(lines) + SIGNATURE
+
+
+def compute_heures_favorables(min_games: int = 15, seuil_bonus: float = 0.10) -> List[Dict]:
     """
     Analyse les données historiques heure par heure pour trouver les heures favorables.
 
     Méthode statistique :
       1. Calcule la fréquence moyenne globale de chaque costume (sur toutes les heures actives)
       2. Pour chaque heure, compare la fréquence locale vs la moyenne
-      3. Un costume est "favorisé" à une heure si son écart positif ≥ seuil_bonus (8% par défaut)
+      3. Un costume est "favorisé" à une heure si son écart positif ≥ seuil_bonus (10% par défaut)
       4. Le score d'une heure = somme des écarts positifs (plus élevé = plus favorable)
+      5. Nécessite au moins 15 jeux par heure pour être pris en compte (fiabilité statistique)
 
     Retourne une liste triée par score décroissant.
     """
@@ -1226,98 +1339,100 @@ def compute_heures_favorables(min_games: int = 5, seuil_bonus: float = 0.08) -> 
 
 def generate_heures_favorables_text() -> str:
     """
-    Génère le message des heures favorables à envoyer dans le canal.
-    Annoncé toutes les 3h — indique les costumes statistiquement dominants par heure.
+    Génère le message DÉTAILLÉ des heures favorables — réservé à l'administrateur.
+    Contient les pourcentages, costumes dominants et nombre de jeux par créneau.
     """
-    now      = datetime.now()
+    now        = datetime.now(timezone.utc).replace(tzinfo=None)  # Côte d'Ivoire = UTC+0
     favorables = compute_heures_favorables()
-    suit_emoji = {'♠': '♠️', '♥': '❤️', '♦': '♦️', '♣': '♣️'}
     suit_names = {'♠': 'Pique', '♥': 'Cœur', '♦': 'Carreau', '♣': 'Trèfle'}
+
+    total_active = sum(1 for h in range(24) if hourly_game_count[h] >= 15)
+    total_games  = sum(hourly_game_count[h] for h in range(24))
 
     lines = [
         f"📈 **HEURES FAVORABLES — ANALYSE STATISTIQUE**",
-        f"_{now.strftime('%d/%m/%Y à %Hh%M')}_\n",
+        f"_{now.strftime('%d/%m/%Y à %Hh%M')}_",
+        f"_Basé sur {total_games} jeux · {total_active} heures actives (≥15 jeux/h)_\n",
     ]
 
-    total_active = sum(1 for h in range(24) if hourly_game_count[h] >= 5)
-    total_games  = sum(hourly_game_count[h] for h in range(24))
-
-    if total_games < 20:
+    if total_games < 100:
         lines.append(
-            "⚠️ _Données insuffisantes — le bot accumule les statistiques en temps réel._\n"
-            "_Plus il fonctionne longtemps, plus la détection est précise._"
+            f"⚠️ _Accumulation en cours ({total_games}/100 jeux)_\n"
+            "_Plus le bot fonctionne longtemps, plus la détection est précise._"
         )
         return "\n".join(lines)
-
-    lines.append(f"_Basé sur **{total_games}** jeux analysés | **{total_active}** heures actives_\n")
 
     if not favorables:
-        lines.append("_Aucune heure significativement favorable détectée pour l'instant._")
-        lines.append("_Les données s'affinent avec le temps._")
+        lines.append("_Aucune heure significativement favorable détectée._")
+        lines.append("_Critères : ≥15 jeux/h · costume ≥+10% au-dessus de sa moyenne._")
         return "\n".join(lines)
 
-    # Top 5 meilleures heures
-    lines.append("🏆 **Top heures favorables (score = écart cumulé vs moyenne) :**\n")
-    for rank, entry in enumerate(favorables[:5], 1):
-        h       = entry['heure']
-        score   = entry['score']
-        suits   = entry['suits']
-        medal   = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"][rank - 1]
+    # Toutes les heures favorables avec détails complets
+    lines.append("🏆 **Heures favorables (score = écart cumulé des costumes) :**\n")
+    medals = ["🥇", "🥈", "🥉"] + ["▪️"] * 21
+    for rank, entry in enumerate(favorables, 1):
+        h     = entry['heure']
+        score = entry['score']
+        suits = entry['suits']
+        nb_h  = hourly_game_count[h]
+        medal = medals[rank - 1]
         suit_parts = " | ".join(
-            f"{suit_emoji.get(s['suit'], s['suit'])} +{s['bonus']}%" for s in suits
+            f"{s['suit']} {suit_names.get(s['suit'],'')} {s['pct']}% (+{s['bonus']}%)"
+            for s in suits
         )
-        lines.append(f"{medal} **{h:02d}h00** — score {score:.1f}%")
+        lines.append(f"{medal} **{h:02d}h** — score {score:.1f}% · {nb_h} jeux")
         lines.append(f"   ↳ {suit_parts}")
 
-    # Prochaine heure favorable (parmi les prochaines 6h)
-    next_favs = [e for e in favorables if e['heure'] > now.hour]
-    if not next_favs:
-        next_favs = [e for e in favorables if e['heure'] <= now.hour]
-
+    # Prochaine heure favorable
+    next_favs = [e for e in favorables if e['heure'] > now.hour] or favorables
     if next_favs:
-        nxt = next_favs[0]
-        h   = nxt['heure']
+        nxt  = next_favs[0]
+        h    = nxt['heure']
         diff = (h - now.hour) % 24
-        suit_str = " & ".join(
-            f"{suit_emoji.get(s['suit'], s['suit'])} {suit_names.get(s['suit'], s['suit'])} (+{s['bonus']}%)"
-            for s in nxt['suits']
-        )
-        lines.append(f"\n⏰ **Prochaine heure favorable : {h:02d}h00**")
-        lines.append(f"   Dans **{diff}h** — {suit_str}")
+        top  = nxt['suits'][0]
+        lines.append(f"\n⏰ **Prochain créneau : {h:02d}h** — dans {diff}h")
+        lines.append(f"   ↳ {top['suit']} {suit_names.get(top['suit'],'')} {top['pct']}% (+{top['bonus']}%)")
 
     lines.append(
-        "\n_📌 Méthode : fréquence historique par heure vs moyenne globale._\n"
-        "_Un costume est favori si +8% au-dessus de sa moyenne._"
+        "\n_📌 Méthode : distribution % des costumes par heure vs moyenne globale._\n"
+        "_Seuils : ≥15 jeux/h · écart ≥+10% pour être retenu._"
     )
     return "\n".join(lines)
 
 
 def generate_heures_favorables_intervals() -> str:
     """
-    Génère le bloc heures favorables sous forme d'intervalles de 2h (heure du Bénin = UTC+1).
-    Retourne une chaîne à coller à la fin du mode d'emploi.
+    Bloc heures favorables simplifié pour le canal (mode d'emploi).
+    Affiche uniquement les créneaux horaires — aucun détail (% ou costumes).
     """
-    from datetime import timedelta
-    favorables = compute_heures_favorables()
-    benin_offset = timedelta(hours=1)
-    now_benin = datetime.utcnow() + benin_offset
+    SIGNATURE = "\n\n_En Dieu nous comptons, Sossou Kouamé prediction 🔥_"
+    now_ci  = datetime.now(timezone.utc).replace(tzinfo=None)  # Côte d'Ivoire = UTC+0
+    now_h   = now_ci.hour
 
-    header = "\n\n━━━━━━━━━━━━━━━━━━━━━━\n⏰ *Heures favorables* _(heure du Bénin)_"
+    stat_results = compute_heures_favorables()
+    all_heures   = sorted(e['heure'] for e in stat_results)
+    total_games  = sum(hourly_game_count[h] for h in range(24))
 
-    if not favorables:
-        total_games = sum(hourly_game_count[h] for h in range(24))
-        if total_games < 20:
-            return header + "\n_Données en cours d'accumulation..._"
-        return header + "\n_Aucune heure significativement favorable détectée._"
+    header = "\n\n━━━━━━━━━━━━━━━━━━━━━━\n⏰ *Heures favorables* _(heure de Côte d'Ivoire)_"
 
-    intervals = []
-    for entry in favorables:
-        h_srv = entry['heure']
-        h_ben = (h_srv + 1) % 24
-        h_end = (h_ben + 2) % 24
-        intervals.append(f"{h_ben:02d}h00–{h_end:02d}h00")
+    if total_games < 100:
+        return header + f"\n_⏳ Analyse en cours ({total_games}/100 jeux)..._" + SIGNATURE
 
-    return header + "\n👉 " + " · ".join(intervals)
+    if not all_heures:
+        return header + "\n_Aucun créneau significatif détecté pour l'instant._" + SIGNATURE
+
+    intervals = group_heures_into_intervals(all_heures)
+    lines = [header, "🟢 *Créneaux favorables :* " + " · ".join(intervals)]
+
+    upcoming = [h for h in all_heures if h > now_h] or all_heures
+    if upcoming:
+        nxt   = upcoming[0]
+        diff  = (nxt - now_h) % 24
+        nxt_i = group_heures_into_intervals([nxt])[0]
+        dans  = f"dans {diff}h" if diff > 0 else "maintenant"
+        lines.append(f"⏩ *Prochain créneau : {nxt_i}* _{dans}_")
+
+    return "\n".join(lines) + SIGNATURE
 
 
 async def send_mode_emploi_with_heures():
@@ -1329,16 +1444,37 @@ async def send_mode_emploi_with_heures():
         entity = await resolve_channel(PREDICTION_CHANNEL_ID)
         if entity:
             txt = mode_emploi_text + generate_heures_favorables_intervals()
-            await client.send_message(entity, txt, parse_mode='markdown')
+            sent = await client.send_message(entity, txt, parse_mode='markdown')
             logger.info("📋 Mode d'emploi + heures favorables envoyé dans le canal")
+            asyncio.create_task(auto_delete_canal_message(sent.id))
     except Exception as e:
         logger.error(f"❌ Erreur send_mode_emploi_with_heures: {e}")
 
 
+async def send_heures_favorables_simple():
+    """
+    Envoie le message créneaux favorables dans le canal.
+    Appelé au démarrage du bot et après chaque reset #1440.
+    """
+    if not PREDICTION_CHANNEL_ID:
+        return
+    try:
+        entity = await resolve_channel(PREDICTION_CHANNEL_ID)
+        if not entity:
+            return
+        txt = generate_heures_favorables_canal()
+        sent = await client.send_message(entity, txt, parse_mode='markdown')
+        logger.info("⏰ Heures favorables envoyées dans le canal de prédiction")
+        asyncio.create_task(auto_delete_canal_message(sent.id))
+    except Exception as e:
+        logger.error(f"❌ Erreur send_heures_favorables_simple: {e}")
+
+
 async def heures_favorables_loop():
     """
-    Envoie les heures favorables dans le canal toutes les 3h à heure alignée :
-    00h, 03h, 06h, 09h, 12h, 15h, 18h, 21h
+    Toutes les 3h (00h, 03h, 06h, 09h, 12h, 15h, 18h, 21h) :
+    - Admin : rapport statistique complet (privé)
+    - Canal : message court avec créneaux favorables (intervalles + prochain créneau)
     """
     global heures_favorables_active
     interval = 3
@@ -1356,16 +1492,31 @@ async def heures_favorables_loop():
                 continue
 
             heure = datetime.now().strftime('%H:%M')
-            txt   = generate_heures_favorables_text()
 
-            # Chat privé admin uniquement
+            # ── Admin : rapport complet ──────────────────────────────────────
             if ADMIN_ID and ADMIN_ID != 0:
                 try:
                     admin_entity = await client.get_entity(ADMIN_ID)
-                    await client.send_message(admin_entity, txt, parse_mode='markdown')
-                    logger.info(f"📈 Heures favorables envoyées à l'admin ({heure})")
+                    await client.send_message(
+                        admin_entity, generate_heures_favorables_text(), parse_mode='markdown'
+                    )
+                    logger.info(f"📈 Heures favorables (admin) envoyées ({heure})")
                 except Exception as admin_err:
                     logger.error(f"❌ Heures favorables admin: {admin_err}")
+
+            # ── Canal : message court créneaux favorables ────────────────────
+            if PREDICTION_CHANNEL_ID:
+                try:
+                    canal_entity = await resolve_channel(PREDICTION_CHANNEL_ID)
+                    if canal_entity:
+                        sent = await client.send_message(
+                            canal_entity, generate_heures_favorables_canal(), parse_mode='markdown'
+                        )
+                        logger.info(f"⏰ Heures favorables (canal) envoyées ({heure})")
+                        asyncio.create_task(auto_delete_canal_message(sent.id))
+                except Exception as canal_err:
+                    logger.error(f"❌ Heures favorables canal: {canal_err}")
+
         except Exception as e:
             logger.error(f"❌ Erreur heures_favorables_loop: {e}")
             await asyncio.sleep(60)
@@ -1456,18 +1607,15 @@ def update_compteur5(game_number: int, player_suits: Set[str], player_cards_raw:
 # ============================================================================
 
 def update_compteur6(player_suits: Set[str]):
-    """Incrémente le compteur d'apparitions Compteur6 pour chaque costume présent.
-    Le compteur est plafonné à Wj pour ne jamais dépasser le seuil affiché."""
+    """Incrémente librement le compteur d'apparitions Compteur6 pour chaque costume présent.
+    Aucun plafond : c'est apply_compteur6() qui remet à 0 quand le seuil Wj est atteint."""
     global compteur6_trackers
     for suit in player_suits:
         if suit in compteur6_trackers:
-            new_val = compteur6_trackers[suit] + 1
-            # Plafond : on ne dépasse jamais Wj (le seuil de déclenchement)
-            compteur6_trackers[suit] = min(new_val, compteur6_seuil_Wj)
-            if new_val >= compteur6_seuil_Wj:
-                logger.info(
-                    f"📊 C6 {suit}: {new_val}x → seuil Wj={compteur6_seuil_Wj} atteint"
-                )
+            compteur6_trackers[suit] += 1
+            logger.info(
+                f"📊 C6 {suit}: {compteur6_trackers[suit]}x (Wj={compteur6_seuil_Wj})"
+            )
 
 def apply_compteur6(suit: str) -> str:
     """
@@ -1499,26 +1647,28 @@ def apply_compteur6(suit: str) -> str:
 # COMPTEUR4 — PERSISTANCE (séries d'absences — survit aux resets)
 # ============================================================================
 
-def load_compteur4_data():
-    """Charge les séries d'absences Compteur4 depuis le fichier persistant."""
+async def load_compteur4_data():
+    """Charge les séries d'absences Compteur4 depuis PostgreSQL (fallback JSON)."""
     global compteur4_events
     try:
-        if os.path.exists(COMPTEUR4_DATA_FILE):
+        raw = await db.db_load_kv('compteur4')
+        if raw is None and os.path.exists(COMPTEUR4_DATA_FILE):
             with open(COMPTEUR4_DATA_FILE, 'r', encoding='utf-8') as f:
                 raw = json.load(f)
+        if raw:
             compteur4_events = []
             for item in raw:
                 item['start_time'] = datetime.fromisoformat(item['start_time'])
                 item['end_time']   = datetime.fromisoformat(item['end_time'])
                 compteur4_events.append(item)
-            logger.info(f"📂 C4: {len(compteur4_events)} séries chargées depuis disque")
+            logger.info(f"📂 C4: {len(compteur4_events)} séries chargées")
     except Exception as e:
         logger.error(f"❌ Chargement C4 échoué: {e}")
         compteur4_events = []
 
 
 def save_compteur4_data():
-    """Sauvegarde les séries d'absences Compteur4 sur disque (persistance entre resets)."""
+    """Sauvegarde les séries d'absences Compteur4 dans PostgreSQL."""
     try:
         data = []
         for item in compteur4_events:
@@ -1526,8 +1676,7 @@ def save_compteur4_data():
             row['start_time'] = item['start_time'].isoformat()
             row['end_time']   = item['end_time'].isoformat()
             data.append(row)
-        with open(COMPTEUR4_DATA_FILE, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        db.db_schedule(db.db_save_kv('compteur4', data))
     except Exception as e:
         logger.error(f"❌ Sauvegarde C4 échouée: {e}")
 
@@ -1536,26 +1685,28 @@ def save_compteur4_data():
 # COMPTEUR7 — SÉRIES CONSÉCUTIVES PERSISTANTES
 # ============================================================================
 
-def load_compteur7_data():
-    """Charge les séries Compteur7 depuis le fichier persistant (survit aux resets)."""
+async def load_compteur7_data():
+    """Charge les séries Compteur7 depuis PostgreSQL (fallback JSON)."""
     global compteur7_completed
     try:
-        if os.path.exists(COMPTEUR7_DATA_FILE):
+        raw = await db.db_load_kv('compteur7')
+        if raw is None and os.path.exists(COMPTEUR7_DATA_FILE):
             with open(COMPTEUR7_DATA_FILE, 'r', encoding='utf-8') as f:
                 raw = json.load(f)
-            compteur7_completed = []
+        compteur7_completed = []
+        if raw:
             for item in raw:
                 item['start_time'] = datetime.fromisoformat(item['start_time'])
                 item['end_time']   = datetime.fromisoformat(item['end_time'])
                 compteur7_completed.append(item)
-            logger.info(f"📂 C7: {len(compteur7_completed)} séries chargées depuis disque")
+            logger.info(f"📂 C7: {len(compteur7_completed)} séries chargées")
     except Exception as e:
         logger.error(f"❌ Chargement C7 échoué: {e}")
         compteur7_completed = []
 
 
 def save_compteur7_data():
-    """Sauvegarde les séries Compteur7 sur disque (persistance entre resets)."""
+    """Sauvegarde les séries Compteur7 dans PostgreSQL."""
     try:
         data = []
         for item in compteur7_completed:
@@ -1563,19 +1714,20 @@ def save_compteur7_data():
             row['start_time'] = item['start_time'].isoformat()
             row['end_time']   = item['end_time'].isoformat()
             data.append(row)
-        with open(COMPTEUR7_DATA_FILE, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        db.db_schedule(db.db_save_kv('compteur7', data))
     except Exception as e:
         logger.error(f"❌ Sauvegarde C7 échouée: {e}")
 
 
-def load_hourly_data():
-    """Charge les données horaires depuis le fichier persistant."""
+async def load_hourly_data():
+    """Charge les données horaires depuis PostgreSQL (fallback JSON)."""
     global hourly_suit_data, hourly_game_count
     try:
-        if os.path.exists(HOURLY_DATA_FILE):
+        saved = await db.db_load_hourly()
+        if saved is None and os.path.exists(HOURLY_DATA_FILE):
             with open(HOURLY_DATA_FILE, 'r', encoding='utf-8') as f:
                 saved = json.load(f)
+        if saved:
             for h_str, suits in saved.get('suits', {}).items():
                 h = int(h_str)
                 if 0 <= h <= 23:
@@ -1586,20 +1738,15 @@ def load_hourly_data():
                 h = int(h_str)
                 if 0 <= h <= 23:
                     hourly_game_count[h] = cnt
-            logger.info("📂 Données horaires chargées depuis disque")
+            logger.info("📂 Données horaires chargées")
     except Exception as e:
         logger.error(f"❌ Chargement données horaires: {e}")
 
 
 def save_hourly_data():
-    """Sauvegarde les données horaires sur disque."""
+    """Sauvegarde les données horaires dans PostgreSQL."""
     try:
-        data = {
-            'suits':  {str(h): dict(suits) for h, suits in hourly_suit_data.items()},
-            'totals': {str(h): cnt for h, cnt in hourly_game_count.items()},
-        }
-        with open(HOURLY_DATA_FILE, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        db.db_schedule(db.db_save_hourly(hourly_suit_data, hourly_game_count))
     except Exception as e:
         logger.error(f"❌ Sauvegarde données horaires: {e}")
 
@@ -1649,6 +1796,7 @@ def update_compteur7(game_number: int, player_suits: Set[str]) -> List[Dict]:
 # ============================================================================
 
 def save_compteur8_data():
+    """Sauvegarde les séries Compteur8 dans PostgreSQL."""
     try:
         data = {
             'completed': [
@@ -1660,25 +1808,26 @@ def save_compteur8_data():
                 for s in compteur8_completed
             ]
         }
-        with open(COMPTEUR8_DATA_FILE, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        db.db_schedule(db.db_save_kv('compteur8', data))
     except Exception as e:
         logger.error(f"❌ Erreur save_compteur8: {e}")
 
 
-def load_compteur8_data():
+async def load_compteur8_data():
+    """Charge les séries Compteur8 depuis PostgreSQL (fallback JSON)."""
     global compteur8_completed
-    if not os.path.exists(COMPTEUR8_DATA_FILE):
-        return
     try:
-        with open(COMPTEUR8_DATA_FILE, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        compteur8_completed = []
-        for s in data.get('completed', []):
-            s['start_time'] = datetime.fromisoformat(s['start_time'])
-            s['end_time']   = datetime.fromisoformat(s['end_time'])
-            compteur8_completed.append(s)
-        logger.info(f"✅ Compteur8 chargé: {len(compteur8_completed)} série(s) d'absences persistante(s)")
+        data = await db.db_load_kv('compteur8')
+        if data is None and os.path.exists(COMPTEUR8_DATA_FILE):
+            with open(COMPTEUR8_DATA_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        if data:
+            compteur8_completed = []
+            for s in data.get('completed', []):
+                s['start_time'] = datetime.fromisoformat(s['start_time'])
+                s['end_time']   = datetime.fromisoformat(s['end_time'])
+                compteur8_completed.append(s)
+            logger.info(f"✅ C8 chargé: {len(compteur8_completed)} série(s)")
     except Exception as e:
         logger.error(f"❌ Erreur load_compteur8: {e}")
 
@@ -1745,27 +1894,24 @@ def _c9_is_active() -> bool:
 def c9_get_override(proposed_suit: str) -> Optional[str]:
     """
     Vérifie si C9 recommande un costume différent de proposed_suit.
-    Si proposed_suit est le costume 'fort' (count élevé avec diff ≥ SS vs un autre),
-    C9 recommande de prédire le costume 'faible' à la place.
-    Retourne le costume overridé, ou None si C9 n'intervient pas.
+    Vérifie uniquement la paire inverse de proposed_suit (♦↔♠, ♣↔♥).
+    Si proposed_suit est le fort (écart ≥ SS), retourne le faible (son inverse).
+    Retourne None si C9 n'intervient pas.
     """
     if not _c9_is_active():
         return None
-    best_faible = None
-    best_diff   = 0
-    for faible in ALL_SUITS:
-        if faible == proposed_suit:
-            continue
-        diff = compteur9_counts[proposed_suit] - compteur9_counts[faible]
-        if diff >= compteur9_ss and diff > best_diff:
-            best_diff   = diff
-            best_faible = faible
-    if best_faible:
+    # Uniquement la paire inverse du costume proposé
+    inverse = COMPTEUR6_PAIRS.get(proposed_suit)
+    if not inverse:
+        return None
+    diff = compteur9_counts[proposed_suit] - compteur9_counts[inverse]
+    if diff >= compteur9_ss:
         logger.info(
             f"🔄 C9 override: {proposed_suit}({compteur9_counts[proposed_suit]}) "
-            f"→ {best_faible}({compteur9_counts[best_faible]}) diff={best_diff}"
+            f"→ {inverse}({compteur9_counts[inverse]}) diff={diff}"
         )
-    return best_faible
+        return inverse
+    return None
 
 
 def _c9_add_silent(suit: str, fort: str, diff: int, game_number: int):
@@ -1818,6 +1964,26 @@ def _c9_verify_pending(game_number: int, player_suits: Set[str]):
         f"📊 C9 silent #{pred['target_game']}: {pred['suit']} → {pred['result'].upper()}"
         + (" [send_next=ON]" if compteur9_send_next_public else "")
     )
+
+    # ── Enregistrer dans prediction_history pour que /raison le montre ────────
+    _suit_text = {'♠': 'Pique', '♥': 'Coeur', '♦': 'Carreau', '♣': 'Trefle'}
+    suite_vers_canal = " Perdu → prochaine prediction envoyee dans le canal." if pred['result'] == 'loss' else ""
+    reason_c9 = (
+        f"C9 silencieux: paire {_suit_text.get(pred['fort'], pred['fort'])}"
+        f"({compteur9_counts.get(pred['fort'], '?')}) vs "
+        f"{_suit_text.get(pred['suit'], pred['suit'])}"
+        f"({compteur9_counts.get(pred['suit'], '?')}) "
+        f"ecart={pred['diff']} >= SS={compteur9_ss}."
+        + suite_vers_canal
+    )
+    add_prediction_to_history(
+        pred['target_game'], pred['suit'],
+        [pred['target_game']], 'compteur9_silent', reason_c9
+    )
+    final_status = 'gagne_r0' if pred['result'] == 'win' else 'perdu'
+    update_prediction_in_history(pred['target_game'], pred['suit'], pred['target_game'], 0, final_status)
+    # ──────────────────────────────────────────────────────────────────────────
+
     save_compteur9_data()  # Persistance immédiate après résolution
 
 
@@ -1832,58 +1998,62 @@ def update_compteur9_counts(player_cards_raw: list):
 
 def _c9_check_triggers() -> List[Tuple[str, str, int]]:
     """
-    Vérifie les paires de costumes pour les nouveaux écarts ≥ SS.
+    Vérifie uniquement les paires inverses (♦↔♠ et ♣↔♥) pour les nouveaux écarts ≥ SS.
     Retourne les nouvelles paires (fort, faible, diff) qui viennent de passer le seuil.
     Chaque paire n'est retournée qu'une fois par cycle horaire.
     """
     global compteur9_triggered_pairs
     newly = []
-    for i, fort in enumerate(ALL_SUITS):
-        for j, faible in enumerate(ALL_SUITS):
-            if i == j:
-                continue
-            diff = compteur9_counts[fort] - compteur9_counts[faible]
-            if diff >= compteur9_ss and (fort, faible) not in compteur9_triggered_pairs:
-                compteur9_triggered_pairs.add((fort, faible))
-                newly.append((fort, faible, diff))
-                logger.info(
-                    f"📊 C9: {fort}({compteur9_counts[fort]}) - "
-                    f"{faible}({compteur9_counts[faible]}) = {diff} ≥ SS={compteur9_ss}"
-                )
+    # Uniquement les paires inverses définies — pas toutes les combinaisons
+    checked_pairs = set()
+    for suit_a, suit_b in COMPTEUR6_PAIRS.items():
+        pair_key = tuple(sorted([suit_a, suit_b]))
+        if pair_key in checked_pairs:
+            continue
+        checked_pairs.add(pair_key)
+        count_a = compteur9_counts[suit_a]
+        count_b = compteur9_counts[suit_b]
+        # Déterminer fort et faible dans cette paire
+        if count_a >= count_b:
+            fort, faible, diff = suit_a, suit_b, count_a - count_b
+        else:
+            fort, faible, diff = suit_b, suit_a, count_b - count_a
+        if diff >= compteur9_ss and (fort, faible) not in compteur9_triggered_pairs:
+            compteur9_triggered_pairs.add((fort, faible))
+            newly.append((fort, faible, diff))
+            logger.info(
+                f"📊 C9: {fort}({compteur9_counts[fort]}) - "
+                f"{faible}({compteur9_counts[faible]}) = {diff} ≥ SS={compteur9_ss}"
+            )
     return newly
 
 
 async def send_compteur9_public(faible: str, fort: str, diff: int, game_number: int):
     """
-    Envoie une prédiction C9 en privé à l'admin (plus dans le canal public).
-    Appelée uniquement après un LOSS silencieux + conditions OK (HH:mm ≤ HH:30,
-    aucune prédiction en cours).
+    Envoie une prédiction C9 en PRIVÉ À L'ADMINISTRATEUR uniquement.
+    C9 n'est jamais envoyé dans le canal de prédiction.
     """
-    if not ADMIN_ID:
-        return
     try:
-        suit_emoji = {'♠': '♠️', '♥': '❤️', '♦': '♦️', '♣': '♣️'}
-        suit_names = {'♠': 'Pique', '♥': 'Cœur', '♦': 'Carreau', '♣': 'Trèfle'}
-        now    = datetime.now()
-        next_h = (now.hour + 1) % 24
-        msg = (
-            f"📈 **COMPTEUR 9 — ANALYSE HORAIRE**\n\n"
-            f"{suit_emoji.get(faible, faible)} **{suit_names.get(faible, faible)}** "
-            f"recommandé pour le prochain jeu\n\n"
-            f"_Écart : {suit_emoji.get(fort, fort)}({compteur9_counts[fort]}) "
-            f"— {suit_emoji.get(faible, faible)}({compteur9_counts[faible]}) "
-            f"= **{diff}** [SS={compteur9_ss}]_\n\n"
-            f"📊 **Compteur 9 actuel :**\n"
-            f"♠️ : {compteur9_counts['♠']}\n"
-            f"❤️ : {compteur9_counts['♥']}\n"
-            f"♦️ : {compteur9_counts['♦']}\n"
-            f"♣️ : {compteur9_counts['♣']}\n\n"
-            f"🕐 Reset effectué: {compteur9_reset_time.strftime('%H:%M') if compteur9_reset_time else '--:--'}\n"
-            f"⏭ Prochain reset: {next_h:02d}:00"
+        _suit_text = {'♠': 'Pique', '♥': 'Coeur', '♦': 'Carreau', '♣': 'Trefle'}
+        pred_num = game_number + PREDICTION_DF
+        reason = (
+            f"C9: {_suit_text.get(fort, fort)}({compteur9_counts[fort]}) "
+            f"vs {_suit_text.get(faible, faible)}({compteur9_counts[faible]}) "
+            f"ecart={diff} >= SS={compteur9_ss} — apres LOSS silencieux."
         )
-        admin_entity = await client.get_entity(ADMIN_ID)
-        await client.send_message(admin_entity, msg, parse_mode='markdown')
-        logger.info(f"📤 C9 prédiction envoyée en privé admin: {faible} (après LOSS)")
+        add_prediction_to_history(pred_num, faible, [], 'compteur9', reason)
+        if ADMIN_ID and ADMIN_ID != 0:
+            suit_names = {'♠': 'Pique', '♥': 'Cœur', '♦': 'Carreau', '♣': 'Trèfle'}
+            msg = (
+                f"🔵 **C9 — Prédiction privée** (admin uniquement)\n"
+                f"Jeu #{pred_num} → **{suit_names.get(faible, faible)}** {faible}\n"
+                f"_{_suit_text.get(fort, fort)}({compteur9_counts[fort]}) "
+                f"vs {_suit_text.get(faible, faible)}({compteur9_counts[faible]}) "
+                f"— écart={diff}, SS={compteur9_ss}_"
+            )
+            admin_entity = await client.get_entity(ADMIN_ID)
+            await client.send_message(admin_entity, msg, parse_mode='markdown')
+            logger.info(f"🔵 C9 admin privé: #{pred_num} {faible} (après LOSS silencieux)")
     except Exception as e:
         logger.error(f"❌ Erreur send_compteur9_public: {e}")
 
@@ -1907,27 +2077,28 @@ def reset_compteur9_now():
 
 
 def save_pending_predictions():
-    """Sauvegarde pending_predictions sur disque pour survivre aux redémarrages."""
+    """Sauvegarde pending_predictions dans PostgreSQL."""
     try:
         def _dt(v):
             return v.isoformat() if isinstance(v, datetime) else v
         serializable = {}
         for gn, pred in pending_predictions.items():
             serializable[str(gn)] = {k: _dt(v) for k, v in pred.items()}
-        with open(PENDING_PRED_FILE, 'w', encoding='utf-8') as f:
-            json.dump(serializable, f, ensure_ascii=False, indent=2)
+        db.db_schedule(db.db_save_all_pending(serializable))
     except Exception as e:
         logger.error(f"❌ Erreur save_pending_predictions: {e}")
 
 
-def load_pending_predictions():
-    """Charge pending_predictions depuis le JSON (reprise après redémarrage)."""
+async def load_pending_predictions():
+    """Charge pending_predictions depuis PostgreSQL (fallback JSON)."""
     global pending_predictions
-    if not os.path.exists(PENDING_PRED_FILE):
-        return
     try:
-        with open(PENDING_PRED_FILE, 'r', encoding='utf-8') as f:
-            data = json.load(f)
+        data = await db.db_load_pending()
+        if not data and os.path.exists(PENDING_PRED_FILE):
+            with open(PENDING_PRED_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        if not data:
+            return
         loaded = {}
         for gn_str, pred in data.items():
             gn = int(gn_str)
@@ -1937,16 +2108,42 @@ def load_pending_predictions():
                         pred[field] = datetime.fromisoformat(pred[field])
                     except Exception:
                         pass
-            # Remettre le statut en_cours (l'animation ne reprend pas mais la vérif oui)
             pred['status'] = 'en_cours'
             loaded[gn] = pred
         if loaded:
             pending_predictions = loaded
             logger.info(f"✅ Pending predictions rechargées: {list(loaded.keys())}")
-        # Supprimer le fichier pour ne pas re-charger au prochain démarrage
-        # (elles seront re-sauvegardées à la prochaine résolution)
     except Exception as e:
         logger.error(f"❌ Erreur load_pending_predictions: {e}")
+
+
+async def load_prediction_history():
+    """
+    Charge l'historique des prédictions depuis PostgreSQL dans la liste
+    prediction_history en mémoire. Normalise les anciens statuts 'win'/'loss'
+    vers 'gagne_rN'/'perdu' pour la compatibilité.
+    """
+    global prediction_history
+    try:
+        rows = await db.db_load_prediction_history(limit=500)
+        if not rows:
+            return
+        normalized = []
+        for entry in rows:
+            status = entry.get('status', '')
+            # Normalisation des anciens statuts du seed initial
+            if status == 'win':
+                level = entry.get('rattrapage_level', 0) or 0
+                entry['status'] = f'gagne_r{level}'
+            elif status == 'loss':
+                entry['status'] = 'perdu'
+            normalized.append(entry)
+        prediction_history = normalized
+        wins   = sum(1 for p in normalized if p['status'].startswith('gagne'))
+        losses = sum(1 for p in normalized if p['status'] == 'perdu')
+        logger.info(f"📂 Prediction history chargée: {len(normalized)} entrées ({wins} gagnées, {losses} perdues)")
+    except Exception as e:
+        logger.error(f"❌ Erreur load_prediction_history: {e}")
 
 
 def clear_pending_pred_file():
@@ -1959,7 +2156,7 @@ def clear_pending_pred_file():
 
 
 def save_compteur9_data():
-    """Sauvegarde l'historique des prédictions silencieuses C9 sur disque (JSON)."""
+    """Sauvegarde l'historique C9 dans PostgreSQL."""
     try:
         def _dt(v):
             return v.isoformat() if isinstance(v, datetime) else v
@@ -1970,20 +2167,21 @@ def save_compteur9_data():
             ],
             'last_result': compteur9_last_result,
         }
-        with open(COMPTEUR9_DATA_FILE, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        db.db_schedule(db.db_save_kv('compteur9', data))
     except Exception as e:
         logger.error(f"❌ Erreur save_compteur9: {e}")
 
 
-def load_compteur9_data():
-    """Charge l'historique des prédictions silencieuses C9 depuis le JSON persistant."""
+async def load_compteur9_data():
+    """Charge l'historique C9 depuis PostgreSQL (fallback JSON)."""
     global compteur9_silent_history, compteur9_last_result
-    if not os.path.exists(COMPTEUR9_DATA_FILE):
-        return
     try:
-        with open(COMPTEUR9_DATA_FILE, 'r', encoding='utf-8') as f:
-            data = json.load(f)
+        data = await db.db_load_kv('compteur9')
+        if data is None and os.path.exists(COMPTEUR9_DATA_FILE):
+            with open(COMPTEUR9_DATA_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        if not data:
+            return
         loaded = []
         for p in data.get('silent_history', []):
             for field in ('created_at', 'resolved_at'):
@@ -1996,7 +2194,7 @@ def load_compteur9_data():
         compteur9_silent_history = loaded
         compteur9_last_result    = data.get('last_result', 'none')
         logger.info(
-            f"✅ Compteur9 chargé: {len(compteur9_silent_history)} prédiction(s) silencieuse(s)"
+            f"✅ C9 chargé: {len(compteur9_silent_history)} prédiction(s)"
         )
     except Exception as e:
         logger.error(f"❌ Erreur load_compteur9: {e}")
@@ -2025,7 +2223,7 @@ def generate_compteur9_pdf() -> bytes:
     pdf.set_font('Helvetica', 'B', 16)
     pdf.set_fill_color(20, 80, 160)
     pdf.set_text_color(255, 255, 255)
-    pdf.cell(0, 12, 'BACCARAT AI - Compteur 9 : Predictions Silencieuses', ln=True, align='C', fill=True)
+    pdf.cell(0, 12, 'BACCARAT AI - Compteur 9 : Predictions Silencieuses', new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C', fill=True)
     pdf.ln(3)
 
     pdf.set_font('Helvetica', '', 9)
@@ -2033,8 +2231,7 @@ def generate_compteur9_pdf() -> bytes:
     pdf.cell(0, 5,
         f'Seuil SS={compteur9_ss} | '
         f'Genere le {datetime.now().strftime("%d/%m/%Y %H:%M")} | '
-        f'Total: {total} | Win: {wins} | Loss: {losses} | Taux: {winrate:.1f}% | PERSISTANT',
-        ln=True, align='C'
+        f'Total: {total} | Win: {wins} | Loss: {losses} | Taux: {winrate:.1f}% | PERSISTANT', new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C'
     )
     pdf.ln(4)
 
@@ -2042,7 +2239,7 @@ def generate_compteur9_pdf() -> bytes:
     pdf.set_font('Helvetica', 'B', 11)
     pdf.set_fill_color(230, 240, 255)
     pdf.set_text_color(20, 80, 160)
-    pdf.cell(0, 8, f'  Bilan : {wins}W  {losses}L  {total - wins - losses} autres  |  Taux de reussite : {winrate:.1f}%', ln=True, fill=True)
+    pdf.cell(0, 8, f'  Bilan : {wins}W  {losses}L  {total - wins - losses} autres  |  Taux de reussite : {winrate:.1f}%', new_x=XPos.LMARGIN, new_y=YPos.NEXT, fill=True)
     pdf.ln(4)
 
     # ── En-tête table ─────────────────────────────────────────────────────────
@@ -2097,14 +2294,14 @@ def generate_compteur9_pdf() -> bytes:
     if not sorted_preds:
         pdf.set_text_color(150, 150, 150)
         pdf.set_font('Helvetica', 'I', 10)
-        pdf.cell(0, 10, 'Aucune prediction silencieuse enregistree.', ln=True, align='C')
+        pdf.cell(0, 10, 'Aucune prediction silencieuse enregistree.', new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C')
 
     # ── PAGE 2 : STATISTIQUES PAR COSTUME ─────────────────────────────────────
     pdf.add_page()
     pdf.set_font('Helvetica', 'B', 14)
     pdf.set_fill_color(20, 80, 160)
     pdf.set_text_color(255, 255, 255)
-    pdf.cell(0, 10, 'Compteur 9 - Statistiques par Costume', ln=True, align='C', fill=True)
+    pdf.cell(0, 10, 'Compteur 9 - Statistiques par Costume', new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C', fill=True)
     pdf.ln(6)
 
     for suit in ALL_SUITS:
@@ -2117,31 +2314,27 @@ def generate_compteur9_pdf() -> bytes:
         pdf.set_font('Helvetica', 'B', 11)
         pdf.cell(0, 7,
             f'  {suit_names_map.get(suit, suit)} : '
-            f'{len(suit_preds)} predictions  |  {sw}W  {sl}L  |  {sr:.1f}%',
-            ln=True
-        )
+            f'{len(suit_preds)} predictions  |  {sw}W  {sl}L  |  {sr:.1f}%', new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.ln(6)
 
     # Compteurs actuels de l'heure
     pdf.set_font('Helvetica', 'B', 11)
     pdf.set_fill_color(230, 240, 255)
     pdf.set_text_color(20, 80, 160)
-    pdf.cell(0, 7, '  Compteurs horaires actuels (reset a chaque heure pile)', ln=True, fill=True)
+    pdf.cell(0, 7, '  Compteurs horaires actuels (reset a chaque heure pile)', new_x=XPos.LMARGIN, new_y=YPos.NEXT, fill=True)
     pdf.ln(3)
     for suit in sorted(ALL_SUITS, key=lambda s: compteur9_counts[s], reverse=True):
         color = suit_colors.get(suit, (0, 0, 0))
         pdf.set_text_color(*color)
         pdf.set_font('Helvetica', '', 10)
         pdf.cell(0, 6,
-            f'    {suit_names_map.get(suit, suit)} : {compteur9_counts[suit]} cartes comptees',
-            ln=True
-        )
+            f'    {suit_names_map.get(suit, suit)} : {compteur9_counts[suit]} cartes comptees', new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.ln(4)
 
     reset_str = compteur9_reset_time.strftime('%H:%M') if compteur9_reset_time else '--:--'
     pdf.set_font('Helvetica', 'I', 9)
     pdf.set_text_color(120, 120, 120)
-    pdf.cell(0, 5, f'Dernier reset: {reset_str}  |  Le comptage continue toute l\'heure (HH:00 - HH:59)', ln=True, align='C')
+    pdf.cell(0, 5, f'Dernier reset: {reset_str}  |  Le comptage continue toute l\'heure (HH:00 - HH:59)', new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C')
 
     return pdf.output(dest='S').encode('latin-1')
 
@@ -2206,7 +2399,7 @@ def generate_compteur8_pdf() -> bytes:
     pdf.set_font('Helvetica', 'B', 16)
     pdf.set_fill_color(180, 0, 0)
     pdf.set_text_color(255, 255, 255)
-    pdf.cell(0, 12, 'BACCARAT AI - Compteur 8 : Absences Consecutives', ln=True, align='C', fill=True)
+    pdf.cell(0, 12, 'BACCARAT AI - Compteur 8 : Absences Consecutives', new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C', fill=True)
     pdf.ln(4)
 
     pdf.set_font('Helvetica', '', 10)
@@ -2214,8 +2407,7 @@ def generate_compteur8_pdf() -> bytes:
     pdf.cell(0, 6,
         f'Absences >= {COMPTEUR8_THRESHOLD}x consecutives | '
         f'Genere le {datetime.now().strftime("%d/%m/%Y %H:%M")} | '
-        f'Total: {len(compteur8_completed)} serie(s) | PERSISTANT',
-        ln=True, align='C'
+        f'Total: {len(compteur8_completed)} serie(s) | PERSISTANT', new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C'
     )
     pdf.ln(6)
 
@@ -2251,22 +2443,21 @@ def generate_compteur8_pdf() -> bytes:
     else:
         pdf.set_text_color(150, 150, 150)
         pdf.set_font('Helvetica', 'I', 10)
-        pdf.cell(0, 10, 'Aucune serie d absence >= 10 enregistree.', ln=True, align='C')
+        pdf.cell(0, 10, 'Aucune serie d absence >= 10 enregistree.', new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C')
 
     # ── PAGE 2 : COMPTEUR7 — PRÉSENCES ───────────────────────────────────────
     pdf.add_page()
     pdf.set_font('Helvetica', 'B', 16)
     pdf.set_fill_color(90, 0, 160)
     pdf.set_text_color(255, 255, 255)
-    pdf.cell(0, 12, 'BACCARAT AI - Compteur 7 : Presences Consecutives', ln=True, align='C', fill=True)
+    pdf.cell(0, 12, 'BACCARAT AI - Compteur 7 : Presences Consecutives', new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C', fill=True)
     pdf.ln(4)
 
     pdf.set_font('Helvetica', '', 10)
     pdf.set_text_color(100, 100, 100)
     pdf.cell(0, 6,
         f'Serie enregistree >= {COMPTEUR7_THRESHOLD}x | '
-        f'Total: {len(compteur7_completed)} serie(s) | PERSISTANT',
-        ln=True, align='C'
+        f'Total: {len(compteur7_completed)} serie(s) | PERSISTANT', new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C'
     )
     pdf.ln(6)
 
@@ -2302,14 +2493,14 @@ def generate_compteur8_pdf() -> bytes:
     else:
         pdf.set_text_color(150, 150, 150)
         pdf.set_font('Helvetica', 'I', 10)
-        pdf.cell(0, 10, 'Aucune serie de presences >= 5 enregistree.', ln=True, align='C')
+        pdf.cell(0, 10, 'Aucune serie de presences >= 5 enregistree.', new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C')
 
     # ── PAGE 3 : TABLEAU COMPARATIF C8 vs C7 ─────────────────────────────────
     pdf.add_page()
     pdf.set_font('Helvetica', 'B', 14)
     pdf.set_fill_color(50, 50, 50)
     pdf.set_text_color(255, 255, 255)
-    pdf.cell(0, 12, 'COMPARAISON : C8 (Absences) vs C7 (Presences)', ln=True, align='C', fill=True)
+    pdf.cell(0, 12, 'COMPARAISON : C8 (Absences) vs C7 (Presences)', new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C', fill=True)
     pdf.ln(6)
 
     cmp_headers = ['Costume', 'C8 series', 'C8 max abs.', 'C8 moy abs.', 'C7 series', 'C7 max pres.', 'C7 moy pres.']
@@ -2347,8 +2538,7 @@ def generate_compteur8_pdf() -> bytes:
     pdf.cell(0, 5,
         f'C8 = absences >= {COMPTEUR8_THRESHOLD} consecutives | '
         f'C7 = presences >= {COMPTEUR7_THRESHOLD} consecutives | '
-        f'Genere le {datetime.now().strftime("%d/%m/%Y %H:%M")}',
-        ln=True, align='C'
+        f'Genere le {datetime.now().strftime("%d/%m/%Y %H:%M")}', new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C'
     )
 
     return pdf.output(dest='S').encode('latin-1')
@@ -2418,9 +2608,276 @@ async def send_compteur8_pdf():
         import traceback; logger.error(traceback.format_exc())
 
 
+def generate_compteur8_only_pdf() -> bytes:
+    """Génère un PDF uniquement Compteur8 — absences consécutives (sans C7)."""
+    suit_names_map = {'♠': 'Pique', '♥': 'Coeur', '♦': 'Carreau', '♣': 'Trefle'}
+    suit_colors    = {'♠': (30, 30, 30), '♥': (180, 0, 0), '♦': (0, 80, 180), '♣': (0, 120, 0)}
+
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+
+    pdf.set_font('Helvetica', 'B', 16)
+    pdf.set_fill_color(180, 0, 0)
+    pdf.set_text_color(255, 255, 255)
+    pdf.cell(0, 12, 'BACCARAT AI - Compteur 8 : Absences Consecutives', new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C', fill=True)
+    pdf.ln(4)
+
+    pdf.set_font('Helvetica', '', 10)
+    pdf.set_text_color(100, 100, 100)
+    pdf.cell(0, 6,
+        f'Absences >= {COMPTEUR8_THRESHOLD}x consecutives | '
+        f'Genere le {datetime.now().strftime("%d/%m/%Y %H:%M")} | '
+        f'Total: {len(compteur8_completed)} serie(s) | PERSISTANT', new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C'
+    )
+    pdf.ln(6)
+
+    col_widths = [32, 22, 22, 32, 32, 26]
+    headers    = ['Costume', 'Date debut', 'Heure debut', 'Jeu debut', 'Jeu fin', 'Nb absents']
+
+    pdf.set_font('Helvetica', 'B', 9)
+    pdf.set_fill_color(220, 50, 50)
+    pdf.set_text_color(255, 255, 255)
+    for w, h in zip(col_widths, headers):
+        pdf.cell(w, 8, h, border=1, align='C', fill=True)
+    pdf.ln()
+
+    if compteur8_completed:
+        for i, s in enumerate(sorted(compteur8_completed, key=lambda x: x['start_time'])):
+            suit  = s['suit']
+            color = suit_colors.get(suit, (0, 0, 0))
+            pdf.set_fill_color(245, 245, 245) if i % 2 == 0 else pdf.set_fill_color(255, 255, 255)
+            pdf.set_text_color(*color)
+            pdf.set_font('Helvetica', 'B', 9)
+            row = [
+                suit_names_map.get(suit, suit),
+                s['start_time'].strftime('%d/%m/%Y'),
+                s['start_time'].strftime('%Hh%M'),
+                f"#{s['start_game']}",
+                f"#{s['end_game']}",
+                str(s['count']),
+            ]
+            fills = [True] + [False] * (len(col_widths) - 1)
+            for w, cell, fl in zip(col_widths, row, fills):
+                pdf.cell(w, 7, cell, border=1, align='C', fill=fl)
+            pdf.ln()
+    else:
+        pdf.set_text_color(150, 150, 150)
+        pdf.set_font('Helvetica', 'I', 10)
+        pdf.cell(0, 10, f'Aucune serie d absence >= {COMPTEUR8_THRESHOLD} enregistree.', new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C')
+
+    return pdf.output(dest='S').encode('latin-1')
+
+
+async def send_compteur8_only_pdf():
+    """Envoie uniquement le PDF Compteur8 (absences) à l'admin."""
+    global compteur8_pdf_msg_id
+    if not ADMIN_ID or ADMIN_ID == 0:
+        return
+    try:
+        pdf_bytes  = generate_compteur8_only_pdf()
+        pdf_buffer = io.BytesIO(pdf_bytes)
+        pdf_buffer.name = "compteur8_absences.pdf"
+        admin_entity = await client.get_entity(ADMIN_ID)
+
+        if compteur8_pdf_msg_id:
+            try:
+                await client.delete_messages(admin_entity, [compteur8_pdf_msg_id])
+            except Exception:
+                pass
+            compteur8_pdf_msg_id = None
+
+        caption = (
+            f"📊 **COMPTEUR8 — Absences ≥{COMPTEUR8_THRESHOLD}x**\n"
+            f"Total : **{len(compteur8_completed)}** série(s)\n"
+            f"Mis à jour : {datetime.now().strftime('%d/%m/%Y %Hh%M')}"
+        )
+        sent = await client.send_file(
+            admin_entity, pdf_buffer,
+            caption=caption, parse_mode='markdown',
+            attributes=[], file_name="compteur8_absences.pdf"
+        )
+        compteur8_pdf_msg_id = sent.id
+        logger.info("✅ PDF Compteur8 seul envoyé à l'admin")
+    except Exception as e:
+        logger.error(f"❌ Erreur send_compteur8_only_pdf: {e}")
+
+
+def generate_comparaison_c8_pdf(nb_jours: int) -> bytes:
+    """Génère un PDF de comparaison C8 (absences) jour par jour — toutes les données préservées."""
+    from datetime import timedelta, date as date_type
+    suit_names_map = {'♠': 'Pique', '♥': 'Coeur', '♦': 'Carreau', '♣': 'Trefle'}
+    suit_colors    = {'♠': (30, 30, 30), '♥': (180, 0, 0), '♦': (0, 80, 180), '♣': (0, 120, 0)}
+
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=12)
+    pdf.add_page()
+
+    pdf.set_font('Helvetica', 'B', 15)
+    pdf.set_fill_color(180, 0, 0)
+    pdf.set_text_color(255, 255, 255)
+    pdf.cell(0, 11, f'COMPARAISON C8 — Absences sur {nb_jours} jours', new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C', fill=True)
+    pdf.ln(3)
+    pdf.set_font('Helvetica', '', 9)
+    pdf.set_text_color(100, 100, 100)
+    pdf.cell(0, 5, f'Absences >= {COMPTEUR8_THRESHOLD}x | Genere le {datetime.now().strftime("%d/%m/%Y %H:%M")} | Toutes donnees preservees', new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C')
+    pdf.ln(5)
+
+    today = datetime.now().date()
+    col_w = [28, 22, 20, 28, 28, 22]
+    headers = ['Costume', 'Date debut', 'H. debut', 'Jeu debut', 'Jeu fin', 'Nb absents']
+
+    for d in range(nb_jours):
+        target     = today - timedelta(days=d)
+        label      = f"Aujourd'hui ({target.strftime('%d/%m/%Y')})" if d == 0 else f"J-{d} — {target.strftime('%d/%m/%Y')}"
+        day_series = sorted([s for s in compteur8_completed if s['end_time'].date() == target], key=lambda x: x['start_time'])
+
+        # En-tête du jour
+        pdf.set_font('Helvetica', 'B', 10)
+        pdf.set_fill_color(220, 50, 50)
+        pdf.set_text_color(255, 255, 255)
+        pdf.cell(0, 8, f'  {label}  —  {len(day_series)} serie(s)', new_x=XPos.LMARGIN, new_y=YPos.NEXT, fill=True)
+        pdf.ln(1)
+
+        if not day_series:
+            pdf.set_font('Helvetica', 'I', 9)
+            pdf.set_text_color(150, 150, 150)
+            pdf.cell(0, 6, '  Aucune serie d absence enregistree ce jour.', new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.ln(3)
+            continue
+
+        # En-têtes de colonnes
+        pdf.set_font('Helvetica', 'B', 8)
+        pdf.set_fill_color(240, 200, 200)
+        pdf.set_text_color(60, 0, 0)
+        for w, h in zip(col_w, headers):
+            pdf.cell(w, 7, h, border=1, align='C', fill=True)
+        pdf.ln()
+
+        # Lignes de données — TOUTES, aucune limite
+        pdf.set_font('Helvetica', '', 8)
+        for i, s in enumerate(day_series):
+            suit  = s['suit']
+            color = suit_colors.get(suit, (0, 0, 0))
+            pdf.set_text_color(*color)
+            bg = (250, 245, 245) if i % 2 == 0 else (255, 255, 255)
+            pdf.set_fill_color(*bg)
+            row = [
+                suit_names_map.get(suit, suit),
+                s['start_time'].strftime('%d/%m/%Y'),
+                s['start_time'].strftime('%Hh%M'),
+                f"#{s['start_game']}",
+                f"#{s['end_game']}",
+                str(s['count']),
+            ]
+            for w, cell in zip(col_w, row):
+                pdf.cell(w, 6, cell, border=1, align='C', fill=True)
+            pdf.ln()
+
+        # Résumé par costume pour ce jour
+        pdf.ln(2)
+        pdf.set_font('Helvetica', 'I', 8)
+        pdf.set_text_color(80, 80, 80)
+        for suit in ALL_SUITS:
+            ss = [x for x in day_series if x['suit'] == suit]
+            if ss:
+                maxi = max(x['count'] for x in ss)
+                moy  = round(sum(x['count'] for x in ss) / len(ss), 1)
+                pdf.cell(0, 5, f"  {suit_names_map.get(suit, suit)}: {len(ss)} serie(s) | max={maxi} | moy={moy}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.ln(4)
+
+    return pdf.output(dest='S').encode('latin-1')
+
+
+def generate_comparaison_c7_pdf(nb_jours: int) -> bytes:
+    """Génère un PDF de comparaison C7 (présences) jour par jour — toutes les données préservées."""
+    from datetime import timedelta
+    suit_names_map = {'♠': 'Pique', '♥': 'Coeur', '♦': 'Carreau', '♣': 'Trefle'}
+    suit_colors    = {'♠': (30, 30, 30), '♥': (180, 0, 0), '♦': (0, 80, 180), '♣': (0, 120, 0)}
+
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=12)
+    pdf.add_page()
+
+    pdf.set_font('Helvetica', 'B', 15)
+    pdf.set_fill_color(90, 0, 160)
+    pdf.set_text_color(255, 255, 255)
+    pdf.cell(0, 11, f'COMPARAISON C7 — Presences sur {nb_jours} jours', new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C', fill=True)
+    pdf.ln(3)
+    pdf.set_font('Helvetica', '', 9)
+    pdf.set_text_color(100, 100, 100)
+    pdf.cell(0, 5, f'Presences >= {COMPTEUR7_THRESHOLD}x | Genere le {datetime.now().strftime("%d/%m/%Y %H:%M")} | Toutes donnees preservees', new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C')
+    pdf.ln(5)
+
+    today = datetime.now().date()
+    col_w = [28, 22, 20, 28, 28, 22]
+    headers = ['Costume', 'Date debut', 'H. debut', 'Jeu debut', 'Jeu fin', 'Nb presents']
+
+    for d in range(nb_jours):
+        target     = today - timedelta(days=d)
+        label      = f"Aujourd'hui ({target.strftime('%d/%m/%Y')})" if d == 0 else f"J-{d} — {target.strftime('%d/%m/%Y')}"
+        day_series = sorted([s for s in compteur7_completed if s['end_time'].date() == target], key=lambda x: x['start_time'])
+
+        # En-tête du jour
+        pdf.set_font('Helvetica', 'B', 10)
+        pdf.set_fill_color(90, 0, 160)
+        pdf.set_text_color(255, 255, 255)
+        pdf.cell(0, 8, f'  {label}  —  {len(day_series)} serie(s)', new_x=XPos.LMARGIN, new_y=YPos.NEXT, fill=True)
+        pdf.ln(1)
+
+        if not day_series:
+            pdf.set_font('Helvetica', 'I', 9)
+            pdf.set_text_color(150, 150, 150)
+            pdf.cell(0, 6, '  Aucune serie de presences enregistree ce jour.', new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.ln(3)
+            continue
+
+        # En-têtes de colonnes
+        pdf.set_font('Helvetica', 'B', 8)
+        pdf.set_fill_color(220, 200, 240)
+        pdf.set_text_color(60, 0, 100)
+        for w, h in zip(col_w, headers):
+            pdf.cell(w, 7, h, border=1, align='C', fill=True)
+        pdf.ln()
+
+        # Lignes de données — TOUTES, aucune limite
+        pdf.set_font('Helvetica', '', 8)
+        for i, s in enumerate(day_series):
+            suit  = s['suit']
+            color = suit_colors.get(suit, (0, 0, 0))
+            pdf.set_text_color(*color)
+            bg = (248, 245, 255) if i % 2 == 0 else (255, 255, 255)
+            pdf.set_fill_color(*bg)
+            row = [
+                suit_names_map.get(suit, suit),
+                s['start_time'].strftime('%d/%m/%Y'),
+                s['start_time'].strftime('%Hh%M'),
+                f"#{s['start_game']}",
+                f"#{s['end_game']}",
+                str(s['count']),
+            ]
+            for w, cell in zip(col_w, row):
+                pdf.cell(w, 6, cell, border=1, align='C', fill=True)
+            pdf.ln()
+
+        # Résumé par costume pour ce jour
+        pdf.ln(2)
+        pdf.set_font('Helvetica', 'I', 8)
+        pdf.set_text_color(80, 80, 80)
+        for suit in ALL_SUITS:
+            ss = [x for x in day_series if x['suit'] == suit]
+            if ss:
+                maxi = max(x['count'] for x in ss)
+                moy  = round(sum(x['count'] for x in ss) / len(ss), 1)
+                pdf.cell(0, 5, f"  {suit_names_map.get(suit, suit)}: {len(ss)} serie(s) | max={maxi} | moy={moy}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.ln(4)
+
+    return pdf.output(dest='S').encode('latin-1')
+
+
 def update_hourly_data(player_suits: Set[str]):
     """Met à jour les compteurs horaires (pour /comparaison)."""
-    h = datetime.now().hour
+    h = datetime.now(timezone.utc).replace(tzinfo=None).hour  # UTC+0 = heure Côte d'Ivoire
     hourly_game_count[h] += 1
     for suit in player_suits:
         if suit in hourly_suit_data[h]:
@@ -2444,7 +2901,7 @@ def generate_compteur7_pdf() -> bytes:
     pdf.set_font('Helvetica', 'B', 16)
     pdf.set_fill_color(90, 0, 160)
     pdf.set_text_color(255, 255, 255)
-    pdf.cell(0, 12, 'BACCARAT AI - Series Consecutives Compteur 7', ln=True, align='C', fill=True)
+    pdf.cell(0, 12, 'BACCARAT AI - Series Consecutives Compteur 7', new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C', fill=True)
     pdf.ln(4)
 
     pdf.set_font('Helvetica', '', 10)
@@ -2452,8 +2909,7 @@ def generate_compteur7_pdf() -> bytes:
     pdf.cell(0, 6,
         f'Seuil minimum: {COMPTEUR7_THRESHOLD}x | '
         f'Genere le {datetime.now().strftime("%d/%m/%Y %H:%M")} | '
-        f'Total: {len(events_list)} serie(s) | PERSISTANT',
-        ln=True, align='C'
+        f'Total: {len(events_list)} serie(s) | PERSISTANT', new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C'
     )
     pdf.ln(6)
 
@@ -2514,7 +2970,7 @@ def generate_compteur7_pdf() -> bytes:
     pdf.set_font('Helvetica', 'B', 12)
     pdf.set_fill_color(90, 0, 160)
     pdf.set_text_color(255, 255, 255)
-    pdf.cell(0, 10, 'Resume par costume', ln=True, fill=True, align='C')
+    pdf.cell(0, 10, 'Resume par costume', new_x=XPos.LMARGIN, new_y=YPos.NEXT, fill=True, align='C')
     pdf.ln(3)
 
     from collections import Counter as _Counter
@@ -2525,15 +2981,14 @@ def generate_compteur7_pdf() -> bytes:
         pdf.set_text_color(r, g, b)
         name = suit_names_map.get(suit, suit)
         cnt  = suit_counts.get(suit, 0)
-        pdf.cell(0, 8, f'  {name} : {cnt} serie(s) de {COMPTEUR7_THRESHOLD}+ consecutives', ln=True)
+        pdf.cell(0, 8, f'  {name} : {cnt} serie(s) de {COMPTEUR7_THRESHOLD}+ consecutives', new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
     pdf.ln(5)
     pdf.set_font('Helvetica', 'I', 9)
     pdf.set_text_color(130, 130, 130)
     pdf.cell(0, 6,
         f'BACCARAT AI - PERSISTANT - Reset #1440 ne supprime PAS ce fichier - '
-        f'{datetime.now().strftime("%d/%m/%Y %H:%M")}',
-        ln=True, align='C'
+        f'{datetime.now().strftime("%d/%m/%Y %H:%M")}', new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C'
     )
     return bytes(pdf.output())
 
@@ -2729,7 +3184,7 @@ def add_to_history(game_number: int, player_suits: Set[str]):
 
 def add_prediction_to_history(game_number: int, suit: str, verification_games: List[int], prediction_type: str = 'standard', reason: str = ''):
     global prediction_history
-    prediction_history.insert(0, {
+    entry = {
         'predicted_game': game_number,
         'suit': suit,
         'predicted_at': datetime.now(),
@@ -2740,9 +3195,12 @@ def add_prediction_to_history(game_number: int, suit: str, verification_games: L
         'rattrapage_level': 0,
         'type': prediction_type,
         'reason': reason
-    })
+    }
+    prediction_history.insert(0, entry)
     if len(prediction_history) > MAX_HISTORY_SIZE:
         prediction_history = prediction_history[:MAX_HISTORY_SIZE]
+    db.db_schedule(db.db_add_prediction_history(entry))
+
 
 def update_prediction_in_history(game_number: int, suit: str, verified_by_game: int, rattrapage_level: int, final_status: str):
     global prediction_history
@@ -2752,7 +3210,103 @@ def update_prediction_in_history(game_number: int, suit: str, verified_by_game: 
             pred['verified_at'] = datetime.now()
             pred['verified_by_game'] = verified_by_game
             pred['rattrapage_level'] = rattrapage_level
+            db.db_schedule(db.db_update_prediction_history(game_number, suit, final_status, rattrapage_level, verified_by_game))
             break
+
+# ============================================================================
+# COMPTEUR 11 — PERDU HIER → PRÉDIT DEMAIN
+# ============================================================================
+
+async def load_compteur11():
+    """
+    Charge C11 depuis PostgreSQL (fallback JSON).
+    Si la date sauvegardée est HIER  → les perdus deviennent compteur11_perdu_hier.
+    Si la date sauvegardée est AUJOURD'HUI → les perdus deviennent compteur11_perdu_today.
+    """
+    global compteur11_perdu_hier, compteur11_perdu_today
+    today     = datetime.now().date()
+    yesterday = today - timedelta(days=1)
+    try:
+        data = await db.db_load_kv('compteur11')
+        if data is None and os.path.exists(COMPTEUR11_FILE):
+            with open(COMPTEUR11_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        if not data:
+            return
+        saved_date_str = data.get('date', '')
+        if not saved_date_str:
+            return
+        saved_date = datetime.strptime(saved_date_str, '%Y-%m-%d').date()
+        perdus = data.get('perdus', [])
+        if saved_date == yesterday:
+            compteur11_perdu_hier  = perdus
+            compteur11_perdu_today = []
+            logger.info(f"📋 C11 chargé: {len(perdus)} perdus d'hier ({saved_date_str})")
+        elif saved_date == today:
+            compteur11_perdu_today = perdus
+            compteur11_perdu_hier  = []
+            logger.info(f"📋 C11 chargé: {len(perdus)} perdus d'aujourd'hui (reload intraday)")
+        else:
+            compteur11_perdu_hier  = []
+            compteur11_perdu_today = []
+    except Exception as e:
+        logger.error(f"❌ Erreur load_compteur11: {e}")
+
+
+def save_compteur11():
+    """Sauvegarde les perdus du jour dans PostgreSQL."""
+    try:
+        data = {
+            'date':   datetime.now().strftime('%Y-%m-%d'),
+            'perdus': compteur11_perdu_today,
+        }
+        db.db_schedule(db.db_save_kv('compteur11', data))
+    except Exception as e:
+        logger.error(f"❌ Erreur save_compteur11: {e}")
+
+
+def compteur11_add_perdu(game_number: int, suit: str):
+    """Enregistre une prédiction perdue dans la liste du jour (et sauvegarde)."""
+    global compteur11_perdu_today
+    # Éviter les doublons
+    for e in compteur11_perdu_today:
+        if e['game_number'] == game_number and e['suit'] == suit:
+            return
+    compteur11_perdu_today.append({
+        'game_number': game_number,
+        'suit':        suit,
+        'date':        datetime.now().strftime('%Y-%m-%d'),
+    })
+    save_compteur11()
+    logger.info(f"📋 C11 enregistré: #{game_number} {suit} perdu aujourd'hui")
+
+
+async def compteur11_fire(entry: Dict, current_game: int):
+    """Lance une prédiction C11 dans le canal (perdu hier → prédit aujourd'hui)."""
+    global compteur11_triggered
+    orig_game = entry['game_number']
+    suit      = entry['suit']
+    trigger_key = f"{orig_game}_{suit}"
+    if trigger_key in compteur11_triggered:
+        return
+    compteur11_triggered.add(trigger_key)
+
+    pred_num = orig_game  # On prédit le même numéro que hier
+    reason   = (
+        f"C11: jeu #{orig_game} {suit} perdu hier — retour probable aujourd'hui."
+    )
+    added = add_to_prediction_queue(pred_num, suit, 'compteur11', reason)
+    success = await send_prediction_multi_channel(pred_num, suit, 'compteur11')
+    if added:
+        for e in list(prediction_queue):
+            if e['game_number'] == pred_num and e['suit'] == suit and e.get('type') == 'compteur11':
+                prediction_queue.remove(e)
+                break
+    if success:
+        logger.info(f"🔄 C11 prédit: #{pred_num} {suit} (perdu hier #{orig_game})")
+    else:
+        logger.warning(f"⚠️ C11: envoi #{pred_num} {suit} échoué")
+
 
 # ============================================================================
 # INITIALISATION
@@ -3017,7 +3571,7 @@ async def send_prediction_to_channel(channel_id: int, game_number: int, suit: st
         logger.error(f"❌ Erreur envoi à {channel_id}: {e}")
         return None
 
-async def send_prediction_multi_channel(game_number: int, suit: str, prediction_type: str = 'standard') -> bool:
+async def send_prediction_multi_channel(game_number: int, suit: str, prediction_type: str = 'standard', skip_c6: bool = False) -> bool:
     global last_prediction_time, last_prediction_number_sent, DISTRIBUTION_CHANNEL_ID, COMPTEUR2_CHANNEL_ID
 
     # Vérification restriction horaire
@@ -3026,10 +3580,14 @@ async def send_prediction_multi_channel(game_number: int, suit: str, prediction_
         return False
 
     # ── Filtre Compteur6 : redirection par paires inverses ──────────────────
+    # skip_c6=True quand C9 a déjà overridé le costume : C6 ne doit pas annuler l'override C9
     suit_original = suit
-    suit = apply_compteur6(suit)
-    if suit != suit_original:
-        logger.info(f"🔄 C6: prédiction #{game_number} redirigée {suit_original} → {suit}")
+    if not skip_c6:
+        suit = apply_compteur6(suit)
+        if suit != suit_original:
+            logger.info(f"🔄 C6: prédiction #{game_number} redirigée {suit_original} → {suit}")
+    else:
+        logger.info(f"⏭️ C6 ignoré (C9 override actif): costume {suit} conservé tel quel")
 
     success = False
 
@@ -3042,11 +3600,28 @@ async def send_prediction_multi_channel(game_number: int, suit: str, prediction_
         last_prediction_number_sent = game_number
 
         # Chercher la raison dans la file d'attente
+        # Utiliser suit_original : C6 peut avoir redirigé le costume APRÈS le stockage en file
         queued_reason = ''
         for qp in prediction_queue:
-            if qp['game_number'] == game_number and qp['suit'] == suit:
+            if qp['game_number'] == game_number and qp['suit'] == suit_original:
                 queued_reason = qp.get('reason', '')
                 break
+        if not queued_reason and suit_original != suit:
+            # Fallback : cherche aussi par game_number seul (C6 ou C9 ont changé le costume)
+            for qp in prediction_queue:
+                if qp['game_number'] == game_number:
+                    queued_reason = qp.get('reason', '')
+                    break
+
+        # Si C6 a redirigé le costume, annoter la raison pour que /raison le mentionne
+        if suit != suit_original and not skip_c6:
+            _suit_text = {'♠': 'Pique', '♥': 'Coeur', '♦': 'Carreau', '♣': 'Trefle'}
+            c6_wj = compteur6_seuil_Wj
+            c6_cnt = compteur6_trackers.get(suit_original, 0)
+            queued_reason = (queued_reason or '') + (
+                f" | C6: {_suit_text.get(suit_original, suit_original)} → {_suit_text.get(suit, suit)} "
+                f"(inverse a {c6_cnt}/{c6_wj} — seuil Wj non atteint)"
+            )
 
         pending_predictions[game_number] = {
             'suit': suit,
@@ -3116,7 +3691,7 @@ async def notify_b_augmente(suit: str, old_b: int, new_b: int, game_number: int,
         logger.error(f"❌ Notif B augmenté: {e}")
 
 async def send_parole_auto_delete(statut_key: str, game_number: int):
-    """Envoie une parole biblique sur le canal et la supprime automatiquement après 60s."""
+    """Envoie une parole biblique sur le canal et la supprime automatiquement après 30s."""
     try:
         entity = await resolve_channel(PREDICTION_CHANNEL_ID)
         if not entity:
@@ -3130,6 +3705,18 @@ async def send_parole_auto_delete(statut_key: str, game_number: int):
             logger.debug(f"Suppression parole #{game_number} ignorée: {e}")
     except Exception as e:
         logger.debug(f"send_parole_auto_delete #{game_number}: {e}")
+
+
+async def auto_delete_canal_message(msg_id: int, delay_seconds: int = 1800):
+    """Supprime automatiquement un message du canal après 30 min (1800s)."""
+    await asyncio.sleep(delay_seconds)
+    try:
+        entity = await resolve_channel(PREDICTION_CHANNEL_ID)
+        if entity:
+            await client.delete_messages(entity, [msg_id])
+            logger.info(f"🗑️ Message canal #{msg_id} supprimé (auto après {delay_seconds // 60} min)")
+    except Exception as e:
+        logger.debug(f"auto_delete_canal_message #{msg_id}: {e}")
 
 
 async def update_prediction_message(game_number: int, status: str, rattrapage: int = 0):
@@ -3298,6 +3885,7 @@ async def check_prediction_result(game_number: int, player_suits: Set[str], is_f
             del pending_predictions[original_game]
             save_pending_predictions()
             update_prediction_in_history(original_game, target_suit, game_number, rattrapage, 'perdu')
+            compteur11_add_perdu(original_game, target_suit)
             found = True
             continue
 
@@ -3368,6 +3956,7 @@ async def check_prediction_result(game_number: int, player_suits: Set[str], is_f
                 logger.info(f"❌ R3 terminé sans {target_suit}, prédiction PERDUE #{original_game}")
                 await update_prediction_message(original_game, 'perdu', 3)
                 update_prediction_in_history(original_game, target_suit, check_game, 3, 'perdu')
+                compteur11_add_perdu(original_game, target_suit)
                 game_result_cache.pop(check_game, None)   # nettoyage cache — statut final trouvé
                 found = True
 
@@ -3470,13 +4059,22 @@ async def process_prediction_queue(current_game: int, is_finished: bool = False)
         # le "fort" avec un écart ≥ SS, il override vers le costume "faible".
         original_suit  = suit
         c9_ovr = c9_get_override(suit)
+        c9_did_override = False
         if c9_ovr and c9_ovr != suit:
+            c9_did_override = True
+            # Annoter la raison dans la file pour que /raison le mentionne
+            _suit_text = {'♠': 'Pique', '♥': 'Coeur', '♦': 'Carreau', '♣': 'Trefle'}
+            to_send['reason'] = (to_send.get('reason') or '') + (
+                f" | C9 override: {_suit_text.get(suit, suit)} → {_suit_text.get(c9_ovr, c9_ovr)} "
+                f"(ecart SS={compteur9_ss}, diff={compteur9_counts.get(suit,0)-compteur9_counts.get(c9_ovr,0)})"
+            )
             suit = c9_ovr
             logger.info(f"🔄 C9 override appliqué: {original_suit} → {suit} (#pred {pred_number})")
         # ─────────────────────────────────────────────────────────────────────
 
         logger.info(f"📤 Envoi depuis file: #{pred_number} (jeu #{current_game} terminé, df={PREDICTION_DF})")
-        success = await send_prediction_multi_channel(pred_number, suit, pred_type)
+        # Si C9 a overridé le costume, C6 ne doit pas l'annuler (skip_c6=True)
+        success = await send_prediction_multi_channel(pred_number, suit, pred_type, skip_c6=c9_did_override)
         if success:
             prediction_queue.remove(to_send)
 
@@ -3561,10 +4159,7 @@ async def send_bilan_and_reset_at_1440():
     global compteur2_trackers, compteur2_seuil_B_per_suit
     global compteur1_trackers, compteur1_history
     global last_prediction_time, last_prediction_number_sent, suit_block_until
-    global animation_tasks, mode_emploi_sent_games
-
-    # Envoi mode d'emploi + heures favorables au jeu #1440 (3ème envoi du cycle)
-    await send_mode_emploi_with_heures()
+    global animation_tasks
 
     bilan_1440_sent = True
 
@@ -3663,7 +4258,14 @@ async def send_bilan_and_reset_at_1440():
     processed_games.clear()
     prediction_checked_games.clear()
     suit_block_until.clear()
-    mode_emploi_sent_games.clear()   # Réarmer pour le prochain cycle
+
+    # Compteur 11 : rotation des perdus jour J → jour J+1
+    global compteur11_perdu_hier, compteur11_perdu_today, compteur11_triggered
+    compteur11_perdu_hier  = list(compteur11_perdu_today)
+    compteur11_perdu_today = []
+    compteur11_triggered.clear()
+    save_compteur11()   # Sauvegarde avec liste vide (nouveau jour)
+
     last_prediction_time        = None
     last_prediction_number_sent = 0
     perdu_pdf_msg_id            = None
@@ -3739,6 +4341,9 @@ async def send_bilan_and_reset_at_1440():
             await client.send_message(admin_entity, msg, parse_mode='markdown')
         except Exception as e:
             logger.error(f"❌ Erreur notif admin #1440: {e}")
+
+    # Envoi des heures favorables dans le canal après reset #1440
+    await send_heures_favorables_simple()
 
 
 async def process_game_result(game_number: int, player_suits: Set[str], player_cards_raw: list, is_finished: bool = False):
@@ -3847,10 +4452,14 @@ async def process_game_result(game_number: int, player_suits: Set[str], player_c
 
         logger.info(f"📊 Jeu #{game_number}: joueur {player_suits} | C4={dict(compteur4_trackers)}")
 
-    # Envoi mode d'emploi + heures favorables à chaque tiers de cycle (#480, #960)
-    if game_number in (480, 960) and game_number not in mode_emploi_sent_games:
-        mode_emploi_sent_games.add(game_number)
-        asyncio.create_task(send_mode_emploi_with_heures())
+    # ── Compteur 11 : perdu hier → prédit aujourd'hui ───────────────────────
+    # Quand le jeu courant atteint (game_number_perdu_hier - 2), on lance la prédiction
+    if compteur11_perdu_hier and is_finished:
+        for entry in compteur11_perdu_hier:
+            trigger_at = entry['game_number'] - 2
+            if game_number == trigger_at:
+                asyncio.create_task(compteur11_fire(entry, game_number))
+    # ────────────────────────────────────────────────────────────────────────
 
     # Fin de cycle : jeu #1440 terminé → bilan envoyé + reset historique
     if game_number == 1440 and is_finished and not bilan_1440_sent:
@@ -4555,10 +5164,10 @@ async def cmd_compteur8(event):
         parts = raw.split()
         sub   = parts[1].lower() if len(parts) > 1 else ''
 
-        # /compteur8 pdf — envoyer le PDF comparatif C8/C7
+        # /compteur8 pdf — envoyer le PDF Compteur8 seul (absences uniquement)
         if sub == 'pdf':
-            await send_compteur8_pdf()
-            await event.respond("📄 PDF comparatif Compteur8/Compteur7 envoyé.")
+            await send_compteur8_only_pdf()
+            await event.respond("📄 PDF Compteur8 (absences) envoyé.")
             return
 
         # /compteur8 reset — effacer l'historique persistant
@@ -4622,10 +5231,59 @@ async def cmd_comparaison(event):
         await event.respond("🔒 Admin uniquement")
         return
     try:
+        global comparaison_nb_jours
         suit_names = {'♠': 'Pique', '♥': 'Cœur', '♦': 'Carreau', '♣': 'Trèfle'}
         suit_emoji = {'♠': '♠️', '♥': '❤️', '♦': '♦️', '♣': '♣️'}
+        raw   = event.message.message.strip()
+        parts = raw.split()
+        sub   = parts[1].lower() if len(parts) > 1 else ''
 
-        # ── Heures ayant assez de données ────────────────────────────────────
+        # /comparaison jours N — définir le nombre de jours par défaut
+        if sub == 'jours' and len(parts) > 2:
+            try:
+                val = int(parts[2])
+                if val < 1:
+                    await event.respond("❌ Minimum 1 jour")
+                    return
+                comparaison_nb_jours = val
+                await event.respond(f"✅ Nombre de jours de comparaison : **{val}**")
+            except ValueError:
+                await event.respond("❌ Usage: `/comparaison jours 5`")
+            return
+
+        # /comparaison c8 [N] — PDF comparaison C8 jour par jour
+        if sub == 'c8':
+            nb = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else comparaison_nb_jours
+            await event.respond(f"⏳ Génération du PDF C8 sur {nb} jour(s)...")
+            pdf_bytes  = generate_comparaison_c8_pdf(nb)
+            pdf_buffer = io.BytesIO(pdf_bytes)
+            pdf_buffer.name = f"comparaison_c8_{nb}j.pdf"
+            admin_entity = await client.get_entity(ADMIN_ID)
+            await client.send_file(
+                admin_entity, pdf_buffer,
+                caption=f"📊 **Comparaison C8 — {nb} derniers jours**\nAbsences ≥{COMPTEUR8_THRESHOLD}x | Toutes données préservées",
+                parse_mode='markdown',
+                attributes=[], file_name=f"comparaison_c8_{nb}j.pdf"
+            )
+            return
+
+        # /comparaison c7 [N] — PDF comparaison C7 jour par jour
+        if sub == 'c7':
+            nb = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else comparaison_nb_jours
+            await event.respond(f"⏳ Génération du PDF C7 sur {nb} jour(s)...")
+            pdf_bytes  = generate_comparaison_c7_pdf(nb)
+            pdf_buffer = io.BytesIO(pdf_bytes)
+            pdf_buffer.name = f"comparaison_c7_{nb}j.pdf"
+            admin_entity = await client.get_entity(ADMIN_ID)
+            await client.send_file(
+                admin_entity, pdf_buffer,
+                caption=f"📊 **Comparaison C7 — {nb} derniers jours**\nPrésences ≥{COMPTEUR7_THRESHOLD}x | Toutes données préservées",
+                parse_mode='markdown',
+                attributes=[], file_name=f"comparaison_c7_{nb}j.pdf"
+            )
+            return
+
+        # ── Heures ayant assez de données (analyse horaire existante) ─────────
         active_hours = sorted([h for h in range(24) if hourly_game_count[h] >= 3])
         total_games  = sum(hourly_game_count[h] for h in active_hours)
 
@@ -5362,7 +6020,7 @@ def generate_raison_pdf() -> bytes:
     pdf.set_font('Helvetica', 'B', 17)
     pdf.set_fill_color(*VIOLET)
     pdf.set_text_color(*WHITE)
-    pdf.cell(0, 13, 'BACCARAT AI  -  RAPPORT DES PREDICTIONS', ln=True, align='C', fill=True)
+    pdf.cell(0, 13, 'BACCARAT AI  -  RAPPORT DES PREDICTIONS', new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C', fill=True)
     pdf.ln(2)
 
     pdf.set_font('Helvetica', '', 9)
@@ -5375,8 +6033,7 @@ def generate_raison_pdf() -> bytes:
     pdf.cell(0, 6,
         f"Genere le {datetime.now().strftime('%d/%m/%Y  %H:%M')}  |  "
         f"Total: {total}  |  Gagnes: {wins}  |  Perdus: {losses}  |  "
-        f"En cours: {pending_c}  |  Taux de reussite: {pct}",
-        ln=True, align='C')
+        f"En cours: {pending_c}  |  Taux de reussite: {pct}", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C')
     pdf.ln(5)
 
     # ── En-tête du tableau ────────────────────────────────────────────────────
@@ -5404,7 +6061,12 @@ def generate_raison_pdf() -> bytes:
         heure_str= pred_at.strftime('%H:%M:%S')
         jeu_str  = f"#{pred['predicted_game']}"
         suit_nm  = pdf_safe(suit_names.get(suit, suit))
-        cptr_str = 'C2' if pred.get('type') == 'compteur2' else 'Auto'
+        _pdf_type_labels = {
+            'compteur2':        'C2',
+            'compteur9_silent': 'C9-S',
+            'compteur9':        'C9-P',
+        }
+        cptr_str = _pdf_type_labels.get(pred.get('type', ''), 'Auto')
         reason   = pdf_safe(pred.get('reason', '') or '-')
         reason_s = reason[:52] + ('...' if len(reason) > 52 else '')
         stat_lbl = status_labels.get(status, status)
@@ -5454,7 +6116,7 @@ def generate_raison_pdf() -> bytes:
     pdf.set_font('Helvetica', 'B', 11)
     pdf.set_fill_color(*VIOLET)
     pdf.set_text_color(*WHITE)
-    pdf.cell(0, 9, 'RESUME PAR COSTUME', ln=True, fill=True, align='C')
+    pdf.cell(0, 9, 'RESUME PAR COSTUME', new_x=XPos.LMARGIN, new_y=YPos.NEXT, fill=True, align='C')
     pdf.ln(3)
 
     for suit in ['♠', '♥', '♦', '♣']:
@@ -5471,15 +6133,14 @@ def generate_raison_pdf() -> bytes:
         pdf.cell(0, 7,
             f"  {pdf_safe(suit_names.get(suit,suit))} :  "
             f"{len(sp)} pred.  |  {w_s} gagnes  |  {l_s} perdus  |  "
-            f"{en_s} en cours  |  Reussite: {pct_s}",
-            ln=True)
+            f"{en_s} en cours  |  Reussite: {pct_s}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
     # ── Résumé par compteur ───────────────────────────────────────────────────
     pdf.ln(4)
     pdf.set_font('Helvetica', 'B', 11)
     pdf.set_fill_color(*VIOLET)
     pdf.set_text_color(*WHITE)
-    pdf.cell(0, 9, 'RESUME PAR COMPTEUR DECLENCHEUR', ln=True, fill=True, align='C')
+    pdf.cell(0, 9, 'RESUME PAR COMPTEUR DECLENCHEUR', new_x=XPos.LMARGIN, new_y=YPos.NEXT, fill=True, align='C')
     pdf.ln(3)
 
     for ctype, label in [('compteur2', 'Compteur 2'), ('standard', 'Auto / Autres')]:
@@ -5493,8 +6154,7 @@ def generate_raison_pdf() -> bytes:
         pdf.set_font('Helvetica', 'B', 10)
         pdf.set_text_color(*DARK)
         pdf.cell(0, 7,
-            f"  {label} :  {len(sp)} pred.  |  {w_s} gagnes  |  {l_s} perdus  |  Reussite: {pct_s}",
-            ln=True)
+            f"  {label} :  {len(sp)} pred.  |  {w_s} gagnes  |  {l_s} perdus  |  Reussite: {pct_s}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
     # ── Détail des raisons complètes ──────────────────────────────────────────
     long_preds = [p for p in preds if len(p.get('reason','') or '') > 52]
@@ -5503,7 +6163,7 @@ def generate_raison_pdf() -> bytes:
         pdf.set_font('Helvetica', 'B', 11)
         pdf.set_fill_color(*VIOLET)
         pdf.set_text_color(*WHITE)
-        pdf.cell(0, 9, 'DETAIL COMPLET DES RAISONS', ln=True, fill=True, align='C')
+        pdf.cell(0, 9, 'DETAIL COMPLET DES RAISONS', new_x=XPos.LMARGIN, new_y=YPos.NEXT, fill=True, align='C')
         pdf.ln(3)
 
         for pred in long_preds:
@@ -5518,13 +6178,12 @@ def generate_raison_pdf() -> bytes:
             pdf.set_text_color(sr, sg, sb)
             pdf.cell(0, 7,
                 f"  Jeu #{jeu}  -  {pdf_safe(suit_names.get(suit,suit))}  "
-                f"({pred['predicted_at'].strftime('%d/%m %H:%M')})",
-                ln=True)
+                f"({pred['predicted_at'].strftime('%d/%m %H:%M')})", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
             pdf.set_font('Helvetica', '', 8)
             pdf.set_text_color(*DARK)
             for chunk in [reason[i:i+130] for i in range(0, len(reason), 130)]:
-                pdf.cell(0, 5, f"    {chunk}", ln=True)
+                pdf.cell(0, 5, f"    {chunk}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
             pdf.ln(2)
 
     # ── Pied de page ─────────────────────────────────────────────────────────
@@ -5533,8 +6192,7 @@ def generate_raison_pdf() -> bytes:
     pdf.set_text_color(*GREY_TXT)
     pdf.cell(0, 5,
         f'BACCARAT AI  -  Rapport raisons  -  '
-        f'{datetime.now().strftime("%d/%m/%Y %H:%M")}',
-        ln=True, align='C')
+        f'{datetime.now().strftime("%d/%m/%Y %H:%M")}', new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C')
 
     return bytes(pdf.output())
 
@@ -5561,7 +6219,8 @@ async def cmd_raison(event):
     STATUS_MAP = {
         'gagne_r0': '✅ GAGNE R0', 'gagne_r1': '✅ GAGNE R1',
         'gagne_r2': '✅ GAGNE R2', 'gagne_r3': '✅ GAGNE R3',
-        'perdu': '❌ PERDU', 'en_cours': '⏳ EN COURS'
+        'perdu': '❌ PERDU', 'en_cours': '⏳ EN COURS',
+        'expirée_api': '🔌 EXPIRE API',
     }
 
     def format_pred_block(pred, index=None):
@@ -5569,7 +6228,12 @@ async def cmd_raison(event):
         suit    = SUIT_DISPLAY.get(pred['suit'], pred['suit'])
         status  = STATUS_MAP.get(pred.get('status', ''), pred.get('status', '?'))
         pred_at = pred['predicted_at'].strftime('%d/%m %H:%M:%S')
-        ptype   = "C2" if pred.get('type') == 'compteur2' else "Auto"
+        _type_labels = {
+            'compteur2':        'C2',
+            'compteur9_silent': '🔕 C9 (silence)',
+            'compteur9':        '📢 C9 (canal)',
+        }
+        ptype = _type_labels.get(pred.get('type', ''), 'Auto')
         reason  = pred.get('reason', '') or 'Raison non enregistree.'
         ratk    = pred.get('rattrapage_level', 0)
         rat_str = f" R{ratk}" if ratk else ""
@@ -5718,34 +6382,30 @@ async def cmd_bilan(event):
 # ============================================================================
 
 async def mode_emploi_loop():
-    """Envoie le mode d'emploi dans le canal à chaque intervalle défini, à l'heure pile."""
-    global mode_emploi_interval_hours, mode_emploi_text
+    """Envoie le mode d'emploi 3 fois par jour : matin (8h), midi (12h), soirée (22h)."""
+    # Heures cibles d'envoi (heure locale)
+    MODE_EMPLOI_HEURES = [8, 12, 22]
+    sent_today: set = set()   # Heures déjà envoyées aujourd'hui
+    last_day: int = -1        # Jour calendaire du dernier envoi (pour réarmer)
+
     while True:
         try:
-            interval = mode_emploi_interval_hours
-            if interval <= 0:
-                await asyncio.sleep(60)
-                continue
-
+            await asyncio.sleep(30)
             now = datetime.now()
-            # Trouver la prochaine heure pile alignée sur l'intervalle
-            # Ex : intervalle=4h → 00:00, 04:00, 08:00, 12:00, 16:00, 20:00
-            current_hour = now.hour
-            hours_since_last = current_hour % interval
-            hours_until_next = interval - hours_since_last
-            seconds_until_next = hours_until_next * 3600 - (now.minute * 60 + now.second)
-            if seconds_until_next <= 0:
-                seconds_until_next += interval * 3600
 
-            await asyncio.sleep(seconds_until_next)
+            # Réarmer le suivi au changement de jour
+            if now.day != last_day:
+                sent_today.clear()
+                last_day = now.day
 
-            if mode_emploi_interval_hours <= 0:
-                continue
+            # Vérifier si l'heure courante correspond à une heure cible (tranche de 5 min)
+            for h in MODE_EMPLOI_HEURES:
+                if now.hour == h and now.minute < 5 and h not in sent_today:
+                    sent_today.add(h)
+                    await send_mode_emploi_with_heures()
+                    logger.info(f"📋 Mode d'emploi envoyé à {h:02d}h00")
+                    break
 
-            entity = await resolve_channel(PREDICTION_CHANNEL_ID)
-            if entity:
-                await client.send_message(entity, mode_emploi_text, parse_mode='markdown')
-                logger.info(f"📋 Mode d'emploi envoyé ({datetime.now().strftime('%H:%M')})")
         except Exception as e:
             logger.error(f"❌ Erreur mode_emploi_loop: {e}")
             await asyncio.sleep(60)
@@ -6328,13 +6988,18 @@ async def start_bot():
         setup_handlers()
         initialize_trackers()
 
-        # Charger données persistantes Compteur4, Compteur7, Compteur8, Compteur9 et données horaires
-        load_compteur4_data()
-        load_compteur7_data()
-        load_compteur8_data()
-        load_compteur9_data()
-        load_hourly_data()
-        load_pending_predictions()  # Reprend les prédictions en cours après redémarrage
+        # Initialiser PostgreSQL
+        await db.init_db()
+
+        # Charger données persistantes depuis PostgreSQL (avec fallback JSON)
+        await load_compteur4_data()
+        await load_compteur7_data()
+        await load_compteur8_data()
+        await load_compteur9_data()
+        await load_hourly_data()
+        await load_compteur11()           # Charge les perdus d'hier pour les rejouer aujourd'hui
+        await load_pending_predictions()  # Reprend les prédictions en cours après redémarrage
+        await load_prediction_history()   # Charge l'historique pour les heures favorables
 
         if PREDICTION_CHANNEL_ID:
             try:
@@ -6343,6 +7008,7 @@ async def start_bot():
                     prediction_channel_ok = True
                     logger.info(f"✅ Canal prédiction OK")
                     asyncio.create_task(send_mode_emploi_with_heures())  # Envoi au démarrage
+                    asyncio.create_task(send_heures_favorables_simple())  # Heures favorables au démarrage
             except Exception as e:
                 logger.error(f"❌ Erreur canal prédiction: {e}")
 

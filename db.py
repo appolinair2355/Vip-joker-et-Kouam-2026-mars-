@@ -1,0 +1,375 @@
+"""
+Module de persistance PostgreSQL — BACCARAT AI
+Remplace tous les fichiers JSON locaux.
+Toutes les fonctions sont async (asyncpg).
+Pour les contextes synchrones, utiliser db_schedule() pour planifier une sauvegarde.
+"""
+
+import asyncio
+import json
+import logging
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+import asyncpg
+
+logger = logging.getLogger(__name__)
+
+_pool: Optional[asyncpg.Pool] = None
+
+
+# ============================================================================
+# CONNEXION & INITIALISATION
+# ============================================================================
+
+async def init_db(database_url: str = None):
+    """Crée le pool de connexion et initialise les tables."""
+    global _pool
+    if database_url is None:
+        from config import DATABASE_URL
+        database_url = DATABASE_URL
+    if not database_url:
+        logger.warning("⚠️ DATABASE_URL non configurée — persistance JSON uniquement")
+        return
+    try:
+        # Détection du mode SSL :
+        #   - Replit interne (helium / localhost / 127.0.0.1) → pas de SSL
+        #   - Render URL interne (dpg-xxxx-a sans .render.com)  → pas de SSL
+        #   - Render URL externe (.oregon-postgres.render.com)   → SSL requis
+        #   - Toute autre DB cloud externe                       → SSL requis
+        is_local = (
+            'helium'      in database_url or
+            'localhost'   in database_url or
+            '127.0.0.1'   in database_url
+        )
+        is_render_internal = (
+            'dpg-' in database_url and
+            'postgres.render.com' not in database_url
+        )
+        ssl_mode = False if (is_local or is_render_internal) else 'require'
+        _pool = await asyncpg.create_pool(
+            database_url,
+            min_size=1,
+            max_size=5,
+            command_timeout=30,
+            ssl=ssl_mode,
+        )
+        await _create_tables()
+        logger.info("✅ Connexion PostgreSQL établie")
+    except Exception as e:
+        logger.error(f"❌ Impossible de se connecter à PostgreSQL: {e}")
+        _pool = None
+
+
+async def _create_tables():
+    """Crée toutes les tables nécessaires si elles n'existent pas."""
+    async with _pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS kv_store (
+                key         VARCHAR(64) PRIMARY KEY,
+                data        JSONB       NOT NULL,
+                updated_at  TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS hourly_suit_data (
+                heure  INT         NOT NULL,
+                suit   VARCHAR(4)  NOT NULL,
+                count  INT         DEFAULT 0,
+                PRIMARY KEY (heure, suit)
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS pending_predictions (
+                game_number  INT     PRIMARY KEY,
+                data         JSONB   NOT NULL,
+                updated_at   TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS prediction_history (
+                id               SERIAL      PRIMARY KEY,
+                predicted_game   INT         NOT NULL,
+                suit             VARCHAR(4)  NOT NULL,
+                prediction_type  VARCHAR(32) DEFAULT 'standard',
+                reason           TEXT        DEFAULT '',
+                status           VARCHAR(32) DEFAULT 'en_cours',
+                rattrapage_level INT         DEFAULT 0,
+                predicted_at     TIMESTAMPTZ DEFAULT NOW(),
+                verified_at      TIMESTAMPTZ,
+                verified_by_game INT,
+                UNIQUE (predicted_game, suit)
+            )
+        """)
+    logger.info("📋 Tables PostgreSQL prêtes")
+
+
+def is_connected() -> bool:
+    return _pool is not None
+
+
+def db_schedule(coro):
+    """
+    Planifie une coroutine de sauvegarde depuis un contexte synchrone.
+    Utiliser depuis les fonctions save_* non-async.
+    """
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            asyncio.ensure_future(coro)
+        else:
+            loop.run_until_complete(coro)
+    except Exception as e:
+        logger.error(f"❌ db_schedule: {e}")
+
+
+# ============================================================================
+# KV STORE — C4, C7, C8, C9, C11 (JSON blobs)
+# ============================================================================
+
+async def db_save_kv(key: str, data: Any):
+    """Sauvegarde un blob JSON dans kv_store."""
+    if _pool is None:
+        return
+    try:
+        async with _pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO kv_store (key, data, updated_at)
+                VALUES ($1, $2::jsonb, NOW())
+                ON CONFLICT (key) DO UPDATE
+                SET data=$2::jsonb, updated_at=NOW()
+            """, key, json.dumps(data, default=str))
+    except Exception as e:
+        logger.error(f"❌ db_save_kv({key}): {e}")
+
+
+async def db_load_kv(key: str) -> Optional[Any]:
+    """Charge un blob JSON depuis kv_store."""
+    if _pool is None:
+        return None
+    try:
+        async with _pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT data FROM kv_store WHERE key=$1", key
+            )
+            if row:
+                val = row['data']
+                return json.loads(val) if isinstance(val, str) else val
+            return None
+    except Exception as e:
+        logger.error(f"❌ db_load_kv({key}): {e}")
+        return None
+
+
+# ============================================================================
+# DONNÉES HORAIRES — hourly_suit_data
+# ============================================================================
+
+async def db_save_hourly(hourly_suit_data: Dict, hourly_game_count: Dict):
+    """Sauvegarde les données horaires (upsert par heure+costume)."""
+    if _pool is None:
+        return
+    try:
+        async with _pool.acquire() as conn:
+            rows = []
+            for h, suits in hourly_suit_data.items():
+                for suit, count in suits.items():
+                    rows.append((int(h), suit, count))
+            await conn.executemany("""
+                INSERT INTO hourly_suit_data (heure, suit, count)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (heure, suit) DO UPDATE SET count=$3
+            """, rows)
+            # Stocker les totaux dans kv_store
+            totals = {str(h): cnt for h, cnt in hourly_game_count.items()}
+            await db_save_kv('hourly_totals', totals)
+    except Exception as e:
+        logger.error(f"❌ db_save_hourly: {e}")
+
+
+async def db_load_hourly() -> Optional[Dict]:
+    """
+    Charge les données horaires.
+    Retourne {'suits': {h: {suit: count}}, 'totals': {h: count}} ou None.
+    """
+    if _pool is None:
+        return None
+    try:
+        async with _pool.acquire() as conn:
+            rows = await conn.fetch("SELECT heure, suit, count FROM hourly_suit_data")
+        suits: Dict[str, Dict[str, int]] = {}
+        for row in rows:
+            h = str(row['heure'])
+            if h not in suits:
+                suits[h] = {}
+            suits[h][row['suit']] = row['count']
+        totals = await db_load_kv('hourly_totals') or {}
+        return {'suits': suits, 'totals': totals}
+    except Exception as e:
+        logger.error(f"❌ db_load_hourly: {e}")
+        return None
+
+
+# ============================================================================
+# PENDING PREDICTIONS
+# ============================================================================
+
+def _serialize(val):
+    if isinstance(val, datetime):
+        return val.isoformat()
+    return val
+
+
+async def db_save_pending(game_number: int, pred: Dict):
+    """Sauvegarde ou met à jour une prédiction en attente."""
+    if _pool is None:
+        return
+    try:
+        serializable = {k: _serialize(v) for k, v in pred.items()}
+        async with _pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO pending_predictions (game_number, data, updated_at)
+                VALUES ($1, $2::jsonb, NOW())
+                ON CONFLICT (game_number) DO UPDATE
+                SET data=$2::jsonb, updated_at=NOW()
+            """, game_number, json.dumps(serializable, default=str))
+    except Exception as e:
+        logger.error(f"❌ db_save_pending({game_number}): {e}")
+
+
+async def db_delete_pending(game_number: int):
+    """Supprime une prédiction en attente résolue."""
+    if _pool is None:
+        return
+    try:
+        async with _pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM pending_predictions WHERE game_number=$1",
+                game_number
+            )
+    except Exception as e:
+        logger.error(f"❌ db_delete_pending({game_number}): {e}")
+
+
+async def db_save_all_pending(pending_predictions: Dict):
+    """Sauvegarde tout le dict pending_predictions (vidage complet + réinsertion)."""
+    if _pool is None:
+        return
+    try:
+        async with _pool.acquire() as conn:
+            await conn.execute("DELETE FROM pending_predictions")
+            for gn, pred in pending_predictions.items():
+                serializable = {k: _serialize(v) for k, v in pred.items()}
+                await conn.execute("""
+                    INSERT INTO pending_predictions (game_number, data, updated_at)
+                    VALUES ($1, $2::jsonb, NOW())
+                """, int(gn), json.dumps(serializable, default=str))
+    except Exception as e:
+        logger.error(f"❌ db_save_all_pending: {e}")
+
+
+async def db_load_pending() -> Dict:
+    """Charge toutes les prédictions en attente depuis PostgreSQL."""
+    if _pool is None:
+        return {}
+    try:
+        async with _pool.acquire() as conn:
+            rows = await conn.fetch("SELECT game_number, data FROM pending_predictions")
+        result = {}
+        for row in rows:
+            gn = row['game_number']
+            val = row['data']
+            pred = json.loads(val) if isinstance(val, str) else dict(val)
+            for field in ('sent_time',):
+                if field in pred and pred[field]:
+                    try:
+                        pred[field] = datetime.fromisoformat(pred[field])
+                    except Exception:
+                        pass
+            pred['status'] = 'en_cours'
+            result[gn] = pred
+        return result
+    except Exception as e:
+        logger.error(f"❌ db_load_pending: {e}")
+        return {}
+
+
+# ============================================================================
+# PREDICTION HISTORY
+# ============================================================================
+
+async def db_add_prediction_history(entry: Dict):
+    """Ajoute une prédiction dans l'historique PostgreSQL."""
+    if _pool is None:
+        return
+    try:
+        predicted_at = entry.get('predicted_at') or datetime.now()
+        async with _pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO prediction_history
+                    (predicted_game, suit, prediction_type, reason, status,
+                     rattrapage_level, predicted_at)
+                VALUES ($1,$2,$3,$4,$5,$6,$7)
+                ON CONFLICT (predicted_game, suit) DO NOTHING
+            """,
+                entry.get('predicted_game'),
+                entry.get('suit'),
+                entry.get('type', 'standard'),
+                entry.get('reason', ''),
+                entry.get('status', 'en_cours'),
+                entry.get('rattrapage_level', 0),
+                predicted_at if isinstance(predicted_at, datetime) else datetime.now(),
+            )
+    except Exception as e:
+        logger.error(f"❌ db_add_prediction_history: {e}")
+
+
+async def db_update_prediction_history(
+    predicted_game: int, suit: str, status: str,
+    rattrapage_level: int, verified_by_game: int
+):
+    """Met à jour le statut d'une prédiction dans PostgreSQL."""
+    if _pool is None:
+        return
+    try:
+        async with _pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE prediction_history
+                SET status=$3, rattrapage_level=$4, verified_by_game=$5, verified_at=NOW()
+                WHERE predicted_game=$1 AND suit=$2
+            """, predicted_game, suit, status, rattrapage_level, verified_by_game)
+    except Exception as e:
+        logger.error(f"❌ db_update_prediction_history: {e}")
+
+
+async def db_load_prediction_history(limit: int = 200) -> List[Dict]:
+    """Charge les dernières prédictions depuis PostgreSQL."""
+    if _pool is None:
+        return []
+    try:
+        async with _pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT predicted_game, suit, prediction_type, reason, status,
+                       rattrapage_level, predicted_at, verified_at, verified_by_game
+                FROM prediction_history
+                ORDER BY predicted_at DESC
+                LIMIT $1
+            """, limit)
+        result = []
+        for row in rows:
+            result.append({
+                'predicted_game':  row['predicted_game'],
+                'suit':            row['suit'],
+                'type':            row['prediction_type'],
+                'reason':          row['reason'],
+                'status':          row['status'],
+                'rattrapage_level':row['rattrapage_level'],
+                'predicted_at':    row['predicted_at'],
+                'verified_at':     row['verified_at'],
+                'verified_by_game':row['verified_by_game'],
+                'verification_games': [],
+            })
+        return result
+    except Exception as e:
+        logger.error(f"❌ db_load_prediction_history: {e}")
+        return []
