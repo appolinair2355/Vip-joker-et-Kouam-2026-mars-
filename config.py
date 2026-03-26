@@ -114,15 +114,18 @@ API_SILENCE_ALERT_MINUTES = 5
 #   → Render injecte DATABASE_URL automatiquement avec l'URL INTERNE
 #     postgresql://...@dpg-d72p2h3uibrs73a8tojg-a/prediction_baccara
 #     (pas de SSL requis pour les connexions internes Render)
+#   → Le code lit DATABASE_URL en priorité (env var Render) → URL interne utilisée
 #
 # Sur Replit (développement) :
 #   → Pas de variable DATABASE_URL → fallback vers l'URL EXTERNE ci-dessous
-#     (SSL requis pour les connexions externes)
+#     (SSL requis avec vérification désactivée pour les connexions cloud externes)
 #
-# Résultat : DATABASE_URL n'a pas besoin d'être définie manuellement sur Render.
 # ============================================================================
 
-DATABASE_URL = "postgresql://prediction_baccara_user:GAd3ljzVMfK3BUld9w7hHjYeQQGixTUG@dpg-d72p2h3uibrs73a8tojg-a.oregon-postgres.render.com/prediction_baccara"
+DATABASE_URL = (
+    os.environ.get("DATABASE_URL")
+    or "postgresql://prediction_baccara_user:GAd3ljzVMfK3BUld9w7hHjYeQQGixTUG@dpg-d72p2h3uibrs73a8tojg-a.oregon-postgres.render.com/prediction_baccara"
+)
 
 # ============================================================================
 # LOGGING

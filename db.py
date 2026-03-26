@@ -8,6 +8,7 @@ Pour les contextes synchrones, utiliser db_schedule() pour planifier une sauvega
 import asyncio
 import json
 import logging
+import ssl as _ssl
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -46,13 +47,20 @@ async def init_db(database_url: str = None):
             'dpg-' in database_url and
             'postgres.render.com' not in database_url
         )
-        ssl_mode = False if (is_local or is_render_internal) else 'require'
+        needs_ssl = not (is_local or is_render_internal)
+        if needs_ssl:
+            # Connexion externe (URL Replit / cloud) : SSL sans vérif de certificat
+            ssl_ctx = _ssl.create_default_context()
+            ssl_ctx.check_hostname = False
+            ssl_ctx.verify_mode    = _ssl.CERT_NONE
+        else:
+            ssl_ctx = False  # Connexion interne Render : pas de SSL
         _pool = await asyncpg.create_pool(
             database_url,
             min_size=1,
             max_size=5,
             command_timeout=30,
-            ssl=ssl_mode,
+            ssl=ssl_ctx,
         )
         await _create_tables()
         logger.info("✅ Connexion PostgreSQL établie")

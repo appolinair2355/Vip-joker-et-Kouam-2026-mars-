@@ -239,6 +239,7 @@ compteur6_seuil_Wj: int = 2                      # Seuil Wj (modifiable par admi
 compteur6_trackers: Dict[str, int] = {           # Compteur d'apparitions par costume
     '♠': 0, '♥': 0, '♦': 0, '♣': 0
 }
+compteur6_ready: set = set()                     # Costumes dont le cycle Wj vient de se compléter
 COMPTEUR6_PAIRS: Dict[str, str] = {             # Paires inverses
     '♦': '♠', '♠': '♦',
     '♣': '♥', '♥': '♣',
@@ -1242,6 +1243,22 @@ def group_heures_into_intervals(heures: List[int]) -> List[str]:
     return intervals
 
 
+def _temps_restant(now_ci: 'datetime', next_hour: int) -> str:
+    """Temps restant jusqu'à next_hour (0-23), en heures et minutes réelles."""
+    now_min = now_ci.hour * 60 + now_ci.minute
+    nxt_min = next_hour * 60
+    diff_min = (nxt_min - now_min) % (24 * 60)
+    if diff_min == 0:
+        return "maintenant"
+    h, m = divmod(diff_min, 60)
+    if h > 0 and m > 0:
+        return f"dans {h}h {m}min"
+    elif h > 0:
+        return f"dans {h}h"
+    else:
+        return f"dans {m}min"
+
+
 def generate_heures_favorables_canal() -> str:
     """
     Génère un message simplifié pour le canal de prédiction :
@@ -1257,15 +1274,11 @@ def generate_heures_favorables_canal() -> str:
     all_heures   = sorted(e['heure'] for e in stat_results)
     total_games  = sum(hourly_game_count[h] for h in range(24))
 
+    # Si heures non identifiées → rien à envoyer au canal
+    if total_games < 100 or not all_heures:
+        return ""
+
     lines = ["⏰ *Heures favorables* _(heure de Côte d'Ivoire)_\n"]
-
-    if total_games < 100:
-        lines.append(f"_⏳ Analyse en cours ({total_games}/100 jeux)..._")
-        return "\n".join(lines) + SIGNATURE
-
-    if not all_heures:
-        lines.append("_Aucun créneau significatif détecté pour l'instant._")
-        return "\n".join(lines) + SIGNATURE
 
     # Canal : seulement les intervalles, aucun détail
     intervals = group_heures_into_intervals(all_heures)
@@ -1273,14 +1286,9 @@ def generate_heures_favorables_canal() -> str:
 
     upcoming = [h for h in all_heures if h > now_h] or all_heures
     nxt   = upcoming[0]
-    diff  = (nxt - now_h) % 24
     nxt_i = group_heures_into_intervals([nxt])[0]
-    if diff == 0:
-        lines.append(f"⏩ *Prochain créneau : {nxt_i}* _maintenant_")
-    elif diff == 1:
-        lines.append(f"⏩ *Prochain créneau : {nxt_i}* _dans 1h_")
-    else:
-        lines.append(f"⏩ *Prochain créneau : {nxt_i}* _dans {diff}h_")
+    dans  = _temps_restant(now_ci, nxt)
+    lines.append(f"⏩ *Prochain créneau : {nxt_i}* _{dans}_")
 
     return "\n".join(lines) + SIGNATURE
 
@@ -1388,9 +1396,9 @@ def generate_heures_favorables_text() -> str:
     if next_favs:
         nxt  = next_favs[0]
         h    = nxt['heure']
-        diff = (h - now.hour) % 24
+        dans = _temps_restant(now, h)
         top  = nxt['suits'][0]
-        lines.append(f"\n⏰ **Prochain créneau : {h:02d}h** — dans {diff}h")
+        lines.append(f"\n⏰ **Prochain créneau : {h:02d}h** — {dans}")
         lines.append(f"   ↳ {top['suit']} {suit_names.get(top['suit'],'')} {top['pct']}% (+{top['bonus']}%)")
 
     lines.append(
@@ -1415,11 +1423,9 @@ def generate_heures_favorables_intervals() -> str:
 
     header = "\n\n━━━━━━━━━━━━━━━━━━━━━━\n⏰ *Heures favorables* _(heure de Côte d'Ivoire)_"
 
-    if total_games < 100:
-        return header + f"\n_⏳ Analyse en cours ({total_games}/100 jeux)..._" + SIGNATURE
-
-    if not all_heures:
-        return header + "\n_Aucun créneau significatif détecté pour l'instant._" + SIGNATURE
+    if total_games < 100 or not all_heures:
+        # Pas encore identifiées → on n'affiche rien dans le canal
+        return ""
 
     intervals = group_heures_into_intervals(all_heures)
     lines = [header, "🟢 *Créneaux favorables :* " + " · ".join(intervals)]
@@ -1427,9 +1433,8 @@ def generate_heures_favorables_intervals() -> str:
     upcoming = [h for h in all_heures if h > now_h] or all_heures
     if upcoming:
         nxt   = upcoming[0]
-        diff  = (nxt - now_h) % 24
         nxt_i = group_heures_into_intervals([nxt])[0]
-        dans  = f"dans {diff}h" if diff > 0 else "maintenant"
+        dans  = _temps_restant(now_ci, nxt)
         lines.append(f"⏩ *Prochain créneau : {nxt_i}* _{dans}_")
 
     return "\n".join(lines) + SIGNATURE
@@ -1455,10 +1460,22 @@ async def send_heures_favorables_simple():
     """
     Envoie le message créneaux favorables dans le canal.
     Appelé au démarrage du bot et après chaque reset #1440.
+    N'envoie RIEN si les heures favorables ne sont pas encore identifiées
+    (données insuffisantes ou aucune heure favorable détectée) — on attend.
     """
     if not PREDICTION_CHANNEL_ID:
         return
     try:
+        # Vérifier que les heures favorables sont réellement identifiées
+        total_games = sum(hourly_game_count[h] for h in range(24))
+        if total_games < 100:
+            logger.info(f"⏰ Heures favorables non envoyées au démarrage : données insuffisantes ({total_games}/100 jeux)")
+            return
+        favorables = compute_heures_favorables()
+        if not favorables:
+            logger.info("⏰ Heures favorables non envoyées au démarrage : aucun créneau identifié")
+            return
+
         entity = await resolve_channel(PREDICTION_CHANNEL_ID)
         if not entity:
             return
@@ -1505,15 +1522,21 @@ async def heures_favorables_loop():
                     logger.error(f"❌ Heures favorables admin: {admin_err}")
 
             # ── Canal : message court créneaux favorables ────────────────────
+            # Seulement si les heures sont réellement identifiées (données suffisantes)
             if PREDICTION_CHANNEL_ID:
                 try:
-                    canal_entity = await resolve_channel(PREDICTION_CHANNEL_ID)
-                    if canal_entity:
-                        sent = await client.send_message(
-                            canal_entity, generate_heures_favorables_canal(), parse_mode='markdown'
-                        )
-                        logger.info(f"⏰ Heures favorables (canal) envoyées ({heure})")
-                        asyncio.create_task(auto_delete_canal_message(sent.id))
+                    _total = sum(hourly_game_count[h] for h in range(24))
+                    _favs  = compute_heures_favorables() if _total >= 100 else []
+                    if not _favs:
+                        logger.info(f"⏰ Canal ignoré ({heure}) : heures favorables non identifiées ({_total} jeux)")
+                    else:
+                        canal_entity = await resolve_channel(PREDICTION_CHANNEL_ID)
+                        if canal_entity:
+                            sent = await client.send_message(
+                                canal_entity, generate_heures_favorables_canal(), parse_mode='markdown'
+                            )
+                            logger.info(f"⏰ Heures favorables (canal) envoyées ({heure})")
+                            asyncio.create_task(auto_delete_canal_message(sent.id))
                 except Exception as canal_err:
                     logger.error(f"❌ Heures favorables canal: {canal_err}")
 
@@ -1607,39 +1630,47 @@ def update_compteur5(game_number: int, player_suits: Set[str], player_cards_raw:
 # ============================================================================
 
 def update_compteur6(player_suits: Set[str]):
-    """Incrémente librement le compteur d'apparitions Compteur6 pour chaque costume présent.
-    Aucun plafond : c'est apply_compteur6() qui remet à 0 quand le seuil Wj est atteint."""
-    global compteur6_trackers
+    """Incrémente le compteur d'apparitions Compteur6 pour chaque costume présent.
+    Dès que le seuil Wj est atteint → reset à 0 + signal 'ready' pour apply_compteur6."""
+    global compteur6_trackers, compteur6_ready
     for suit in player_suits:
         if suit in compteur6_trackers:
             compteur6_trackers[suit] += 1
-            logger.info(
-                f"📊 C6 {suit}: {compteur6_trackers[suit]}x (Wj={compteur6_seuil_Wj})"
-            )
+            if compteur6_trackers[suit] >= compteur6_seuil_Wj:
+                compteur6_trackers[suit] = 0      # reset immédiat : nouveau cycle
+                compteur6_ready.add(suit)          # signale que ce costume est "prêt"
+                logger.info(
+                    f"🔵 C6 {suit}: Wj={compteur6_seuil_Wj} atteint → reset 0, cycle prêt"
+                )
+            else:
+                logger.info(
+                    f"📊 C6 {suit}: {compteur6_trackers[suit]}x (Wj={compteur6_seuil_Wj})"
+                )
 
 def apply_compteur6(suit: str) -> str:
     """
-    Filtre Compteur6 : avant de prédire `suit`, vérifie si son inverse a atteint Wj.
-    - Inverse atteint Wj → confirmer la prédiction originale (retourne suit)
-                          → RESET du compteur opposé à 0 (cycle consommé)
-    - Inverse pas encore à Wj → prédire l'inverse à la place
+    Filtre Compteur6 : avant de prédire `suit`, vérifie si son inverse a complété un cycle Wj.
+    - Inverse prêt (cycle complété) → confirmer la prédiction originale (retourne suit)
+                                     → Consomme le signal 'ready'
+    - Inverse pas encore prêt       → prédire l'inverse à la place
     Paires : ❤️ ↔ ♦️  |  ♣️ ↔ ♠️
     """
+    global compteur6_ready
     opposite = COMPTEUR6_PAIRS.get(suit)
     if opposite is None:
         return suit
-    count_opposite = compteur6_trackers.get(opposite, 0)
-    if count_opposite >= compteur6_seuil_Wj:
-        # Consommer le cycle : remettre l'opposé à 0
-        compteur6_trackers[opposite] = 0
+    if opposite in compteur6_ready:
+        # Cycle de l'opposé complété : confirmer la prédiction originale
+        compteur6_ready.discard(opposite)
         logger.info(
-            f"🔵 C6: prédit {suit} confirmé — {opposite} apparu {count_opposite}x ≥ Wj={compteur6_seuil_Wj} → reset {opposite}=0"
+            f"🔵 C6: prédit {suit} confirmé — {opposite} a complété son cycle Wj={compteur6_seuil_Wj}"
         )
         return suit
     else:
+        count_opposite = compteur6_trackers.get(opposite, 0)
         logger.info(
             f"🔄 C6: prédit {suit} → redirigé vers {opposite} "
-            f"({opposite} apparu seulement {count_opposite}x < Wj={compteur6_seuil_Wj})"
+            f"({opposite} à {count_opposite}x / Wj={compteur6_seuil_Wj})"
         )
         return opposite
 
@@ -3282,7 +3313,11 @@ def compteur11_add_perdu(game_number: int, suit: str):
 
 
 async def compteur11_fire(entry: Dict, current_game: int):
-    """Lance une prédiction C11 dans le canal (perdu hier → prédit aujourd'hui)."""
+    """Lance une prédiction C11 dans le canal (perdu hier → prédit aujourd'hui).
+    C11 est indépendant de C2 et C6 : il prédit directement le costume perdu hier,
+    en respectant l'écart df (déclenchement à game_number_perdu - PREDICTION_DF).
+    skip_c6=True : C6 ne filtre pas les prédictions C11.
+    """
     global compteur11_triggered
     orig_game = entry['game_number']
     suit      = entry['suit']
@@ -3291,19 +3326,21 @@ async def compteur11_fire(entry: Dict, current_game: int):
         return
     compteur11_triggered.add(trigger_key)
 
-    pred_num = orig_game  # On prédit le même numéro que hier
+    pred_num = orig_game  # Même numéro de jeu que hier
     reason   = (
-        f"C11: jeu #{orig_game} {suit} perdu hier — retour probable aujourd'hui."
+        f"C11: jeu #{orig_game} {suit} perdu hier — retour probable aujourd'hui "
+        f"(déclenché au jeu #{current_game}, écart df={PREDICTION_DF})."
     )
     added = add_to_prediction_queue(pred_num, suit, 'compteur11', reason)
-    success = await send_prediction_multi_channel(pred_num, suit, 'compteur11')
+    # C11 indépendant : skip_c6=True (C6 ne s'applique pas aux prédictions C11)
+    success = await send_prediction_multi_channel(pred_num, suit, 'compteur11', skip_c6=True)
     if added:
         for e in list(prediction_queue):
             if e['game_number'] == pred_num and e['suit'] == suit and e.get('type') == 'compteur11':
                 prediction_queue.remove(e)
                 break
     if success:
-        logger.info(f"🔄 C11 prédit: #{pred_num} {suit} (perdu hier #{orig_game})")
+        logger.info(f"🔄 C11 prédit: #{pred_num} {suit} (perdu hier #{orig_game}, df={PREDICTION_DF})")
     else:
         logger.warning(f"⚠️ C11: envoi #{pred_num} {suit} échoué")
 
@@ -3313,13 +3350,14 @@ async def compteur11_fire(entry: Dict, current_game: int):
 # ============================================================================
 
 def initialize_trackers():
-    global compteur2_trackers, compteur1_trackers, compteur4_trackers, compteur5_trackers, compteur6_trackers
+    global compteur2_trackers, compteur1_trackers, compteur4_trackers, compteur5_trackers, compteur6_trackers, compteur6_ready
     for suit in ALL_SUITS:
         compteur2_trackers[suit] = Compteur2Tracker(suit=suit)
         compteur1_trackers[suit] = Compteur1Tracker(suit=suit)
         compteur4_trackers[suit] = 0
         compteur5_trackers[suit] = 0
         compteur6_trackers[suit] = 0
+    compteur6_ready.clear()
     logger.info("📊 Trackers initialisés (Compteur1, Compteur2, Compteur4, Compteur5, Compteur6)")
 
 # ============================================================================
@@ -3614,13 +3652,14 @@ async def send_prediction_multi_channel(game_number: int, suit: str, prediction_
                     break
 
         # Si C6 a redirigé le costume, annoter la raison pour que /raison le mentionne
+        # (applicable aussi après un override C9 — même règle universelle)
         if suit != suit_original and not skip_c6:
             _suit_text = {'♠': 'Pique', '♥': 'Coeur', '♦': 'Carreau', '♣': 'Trefle'}
             c6_wj = compteur6_seuil_Wj
             c6_cnt = compteur6_trackers.get(suit_original, 0)
             queued_reason = (queued_reason or '') + (
                 f" | C6: {_suit_text.get(suit_original, suit_original)} → {_suit_text.get(suit, suit)} "
-                f"(inverse a {c6_cnt}/{c6_wj} — seuil Wj non atteint)"
+                f"(cycle Wj={c6_wj} non complete — progression: {c6_cnt}/{c6_wj})"
             )
 
         pending_predictions[game_number] = {
@@ -4073,7 +4112,10 @@ async def process_prediction_queue(current_game: int, is_finished: bool = False)
         # ─────────────────────────────────────────────────────────────────────
 
         logger.info(f"📤 Envoi depuis file: #{pred_number} (jeu #{current_game} terminé, df={PREDICTION_DF})")
-        # Si C9 a overridé le costume, C6 ne doit pas l'annuler (skip_c6=True)
+        # Règle C6 :
+        #   - C2 seul (pas de C9 override) → C6 s'applique normalement
+        #   - C9 a overridé (SS gap détecté) → C6 ignoré : C9 prédit le faible directement
+        # C9 silencieux et C9 après LOSS sont gérés séparément (admin privé, aucun lien C6)
         success = await send_prediction_multi_channel(pred_number, suit, pred_type, skip_c6=c9_did_override)
         if success:
             prediction_queue.remove(to_send)
@@ -4103,24 +4145,26 @@ def get_compteur2_ready_predictions(current_game: int) -> List[tuple]:
             suit_display = SUIT_DISPLAY.get(suit, suit)
 
             # Contexte C6 : état de l'inverse au moment du déclenchement
-            # Noms texte purs (sans emoji) pour compatibilité PDF et Telegram
+            # Règle : si PAIR[manquant] a complété son cycle Wj → on confirme le manquant
+            #          sinon → on prédit PAIR[manquant] à la place
             _suit_text = {'♠': 'Pique', '♥': 'Coeur', '♦': 'Carreau', '♣': 'Trefle'}
             opposite    = COMPTEUR6_PAIRS.get(suit, '')
             c6_count    = compteur6_trackers.get(opposite, 0)
             c6_wj       = compteur6_seuil_Wj
             opp_name    = _suit_text.get(opposite, opposite)
             suit_name   = _suit_text.get(suit, suit)
+            inverse_ready = opposite in compteur6_ready  # cycle Wj complété ?
 
             if opposite:
-                if c6_count >= c6_wj:
+                if inverse_ready:
                     c6_line = (
-                        f"C6: l'inverse ({opp_name}) est a {c6_count}/{c6_wj} "
-                        f"(seuil Wj atteint) => le manquant {suit_name} est confirme."
+                        f"C6: l'inverse ({opp_name}) a complete son cycle Wj={c6_wj} "
+                        f"=> le manquant {suit_name} est confirme."
                     )
                 else:
                     c6_line = (
-                        f"C6: l'inverse ({opp_name}) est a seulement {c6_count}/{c6_wj} "
-                        f"(seuil Wj non atteint) => {opp_name} sera predit a la place."
+                        f"C6: l'inverse ({opp_name}) est a {c6_count}/{c6_wj} "
+                        f"(cycle Wj non complete) => {opp_name} sera predit a la place."
                     )
             else:
                 c6_line = "C6: pas de paire definie pour ce costume."
@@ -4298,9 +4342,10 @@ async def send_bilan_and_reset_at_1440():
         compteur2_seuil_B_per_suit[suit] = compteur2_seuil_B
     logger.info(f"🔄 B par costume remis à B admin ({compteur2_seuil_B}) pour tous les costumes")
 
-    # Compteur6 : compteurs d'apparitions remis à 0 (le seuil Wj admin est préservé)
+    # Compteur6 : compteurs et signaux remis à 0 (le seuil Wj admin est préservé)
     for suit in ALL_SUITS:
         compteur6_trackers[suit] = 0
+    compteur6_ready.clear()
     logger.info(f"🔄 Compteur6 remis à 0 (Wj={compteur6_seuil_Wj} préservé)")
 
     # Compteur8 : reset des streaks courants (les séries terminées sont persistantes)
@@ -4438,25 +4483,39 @@ async def process_game_result(game_number: int, player_suits: Set[str], player_c
         # Données horaires pour /comparaison
         update_hourly_data(player_suits)
 
-        # Prédictions Compteur2 — bloquées si C9 envoie publiquement ce jeu (priorité C9)
-        if compteur2_active and not c9_public_firing:
+        # ── Pré-détection C11 : C11 a-t-il priorité sur ce jeu ? ────────────
+        # C11 se déclenche quand game_number == game_number_perdu_hier - PREDICTION_DF
+        # Si oui, C2 est bloqué (C11 prioritaire, indépendant de C2 et C6)
+        c11_firing = False
+        if compteur11_perdu_hier and is_finished:
+            for entry in compteur11_perdu_hier:
+                trigger_at = entry['game_number'] - PREDICTION_DF
+                if game_number == trigger_at:
+                    c11_firing = True
+                    break
+        # ────────────────────────────────────────────────────────────────────
+
+        # Prédictions Compteur2 — bloquées si C9 envoie publiquement OU si C11 prioritaire
+        blocked_by = ('C9 public' if c9_public_firing else '') or ('C11' if c11_firing else '')
+        if compteur2_active and not c9_public_firing and not c11_firing:
             compteur2_preds = get_compteur2_ready_predictions(game_number)
             for suit, pred_num, reason in compteur2_preds:
                 added = add_to_prediction_queue(pred_num, suit, 'compteur2', reason)
                 if added:
                     logger.info(f"📊 Compteur2: #{pred_num} {suit} en file")
-        elif compteur2_active and c9_public_firing:
-            # C9 prioritaire : vider les éventuelles prédictions C2 prêtes sans les envoyer
-            _ = get_compteur2_ready_predictions(game_number)  # consomme/reset les trackers
-            logger.info(f"⏭️ C2 ignoré ce jeu (C9 public prioritaire) — trackers réinitialisés")
+        elif compteur2_active and (c9_public_firing or c11_firing):
+            # C9 ou C11 prioritaire : consommer les trackers C2 sans envoyer
+            _ = get_compteur2_ready_predictions(game_number)
+            logger.info(f"⏭️ C2 ignoré ce jeu ({blocked_by} prioritaire) — trackers réinitialisés")
 
         logger.info(f"📊 Jeu #{game_number}: joueur {player_suits} | C4={dict(compteur4_trackers)}")
 
     # ── Compteur 11 : perdu hier → prédit aujourd'hui ───────────────────────
-    # Quand le jeu courant atteint (game_number_perdu_hier - 2), on lance la prédiction
+    # Déclenchement à game_number_perdu_hier - PREDICTION_DF (respecte l'écart df)
+    # C11 est indépendant : priorité sur C2, bypass C6
     if compteur11_perdu_hier and is_finished:
         for entry in compteur11_perdu_hier:
-            trigger_at = entry['game_number'] - 2
+            trigger_at = entry['game_number'] - PREDICTION_DF
             if game_number == trigger_at:
                 asyncio.create_task(compteur11_fire(entry, game_number))
     # ────────────────────────────────────────────────────────────────────────
@@ -5010,7 +5069,7 @@ async def cmd_compteur5(event):
 
 async def cmd_compteur6(event):
     """Affiche le statut du Compteur6 et permet de régler le seuil Wj."""
-    global compteur6_seuil_Wj, compteur6_trackers
+    global compteur6_seuil_Wj, compteur6_trackers, compteur6_ready
     if event.is_group or event.is_channel:
         return
     if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
@@ -5030,6 +5089,10 @@ async def cmd_compteur6(event):
                     return
                 old = compteur6_seuil_Wj
                 compteur6_seuil_Wj = val
+                # Plafonner les compteurs existants au nouveau Wj
+                for s in compteur6_trackers:
+                    if compteur6_trackers[s] > val:
+                        compteur6_trackers[s] = val
                 await event.respond(
                     f"✅ **Seuil Wj (Compteur6):** {old} → {val}\n"
                     f"Le filtre de prédiction utilisera désormais Wj = **{val}**"
@@ -5042,8 +5105,9 @@ async def cmd_compteur6(event):
         if sub == 'reset':
             for suit in ALL_SUITS:
                 compteur6_trackers[suit] = 0
+            compteur6_ready.clear()
             await event.respond(
-                f"🔄 **Compteur6 reset** — Compteurs remis à 0\n"
+                f"🔄 **Compteur6 reset** — Compteurs et cycles remis à 0\n"
                 f"Seuil Wj préservé : **{compteur6_seuil_Wj}**"
             )
             return
@@ -5056,7 +5120,8 @@ async def cmd_compteur6(event):
             name    = SUIT_DISPLAY.get(suit, suit)
             filled  = min(count, wj)
             bar     = "█" * filled + "░" * (wj - filled)
-            lines.append(f"{name}: [{bar}] {count}/{wj}")
+            ready   = "✅" if suit in compteur6_ready else ""
+            lines.append(f"{name}: [{bar}] {count}/{wj} {ready}")
 
         lines.append(f"\nUsage: /compteur6 [wj N/reset]")
         await event.respond("\n".join(lines), parse_mode='markdown')
