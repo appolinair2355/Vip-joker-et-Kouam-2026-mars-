@@ -2033,7 +2033,7 @@ def generate_compteur9_pdf() -> bytes:
         pdf.set_text_color(*color)
         pdf.set_font('Helvetica', 'B', 11)
         pdf.cell(0, 7,
-            f'  {suit_names_map.get(suit, suit)} ({suit}) : '
+            f'  {suit_names_map.get(suit, suit)} : '
             f'{len(suit_preds)} predictions  |  {sw}W  {sl}L  |  {sr:.1f}%',
             ln=True
         )
@@ -2050,7 +2050,7 @@ def generate_compteur9_pdf() -> bytes:
         pdf.set_text_color(*color)
         pdf.set_font('Helvetica', '', 10)
         pdf.cell(0, 6,
-            f'    {suit_names_map.get(suit, suit)} ({suit}) : {compteur9_counts[suit]} cartes comptees',
+            f'    {suit_names_map.get(suit, suit)} : {compteur9_counts[suit]} cartes comptees',
             ln=True
         )
     pdf.ln(4)
@@ -2058,7 +2058,7 @@ def generate_compteur9_pdf() -> bytes:
     reset_str = compteur9_reset_time.strftime('%H:%M') if compteur9_reset_time else '--:--'
     pdf.set_font('Helvetica', 'I', 9)
     pdf.set_text_color(120, 120, 120)
-    pdf.cell(0, 5, f'Dernier reset: {reset_str}  |  Le comptage continue toute l\'heure (HH:00 → HH:59)', ln=True, align='C')
+    pdf.cell(0, 5, f'Dernier reset: {reset_str}  |  Le comptage continue toute l\'heure (HH:00 - HH:59)', ln=True, align='C')
 
     return pdf.output(dest='S').encode('latin-1')
 
@@ -3390,28 +3390,31 @@ def get_compteur2_ready_predictions(current_game: int) -> List[tuple]:
             suit_display = SUIT_DISPLAY.get(suit, suit)
 
             # Contexte C6 : état de l'inverse au moment du déclenchement
-            opposite     = COMPTEUR6_PAIRS.get(suit, '')
-            c6_count     = compteur6_trackers.get(opposite, 0)
-            c6_wj        = compteur6_seuil_Wj
-            opp_display  = SUIT_DISPLAY.get(opposite, opposite)
+            # Noms texte purs (sans emoji) pour compatibilité PDF et Telegram
+            _suit_text = {'♠': 'Pique', '♥': 'Coeur', '♦': 'Carreau', '♣': 'Trefle'}
+            opposite    = COMPTEUR6_PAIRS.get(suit, '')
+            c6_count    = compteur6_trackers.get(opposite, 0)
+            c6_wj       = compteur6_seuil_Wj
+            opp_name    = _suit_text.get(opposite, opposite)
+            suit_name   = _suit_text.get(suit, suit)
 
             if opposite:
                 if c6_count >= c6_wj:
                     c6_line = (
-                        f"C6: l'inverse ({opp_display}) est a {c6_count}/{c6_wj} "
-                        f"(seuil Wj atteint) => le manquant {suit_display} est confirme."
+                        f"C6: l'inverse ({opp_name}) est a {c6_count}/{c6_wj} "
+                        f"(seuil Wj atteint) => le manquant {suit_name} est confirme."
                     )
                 else:
                     c6_line = (
-                        f"C6: l'inverse ({opp_display}) est a seulement {c6_count}/{c6_wj} "
-                        f"(seuil Wj non atteint) => l'inverse {opp_display} sera predit a la place."
+                        f"C6: l'inverse ({opp_name}) est a seulement {c6_count}/{c6_wj} "
+                        f"(seuil Wj non atteint) => {opp_name} sera predit a la place."
                     )
             else:
                 c6_line = "C6: pas de paire definie pour ce costume."
 
             reason = (
                 f"Du jeu #{start_game} au jeu #{tracker.last_increment_game}, "
-                f"{suit_display} etait absent {tracker.counter} fois de suite "
+                f"{suit_name} etait absent {tracker.counter} fois de suite "
                 f"(seuil B={b}). Prediction lancee pour le jeu #{pred_number}. "
                 f"{c6_line}"
             )
@@ -5275,7 +5278,7 @@ def generate_raison_pdf() -> bytes:
         date_str = pred_at.strftime('%d/%m/%Y')
         heure_str= pred_at.strftime('%H:%M:%S')
         jeu_str  = f"#{pred['predicted_game']}"
-        suit_nm  = suit_names.get(suit, suit)
+        suit_nm  = pdf_safe(suit_names.get(suit, suit))
         cptr_str = 'C2' if pred.get('type') == 'compteur2' else 'Auto'
         reason   = pdf_safe(pred.get('reason', '') or '-')
         reason_s = reason[:52] + ('...' if len(reason) > 52 else '')
@@ -5341,7 +5344,7 @@ def generate_raison_pdf() -> bytes:
         pdf.set_font('Helvetica', 'B', 10)
         pdf.set_text_color(r, g, b)
         pdf.cell(0, 7,
-            f"  {suit_names.get(suit,suit)} ({suit}) :  "
+            f"  {pdf_safe(suit_names.get(suit,suit))} :  "
             f"{len(sp)} pred.  |  {w_s} gagnes  |  {l_s} perdus  |  "
             f"{en_s} en cours  |  Reussite: {pct_s}",
             ln=True)
@@ -5389,7 +5392,7 @@ def generate_raison_pdf() -> bytes:
             pdf.set_font('Helvetica', 'B', 9)
             pdf.set_text_color(sr, sg, sb)
             pdf.cell(0, 7,
-                f"  Jeu #{jeu}  -  {suit_names.get(suit,suit)}  "
+                f"  Jeu #{jeu}  -  {pdf_safe(suit_names.get(suit,suit))}  "
                 f"({pred['predicted_at'].strftime('%d/%m %H:%M')})",
                 ln=True)
 
