@@ -90,52 +90,40 @@ bilan_1440_sent: bool = False  # Évite le double envoi au jeu #1440
 
 # Heures favorables automatique vers le canal
 heures_favorables_active: bool = True  # Annonce toutes les 3h pile
+mode_emploi_sent_games: set = set()    # Jeux déjà traités pour l'envoi du mode d'emploi
 
 # Mode d'emploi automatique vers le canal de prédiction
-MODE_EMPLOI_DEFAULT = """📌 *MODE D'EMPLOI DU BOT DE PRÉDICTION – BACCARAT (CARTES ENSEIGNES)*
+MODE_EMPLOI_DEFAULT = """📌 *BOT BACCARAT — MODE D'EMPLOI*
 
-🎯 *Principe de fonctionnement*
-Le bot a pour vocation de prédire les cartes suivantes :
-♠️ (Pique), ♦️ (Carreau), ♣️ (Trèfle), ❤️ (Cœur).
+🎯 Le bot prédit l'enseigne du joueur en temps réel :
+♠️ Pique · ♦️ Carreau · ♣️ Trèfle · ❤️ Cœur
 
-🕹️ *Procédure d'utilisation*
-*Identification du numéro de jeu*
-Le bot affiche, en tête, un numéro correspondant à une manche spécifique.
-Il convient de se rendre sur votre plateforme de jeu (bookmaker), dans la section Baccarat, afin de retrouver ce numéro.
+━━━━━━━━━━━━━━━━━━━━━━
+🕹️ *Comment jouer ?*
+1️⃣ Repérez le numéro de manche affiché par le bot sur votre bookmaker.
+2️⃣ Misez sur → *« Le joueur reçoit une carte enseigne »* et choisissez l'enseigne indiquée.
+3️⃣ En cas d'échec, le bot génère un rattrapage (R1, R2, R3) — augmentez la mise selon le plan.
 
-*Exécution de la prédiction*
-Sélectionnez l'option :
-👉 « Le joueur reçoit une carte enseigne »
-Puis, choisissez la carte indiquée par le bot.
+━━━━━━━━━━━━━━━━━━━━━━
+🟢 *DÉBUTANTS — Comment miser ?*
+• Commencez toujours par la mise la plus basse.
+• À chaque échec, passez au niveau suivant (R1, R2, R3...).
+• Dès un gain, revenez immédiatement à votre mise de départ.
+• Ne sautez jamais un niveau et ne dépassez pas 6 niveaux.
 
-🔁 *Conduite à tenir en cas d'échec*
-Dans l'éventualité où la prédiction ne se réalise pas, il est recommandé de :
-👉 Se référer immédiatement au numéro suivant, affiché en bas des prédictions, et de rejouer en conséquence.
+🔵 *PROS — Pas grand chose à vous expliquer.*
+Vous connaissez déjà la gestion de mise.
+Faites confiance au signal du bot et gérez votre bankroll comme à votre habitude.
 
-⚠️ *Recommandations stratégiques*
-Il est fortement conseillé d'attendre que le bot enregistre une première perte avant d'entamer toute mise.
-Toutefois, les utilisateurs les plus confiants peuvent intervenir dès la première prédiction.
-Le bot émet quatre prédictions consécutives, suivies d'une pause.
-Cette interruption permet de distinguer clairement les séries de prédictions et d'optimiser leur suivi.
-
-💰 *Plan de mise (progression recommandée)*
-Il est impératif de respecter la séquence de mises suivante :
-• 500 FCFA
-• 1 200 FCFA
-• 2 500 FCFA
-• 5 500 FCFA
-• 12 000 FCFA
-• 25 000 FCFA
-👉 En cas de gain, il convient de revenir à la mise initiale.
-
-🧠 *Conseils essentiels*
-• Respectez rigoureusement le plan de mise établi.
-• Évitez toute prise de décision impulsive ou non stratégique.
-• Limitez-vous à un maximum de quatre prédictions par jour.
-• Ne dépassez en aucun cas les six niveaux de mise définis."""
+━━━━━━━━━━━━━━━━━━━━━━
+🧠 *Règles essentielles*
+• Misez après un *PERDU ❌* sur les prédictions suivantes, de préférence à la prochaine heure favorable affichée par le bot.
+• Ne jamais dépasser 6 niveaux.
+• Toujours revenir au début après un gain.
+• Maximum 4 séries par jour."""
 
 mode_emploi_text: str = MODE_EMPLOI_DEFAULT        # Texte modifiable par l'admin
-mode_emploi_interval_hours: int = 4               # Intervalle en heures (0 = désactivé)
+mode_emploi_interval_hours: int = 0               # Désactivé — envoi basé sur jeu #480/#960/#1440
 
 # Compteur1 - Gestion des costumes présents consécutifs
 compteur1_trackers: Dict[str, 'Compteur1Tracker'] = {}
@@ -242,8 +230,9 @@ COMPTEUR6_PAIRS: Dict[str, str] = {             # Paires inverses
 # SYSTÈME COMPTEUR7 — SÉRIES CONSÉCUTIVES (MIN 5) — PERSISTANT ENTRE RESETS
 # ============================================================================
 COMPTEUR7_THRESHOLD = 5                          # Seuil minimum de présences consécutives
-COMPTEUR7_DATA_FILE = 'compteur7_data.json'      # Fichier persistant (survit aux resets)
-HOURLY_DATA_FILE    = 'hourly_suit_data.json'    # Données horaires pour /comparaison
+COMPTEUR7_DATA_FILE  = 'compteur7_data.json'      # Fichier persistant (survit aux resets)
+HOURLY_DATA_FILE     = 'hourly_suit_data.json'   # Données horaires pour /comparaison
+PENDING_PRED_FILE    = 'pending_predictions.json' # Prédictions en cours (survit aux redémarrages)
 
 # État courant : pour chaque costume, série en cours
 compteur7_current: Dict[str, dict] = {
@@ -1303,6 +1292,49 @@ def generate_heures_favorables_text() -> str:
     return "\n".join(lines)
 
 
+def generate_heures_favorables_intervals() -> str:
+    """
+    Génère le bloc heures favorables sous forme d'intervalles de 2h (heure du Bénin = UTC+1).
+    Retourne une chaîne à coller à la fin du mode d'emploi.
+    """
+    from datetime import timedelta
+    favorables = compute_heures_favorables()
+    benin_offset = timedelta(hours=1)
+    now_benin = datetime.utcnow() + benin_offset
+
+    header = "\n\n━━━━━━━━━━━━━━━━━━━━━━\n⏰ *Heures favorables* _(heure du Bénin)_"
+
+    if not favorables:
+        total_games = sum(hourly_game_count[h] for h in range(24))
+        if total_games < 20:
+            return header + "\n_Données en cours d'accumulation..._"
+        return header + "\n_Aucune heure significativement favorable détectée._"
+
+    intervals = []
+    for entry in favorables:
+        h_srv = entry['heure']
+        h_ben = (h_srv + 1) % 24
+        h_end = (h_ben + 2) % 24
+        intervals.append(f"{h_ben:02d}h00–{h_end:02d}h00")
+
+    return header + "\n👉 " + " · ".join(intervals)
+
+
+async def send_mode_emploi_with_heures():
+    """Envoie le mode d'emploi + heures favorables dans le canal de prédiction."""
+    global mode_emploi_text
+    if not PREDICTION_CHANNEL_ID:
+        return
+    try:
+        entity = await resolve_channel(PREDICTION_CHANNEL_ID)
+        if entity:
+            txt = mode_emploi_text + generate_heures_favorables_intervals()
+            await client.send_message(entity, txt, parse_mode='markdown')
+            logger.info("📋 Mode d'emploi + heures favorables envoyé dans le canal")
+    except Exception as e:
+        logger.error(f"❌ Erreur send_mode_emploi_with_heures: {e}")
+
+
 async def heures_favorables_loop():
     """
     Envoie les heures favorables dans le canal toutes les 3h à heure alignée :
@@ -1823,11 +1855,11 @@ def _c9_check_triggers() -> List[Tuple[str, str, int]]:
 
 async def send_compteur9_public(faible: str, fort: str, diff: int, game_number: int):
     """
-    Envoie une prédiction C9 dans le canal (publique).
+    Envoie une prédiction C9 en privé à l'admin (plus dans le canal public).
     Appelée uniquement après un LOSS silencieux + conditions OK (HH:mm ≤ HH:30,
     aucune prédiction en cours).
     """
-    if not PREDICTION_CHANNEL_ID:
+    if not ADMIN_ID:
         return
     try:
         suit_emoji = {'♠': '♠️', '♥': '❤️', '♦': '♦️', '♣': '♣️'}
@@ -1849,10 +1881,9 @@ async def send_compteur9_public(faible: str, fort: str, diff: int, game_number: 
             f"🕐 Reset effectué: {compteur9_reset_time.strftime('%H:%M') if compteur9_reset_time else '--:--'}\n"
             f"⏭ Prochain reset: {next_h:02d}:00"
         )
-        entity = await resolve_channel(PREDICTION_CHANNEL_ID)
-        if entity:
-            await client.send_message(entity, msg, parse_mode='markdown')
-            logger.info(f"📤 C9 prédiction publique envoyée: {faible} (après LOSS)")
+        admin_entity = await client.get_entity(ADMIN_ID)
+        await client.send_message(admin_entity, msg, parse_mode='markdown')
+        logger.info(f"📤 C9 prédiction envoyée en privé admin: {faible} (après LOSS)")
     except Exception as e:
         logger.error(f"❌ Erreur send_compteur9_public: {e}")
 
@@ -1873,6 +1904,58 @@ def reset_compteur9_now():
     compteur9_send_next_public = False  # Reset de la condition d'envoi public
     logger.info(f"🔄 Compteur9 remis à 0 ({compteur9_reset_time.strftime('%H:%M')})")
     save_compteur9_data()
+
+
+def save_pending_predictions():
+    """Sauvegarde pending_predictions sur disque pour survivre aux redémarrages."""
+    try:
+        def _dt(v):
+            return v.isoformat() if isinstance(v, datetime) else v
+        serializable = {}
+        for gn, pred in pending_predictions.items():
+            serializable[str(gn)] = {k: _dt(v) for k, v in pred.items()}
+        with open(PENDING_PRED_FILE, 'w', encoding='utf-8') as f:
+            json.dump(serializable, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"❌ Erreur save_pending_predictions: {e}")
+
+
+def load_pending_predictions():
+    """Charge pending_predictions depuis le JSON (reprise après redémarrage)."""
+    global pending_predictions
+    if not os.path.exists(PENDING_PRED_FILE):
+        return
+    try:
+        with open(PENDING_PRED_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        loaded = {}
+        for gn_str, pred in data.items():
+            gn = int(gn_str)
+            for field in ('sent_time',):
+                if field in pred and pred[field]:
+                    try:
+                        pred[field] = datetime.fromisoformat(pred[field])
+                    except Exception:
+                        pass
+            # Remettre le statut en_cours (l'animation ne reprend pas mais la vérif oui)
+            pred['status'] = 'en_cours'
+            loaded[gn] = pred
+        if loaded:
+            pending_predictions = loaded
+            logger.info(f"✅ Pending predictions rechargées: {list(loaded.keys())}")
+        # Supprimer le fichier pour ne pas re-charger au prochain démarrage
+        # (elles seront re-sauvegardées à la prochaine résolution)
+    except Exception as e:
+        logger.error(f"❌ Erreur load_pending_predictions: {e}")
+
+
+def clear_pending_pred_file():
+    """Supprime le fichier de sauvegarde des prédictions en cours."""
+    try:
+        if os.path.exists(PENDING_PRED_FILE):
+            os.remove(PENDING_PRED_FILE)
+    except Exception:
+        pass
 
 
 def save_compteur9_data():
@@ -2992,6 +3075,7 @@ async def send_prediction_multi_channel(game_number: int, suit: str, prediction_
             logger.info(f"✅ Prédiction #{game_number} {suit} envoyée ({prediction_type})")
             # Démarrer l'animation dès l'envoi
             start_animation(game_number, game_number)
+            save_pending_predictions()  # Persistance : survit aux redémarrages
 
             secondary_channel_id = None
             if prediction_type == 'distribution' and DISTRIBUTION_CHANNEL_ID:
@@ -3087,6 +3171,7 @@ async def update_prediction_message(game_number: int, status: str, rattrapage: i
     # Arrêter l'animation AVANT d'éditer le résultat final
     stop_animation(game_number)
     del pending_predictions[game_number]
+    save_pending_predictions()  # Mise à jour persistance (prediction résolue)
 
     try:
         prediction_entity = await resolve_channel(PREDICTION_CHANNEL_ID)
@@ -3181,10 +3266,40 @@ async def check_prediction_result(game_number: int, player_suits: Set[str], is_f
             continue
         rattrapage = pred.get('rattrapage', 0)
         if rattrapage == 0:
-            continue  # Géré dans la section directe ci-dessus
+            # Si le jeu original a été sauté par l'API → passer automatiquement à R1
+            if game_number > original_game and original_game not in pred.get('verified_games', []):
+                logger.warning(
+                    f"🔌 Jeu #{original_game} sauté par l'API — passage automatique R1"
+                )
+                pred['verified_games'].append(original_game)
+                pred['rattrapage'] = 1
+                await update_prediction_progress(original_game, original_game + 1)
+            continue  # Géré dans la section directe (ou passage R1 ci-dessus)
 
         target_suit  = pred['suit']
         expected_game = original_game + rattrapage
+
+        # ── Sécurité timeout : si > 8 jeux après la prédiction sans résolution ──
+        # → supprimer le message du canal + nettoyer l'état interne
+        if game_number > original_game + 8:
+            logger.warning(
+                f"⏰ Timeout #{original_game} R{rattrapage}: {game_number - original_game} jeux "
+                f"sans résolution → suppression du canal"
+            )
+            stop_animation(original_game)
+            msg_id = pred.get('message_id')
+            if msg_id and PREDICTION_CHANNEL_ID:
+                try:
+                    prediction_entity = await resolve_channel(PREDICTION_CHANNEL_ID)
+                    if prediction_entity:
+                        await client.delete_messages(prediction_entity, [msg_id])
+                except Exception as _e:
+                    logger.debug(f"Suppression message timeout #{original_game}: {_e}")
+            del pending_predictions[original_game]
+            save_pending_predictions()
+            update_prediction_in_history(original_game, target_suit, game_number, rattrapage, 'perdu')
+            found = True
+            continue
 
         # Ignorer les jeux antérieurs au jeu attendu
         if game_number < expected_game:
@@ -3446,7 +3561,10 @@ async def send_bilan_and_reset_at_1440():
     global compteur2_trackers, compteur2_seuil_B_per_suit
     global compteur1_trackers, compteur1_history
     global last_prediction_time, last_prediction_number_sent, suit_block_until
-    global animation_tasks
+    global animation_tasks, mode_emploi_sent_games
+
+    # Envoi mode d'emploi + heures favorables au jeu #1440 (3ème envoi du cycle)
+    await send_mode_emploi_with_heures()
 
     bilan_1440_sent = True
 
@@ -3545,6 +3663,7 @@ async def send_bilan_and_reset_at_1440():
     processed_games.clear()
     prediction_checked_games.clear()
     suit_block_until.clear()
+    mode_emploi_sent_games.clear()   # Réarmer pour le prochain cycle
     last_prediction_time        = None
     last_prediction_number_sent = 0
     perdu_pdf_msg_id            = None
@@ -3728,6 +3847,11 @@ async def process_game_result(game_number: int, player_suits: Set[str], player_c
 
         logger.info(f"📊 Jeu #{game_number}: joueur {player_suits} | C4={dict(compteur4_trackers)}")
 
+    # Envoi mode d'emploi + heures favorables à chaque tiers de cycle (#480, #960)
+    if game_number in (480, 960) and game_number not in mode_emploi_sent_games:
+        mode_emploi_sent_games.add(game_number)
+        asyncio.create_task(send_mode_emploi_with_heures())
+
     # Fin de cycle : jeu #1440 terminé → bilan envoyé + reset historique
     if game_number == 1440 and is_finished and not bilan_1440_sent:
         asyncio.create_task(send_bilan_and_reset_at_1440())
@@ -3840,6 +3964,7 @@ async def cleanup_stale_predictions():
             except Exception as e:
                 logger.debug(f"Édition message expiré #{game_number} ignorée: {e}")
             del pending_predictions[game_number]
+            save_pending_predictions()
 
 async def auto_reset_system():
     """Vérifie toutes les 30s les prédictions en attente et supprime celles expirées (>10min)."""
@@ -6209,6 +6334,7 @@ async def start_bot():
         load_compteur8_data()
         load_compteur9_data()
         load_hourly_data()
+        load_pending_predictions()  # Reprend les prédictions en cours après redémarrage
 
         if PREDICTION_CHANNEL_ID:
             try:
@@ -6216,6 +6342,7 @@ async def start_bot():
                 if pred_entity:
                     prediction_channel_ok = True
                     logger.info(f"✅ Canal prédiction OK")
+                    asyncio.create_task(send_mode_emploi_with_heures())  # Envoi au démarrage
             except Exception as e:
                 logger.error(f"❌ Erreur canal prédiction: {e}")
 
