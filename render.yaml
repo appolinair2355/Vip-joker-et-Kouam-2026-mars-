@@ -10,6 +10,8 @@ services:
     healthCheckPath: /health
 
     envVars:
+      - key: TELEGRAM_SESSION
+        sync: false
       - key: API_ID
         sync: false
       - key: API_HASH
@@ -25,6 +27,6 @@ services:
       - key: LOG_LEVEL
         value: INFO
       - key: PYTHON_VERSION
-        value: 3.11.0
+        value: 3.12.0
 
     autoDeploy: true

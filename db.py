@@ -113,6 +113,17 @@ async def _create_tables():
             ALTER TABLE prediction_history
             ADD COLUMN IF NOT EXISTS canal_message_id BIGINT DEFAULT NULL
         """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS countdown_panels (
+                id             SERIAL       PRIMARY KEY,
+                panel_number   INT          NOT NULL,
+                interval_str   VARCHAR(32)  NOT NULL,
+                start_h        INT          NOT NULL,
+                end_h          INT          NOT NULL,
+                minutes_before INT          NOT NULL,
+                sent_at        TIMESTAMPTZ  DEFAULT NOW()
+            )
+        """)
     logger.info("📋 Tables PostgreSQL prêtes")
 
 
@@ -402,3 +413,51 @@ async def db_set_prediction_message_id(predicted_game: int, suit: str, canal_mes
             """, canal_message_id, predicted_game, suit)
     except Exception as e:
         logger.error(f"❌ db_set_prediction_message_id: {e}")
+
+
+async def db_save_countdown_panel(panel_number: int, interval_str: str,
+                                   start_h: int, end_h: int, minutes_before: int):
+    """Sauvegarde un panneau countdown dans la table countdown_panels."""
+    if _pool is None:
+        return
+    try:
+        async with _pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO countdown_panels
+                    (panel_number, interval_str, start_h, end_h, minutes_before, sent_at)
+                VALUES ($1, $2, $3, $4, $5, NOW())
+            """, panel_number, interval_str, start_h, end_h, minutes_before)
+    except Exception as e:
+        logger.error(f"❌ db_save_countdown_panel: {e}")
+
+
+async def db_load_countdown_panels(limit: int = 500) -> List[Dict]:
+    """Charge l'historique des panneaux countdown depuis la DB."""
+    if _pool is None:
+        return []
+    try:
+        async with _pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT panel_number, interval_str, start_h, end_h,
+                       minutes_before, sent_at
+                FROM countdown_panels
+                ORDER BY sent_at DESC
+                LIMIT $1
+            """, limit)
+            return [dict(r) for r in rows]
+    except Exception as e:
+        logger.error(f"❌ db_load_countdown_panels: {e}")
+        return []
+
+
+async def db_get_countdown_panel_count() -> int:
+    """Retourne le nombre total de panneaux envoyés."""
+    if _pool is None:
+        return 0
+    try:
+        async with _pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT COUNT(*) AS cnt FROM countdown_panels")
+            return int(row['cnt']) if row else 0
+    except Exception as e:
+        logger.error(f"❌ db_get_countdown_panel_count: {e}")
+        return 0

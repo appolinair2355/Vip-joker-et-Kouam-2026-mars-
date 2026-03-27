@@ -8,12 +8,13 @@ import json
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Set, Tuple
 from datetime import datetime, timedelta, timezone
-from telethon import TelegramClient, events, utils
+from telethon import TelegramClient, events, utils, Button
 from telethon.sessions import StringSession
 from telethon.tl.types import UpdateMessageReactions
 from telethon.errors import (
     ChatWriteForbiddenError, UserBannedInChannelError,
-    AuthKeyError, SessionExpiredError, UserDeactivatedBanError
+    AuthKeyError, SessionExpiredError, UserDeactivatedBanError,
+    FloodWaitError
 )
 import aiohttp as _aiohttp
 from aiohttp import web
@@ -98,6 +99,7 @@ bilan_1440_sent: bool = False  # Évite le double envoi au jeu #1440
 heures_favorables_active: bool = True  # Annonce toutes les 3h pile
 heures_fav_countdown_msg_id: Optional[int] = None       # ID du message compte à rebours en cours
 heures_fav_countdown_task: Optional[asyncio.Task] = None  # Task de mise à jour du countdown
+countdown_panel_counter: int = 0                          # Numéro incrémental du panneau envoyé
 
 comparaison_nb_jours: int = 3          # Nombre de jours à comparer (modifiable par admin)
 
@@ -298,6 +300,8 @@ compteur9_silent_history: List[Dict] = []    # Historique (max 50 entrées)
 compteur9_pending_silent: Optional[Dict] = None  # Prédiction silencieuse en cours de vérification
 compteur9_last_result: str = 'none'          # 'win' / 'loss' / 'none'
 compteur9_send_next_public: bool = False     # Après un LOSS → prochaine prédiction va dans le canal
+
+pending_input: dict = {}                     # {user_id: {'action': str, 'chat_id': int}} — saisie valeur via bouton
 
 def generate_compteur4_pdf(events_list: List[Dict]) -> bytes:
     """Génère un PDF avec le tableau des écarts Compteur4 (format série comme C7)."""
@@ -1266,26 +1270,25 @@ def _temps_restant(now_ci: 'datetime', next_hour: int) -> str:
 
 def generate_heures_favorables_canal() -> str:
     """
-    Génère un message simplifié pour le canal de prédiction :
-    - Affiche UNIQUEMENT les créneaux horaires (pas de détails % ni de costumes)
-    - Indique la prochaine fenêtre favorable à venir
-    Les détails complets sont réservés à l'administrateur.
+    Génère le message complet pour le canal :
+    - Tous les créneaux favorables identifiés
+    - Le prochain créneau à venir
+    - Signature
+    Retourne "" si données insuffisantes ou aucun créneau identifié.
     """
     SIGNATURE = "\n\n_En Dieu nous comptons, Sossou Kouamé prediction 🔥_"
-    now_ci = datetime.now(timezone.utc).replace(tzinfo=None)  # Côte d'Ivoire = UTC+0
+    now_ci = datetime.now(timezone.utc).replace(tzinfo=None)
     now_h  = now_ci.hour
 
     stat_results = compute_heures_favorables()
     all_heures   = sorted(e['heure'] for e in stat_results)
     total_games  = sum(hourly_game_count[h] for h in range(24))
 
-    # Si heures non identifiées → rien à envoyer au canal
-    if total_games < 100 or not all_heures:
+    if total_games < 50 or not all_heures:
         return ""
 
     lines = ["⏰ *Heures favorables* _(heure de Côte d'Ivoire)_\n"]
 
-    # Canal : seulement les intervalles, aucun détail
     intervals = group_heures_into_intervals(all_heures)
     lines.append("🟢 *Créneaux favorables :* " + " · ".join(intervals))
 
@@ -1298,7 +1301,7 @@ def generate_heures_favorables_canal() -> str:
     return "\n".join(lines) + SIGNATURE
 
 
-def compute_heures_favorables(min_games: int = 15, seuil_bonus: float = 0.10) -> List[Dict]:
+def compute_heures_favorables(min_games: int = 8, seuil_bonus: float = 0.10) -> List[Dict]:
     """
     Analyse les données historiques heure par heure pour trouver les heures favorables.
 
@@ -1415,34 +1418,28 @@ def generate_heures_favorables_text() -> str:
 
 def generate_heures_favorables_intervals() -> str:
     """
-    Bloc heures favorables simplifié pour le canal (mode d'emploi).
-    Affiche uniquement les créneaux horaires — aucun détail (% ou costumes).
+    Bloc heures favorables pour le mode d'emploi du canal.
+    Affiche uniquement le prochain créneau favorable (pas la liste complète).
+    Retourne "" si données insuffisantes ou aucun créneau identifié.
     """
     SIGNATURE = "\n\n_En Dieu nous comptons, Sossou Kouamé prediction 🔥_"
-    now_ci  = datetime.now(timezone.utc).replace(tzinfo=None)  # Côte d'Ivoire = UTC+0
+    now_ci  = datetime.now(timezone.utc).replace(tzinfo=None)
     now_h   = now_ci.hour
 
     stat_results = compute_heures_favorables()
     all_heures   = sorted(e['heure'] for e in stat_results)
     total_games  = sum(hourly_game_count[h] for h in range(24))
 
-    header = "\n\n━━━━━━━━━━━━━━━━━━━━━━\n⏰ *Heures favorables* _(heure de Côte d'Ivoire)_"
-
-    if total_games < 100 or not all_heures:
-        # Pas encore identifiées → on n'affiche rien dans le canal
+    if total_games < 50 or not all_heures:
         return ""
 
-    intervals = group_heures_into_intervals(all_heures)
-    lines = [header, "🟢 *Créneaux favorables :* " + " · ".join(intervals)]
-
     upcoming = [h for h in all_heures if h > now_h] or all_heures
-    if upcoming:
-        nxt   = upcoming[0]
-        nxt_i = group_heures_into_intervals([nxt])[0]
-        dans  = _temps_restant(now_ci, nxt)
-        lines.append(f"⏩ *Prochain créneau : {nxt_i}* _{dans}_")
+    nxt   = upcoming[0]
+    nxt_i = group_heures_into_intervals([nxt])[0]
+    dans  = _temps_restant(now_ci, nxt)
 
-    return "\n".join(lines) + SIGNATURE
+    header = "\n\n━━━━━━━━━━━━━━━━━━━━━━\n⏰ *Heures favorables* _(heure de Côte d'Ivoire)_"
+    return header + f"\n⏩ *Prochain créneau : {nxt_i}* _{dans}_" + SIGNATURE
 
 
 async def send_mode_emploi_with_heures():
@@ -1453,9 +1450,9 @@ async def send_mode_emploi_with_heures():
     try:
         entity = await resolve_channel(PREDICTION_CHANNEL_ID)
         if entity:
-            txt = mode_emploi_text + generate_heures_favorables_intervals()
+            txt = mode_emploi_text
             sent = await client.send_message(entity, txt, parse_mode='markdown')
-            logger.info("📋 Mode d'emploi + heures favorables envoyé dans le canal")
+            logger.info("📋 Mode d'emploi envoyé dans le canal")
             asyncio.create_task(auto_delete_canal_message(sent.id))
     except Exception as e:
         logger.error(f"❌ Erreur send_mode_emploi_with_heures: {e}")
@@ -1473,21 +1470,16 @@ async def send_heures_favorables_simple():
     try:
         # Vérifier que les heures favorables sont réellement identifiées
         total_games = sum(hourly_game_count[h] for h in range(24))
-        if total_games < 100:
-            logger.info(f"⏰ Heures favorables non envoyées au démarrage : données insuffisantes ({total_games}/100 jeux)")
+        if total_games < 50:
+            logger.info(f"⏰ Heures favorables non envoyées au démarrage : données insuffisantes ({total_games}/50 jeux)")
             return
         favorables = compute_heures_favorables()
         if not favorables:
             logger.info("⏰ Heures favorables non envoyées au démarrage : aucun créneau identifié")
             return
 
-        entity = await resolve_channel(PREDICTION_CHANNEL_ID)
-        if not entity:
-            return
-        txt = generate_heures_favorables_canal()
-        sent = await client.send_message(entity, txt, parse_mode='markdown')
-        logger.info("⏰ Heures favorables envoyées dans le canal de prédiction")
-        asyncio.create_task(auto_delete_canal_message(sent.id))
+        # Au démarrage : pas d'annonce canal — le panneau la gérera à l'approche du créneau
+        logger.info("⏰ Heures favorables au démarrage : créneau identifié, annonce canal différée (panneau countdown)")
     except Exception as e:
         logger.error(f"❌ Erreur send_heures_favorables_simple: {e}")
 
@@ -1515,6 +1507,18 @@ async def heures_favorables_loop():
 
             heure = datetime.now().strftime('%H:%M')
 
+            # ── Sauvegarder l'analyse en DB (reprise après redémarrage) ──────
+            _total_h = sum(hourly_game_count[h] for h in range(24))
+            if _total_h >= 50:
+                _fav_save = compute_heures_favorables()
+                if _fav_save:
+                    db.db_schedule(db.db_save_kv('last_heures_favorables', {
+                        'favorables':   _fav_save,
+                        'total_games':  _total_h,
+                        'computed_at':  datetime.now().isoformat(),
+                    }))
+                    logger.info(f"💾 Analyse heures favorables sauvegardée en DB ({_total_h} jeux)")
+
             # ── Admin : rapport complet ──────────────────────────────────────
             if ADMIN_ID and ADMIN_ID != 0:
                 try:
@@ -1526,22 +1530,18 @@ async def heures_favorables_loop():
                 except Exception as admin_err:
                     logger.error(f"❌ Heures favorables admin: {admin_err}")
 
-            # ── Canal : message court créneaux favorables ────────────────────
-            # Seulement si les heures sont réellement identifiées (données suffisantes)
+            # ── Canal : message complet (tous créneaux) — auto-supprimé après 30 min ──
             if PREDICTION_CHANNEL_ID:
                 try:
-                    _total = sum(hourly_game_count[h] for h in range(24))
-                    _favs  = compute_heures_favorables() if _total >= 100 else []
-                    if not _favs:
-                        logger.info(f"⏰ Canal ignoré ({heure}) : heures favorables non identifiées ({_total} jeux)")
-                    else:
+                    canal_msg = generate_heures_favorables_canal()
+                    if canal_msg:
                         canal_entity = await resolve_channel(PREDICTION_CHANNEL_ID)
                         if canal_entity:
-                            sent = await client.send_message(
-                                canal_entity, generate_heures_favorables_canal(), parse_mode='markdown'
-                            )
-                            logger.info(f"⏰ Heures favorables (canal) envoyées ({heure})")
-                            asyncio.create_task(auto_delete_canal_message(sent.id))
+                            sent = await client.send_message(canal_entity, canal_msg, parse_mode='markdown')
+                            asyncio.create_task(auto_delete_canal_message(sent.id, delay_seconds=1800))
+                            logger.info(f"⏰ Canal heures favorables envoyé ({heure}) — suppression dans 30 min")
+                    else:
+                        logger.info(f"⏰ Canal heures favorables ignoré ({heure}) — données insuffisantes")
                 except Exception as canal_err:
                     logger.error(f"❌ Heures favorables canal: {canal_err}")
 
@@ -1590,22 +1590,45 @@ def _build_countdown_panel(interval_str: str, minutes_left: int,
         f"🟦   🇨🇮 _(heure Côte d'Ivoire)_   🟦\n"
         f"🟦   ⏳ Dans **{temps}**   🟦\n"
         f"🟦                              🟦\n"
-        f"{corner}🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦{corner}"
+        f"{corner}🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦{corner}\n"
+        f"\n_En Dieu nous comptons, Sossou Kouamé prediction 🔥_"
     )
     return panel
+
+
+async def _save_active_panel(panel_number: int, interval_str: str,
+                              start_h: int, end_h: int,
+                              start_minute: int, total_minutes: int, msg_id: int):
+    """Persiste l'état du panneau countdown actif en DB (kv_store)."""
+    data = {
+        'active':        True,
+        'panel_number':  panel_number,
+        'interval_str':  interval_str,
+        'start_h':       start_h,
+        'end_h':         end_h,
+        'start_minute':  start_minute,
+        'total_minutes': total_minutes,
+        'msg_id':        msg_id,
+    }
+    await db.db_save_kv('active_panel', data)
+
+
+async def _clear_active_panel():
+    """Marque le panneau actif comme terminé en DB."""
+    await db.db_save_kv('active_panel', {'active': False})
 
 
 async def _heures_fav_countdown_runner(msg_id: int, canal_entity,
                                         interval_str: str,
                                         start_minute: int, total_minutes: int):
     """
-    Tâche de fond : met à jour le panneau de compte à rebours toutes les 5 min.
+    Tâche de fond : met à jour le panneau de compte à rebours toutes les 10 min.
     - Supprime le message quand l'heure favorable commence.
-    - Supprime aussi si 30 min max ont été atteintes.
+    - Supprime aussi si 8h max ont été atteintes.
     """
     global heures_fav_countdown_msg_id, heures_fav_countdown_task
-    CHECK_INTERVAL = 5 * 60      # mise à jour toutes les 5 min
-    MAX_AGE        = 30 * 60     # 30 min maximum
+    CHECK_INTERVAL = 10 * 60     # mise à jour toutes les 10 min
+    MAX_AGE        = 8 * 60 * 60 # 8 heures maximum
     blink_state    = False
     start_time     = datetime.now()
 
@@ -1617,7 +1640,7 @@ async def _heures_fav_countdown_runner(msg_id: int, canal_entity,
             remaining = (start_minute - now_min) % (24 * 60)
             elapsed_sec = (now - start_time).total_seconds()
 
-            # Supprimer si heure arrivée ou 30 min écoulées
+            # Supprimer si heure arrivée ou 8h max écoulées
             if remaining <= 0 or elapsed_sec >= MAX_AGE:
                 try:
                     await client.delete_messages(canal_entity, [msg_id])
@@ -1626,12 +1649,15 @@ async def _heures_fav_countdown_runner(msg_id: int, canal_entity,
                     pass
                 heures_fav_countdown_msg_id = None
                 heures_fav_countdown_task   = None
+                await _clear_active_panel()
                 break
 
             blink_state = not blink_state
             panel = _build_countdown_panel(interval_str, remaining, total_minutes, blink_state)
-            await client.edit_message(canal_entity, msg_id, panel, parse_mode='markdown')
-            logger.debug(f"🟦 Countdown mis à jour : {remaining}min restantes")
+            ok = await safe_edit_message(canal_entity, msg_id, panel,
+                                         label=f"countdown {interval_str}", max_retries=3)
+            if ok:
+                logger.debug(f"🟦 Countdown mis à jour : {remaining}min restantes")
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -1641,9 +1667,166 @@ async def _heures_fav_countdown_runner(msg_id: int, canal_entity,
     heures_fav_countdown_task = None
 
 
+async def restore_countdown_panel_if_needed():
+    """
+    Au démarrage : tente de reprendre un panneau countdown en cours (même numéro),
+    ou envoie un nouveau panneau si une heure favorable est attendue dans les 8h.
+    """
+    global heures_fav_countdown_msg_id, heures_fav_countdown_task, countdown_panel_counter
+    try:
+        if not heures_favorables_active or not PREDICTION_CHANNEL_ID:
+            return
+
+        canal_entity = await resolve_channel(PREDICTION_CHANNEL_ID)
+        if not canal_entity:
+            return
+
+        now     = datetime.now()
+        now_min = now.hour * 60 + now.minute
+
+        # ── Étape 1 : vérifier si un panneau actif existe en DB ───────────────
+        saved_panel = await db.db_load_kv('active_panel')
+        if saved_panel and saved_panel.get('active'):
+            start_minute  = saved_panel['start_minute']
+            total_minutes = saved_panel['total_minutes']
+            interval_str  = saved_panel['interval_str']
+            panel_number  = saved_panel['panel_number']
+            stored_msg_id = saved_panel.get('msg_id')
+            remaining     = (start_minute - now_min) % (24 * 60)
+
+            if remaining > 0:
+                # Le panneau est encore valide — reprendre le même numéro
+                panel = _build_countdown_panel(interval_str, remaining, total_minutes, False)
+                msg_id_to_use = None
+
+                # Essayer d'éditer le message existant
+                if stored_msg_id:
+                    ok = await safe_edit_message(
+                        canal_entity, stored_msg_id, panel,
+                        label=f"reprise panneau #{panel_number}", max_retries=3
+                    )
+                    if ok:
+                        msg_id_to_use = stored_msg_id
+                        logger.info(
+                            f"🟦 Panneau #{panel_number} repris (message existant édité) : "
+                            f"{interval_str} — {remaining}min restantes"
+                        )
+                    # Si ok=False → message supprimé entre-temps → envoyer un nouveau
+
+                if msg_id_to_use is None:
+                    # Envoyer un nouveau message avec le même numéro de panneau
+                    sent = await client.send_message(canal_entity, panel, parse_mode='markdown')
+                    msg_id_to_use = sent.id
+                    logger.info(
+                        f"🟦 Panneau #{panel_number} repris (nouveau message) : "
+                        f"{interval_str} — {remaining}min restantes"
+                    )
+
+                heures_fav_countdown_msg_id = msg_id_to_use
+                # Mettre à jour le msg_id en DB si nécessaire
+                await _save_active_panel(
+                    panel_number, interval_str,
+                    saved_panel.get('start_h', 0), saved_panel.get('end_h', 0),
+                    start_minute, total_minutes, msg_id_to_use
+                )
+                heures_fav_countdown_task = asyncio.create_task(
+                    _heures_fav_countdown_runner(
+                        msg_id_to_use, canal_entity, interval_str, start_minute, total_minutes
+                    )
+                )
+                return
+            else:
+                # Panneau expiré → nettoyer
+                await _clear_active_panel()
+                logger.info("🟦 Panneau DB expiré — nettoyage effectué")
+
+        # ── Étape 2 : pas de panneau actif → chercher une heure favorable ─────
+        _total = sum(hourly_game_count[h] for h in range(24))
+        if _total < 50:
+            # Données horaires insuffisantes → essayer de charger la dernière analyse sauvegardée
+            saved_fav = await db.db_load_kv('last_heures_favorables')
+            if not saved_fav or not saved_fav.get('favorables'):
+                logger.info("🟦 Restauration panneau ignorée : données insuffisantes et aucune analyse sauvegardée")
+                return
+            # Vérifier que l'analyse n'est pas trop ancienne (max 25h)
+            try:
+                computed_at = datetime.fromisoformat(saved_fav['computed_at'])
+                age_h = (datetime.now() - computed_at).total_seconds() / 3600
+                if age_h > 25:
+                    logger.info(f"🟦 Restauration panneau ignorée : analyse sauvegardée trop ancienne ({age_h:.1f}h)")
+                    return
+            except Exception:
+                pass
+            favorables = saved_fav['favorables']
+            logger.info(
+                f"🟦 Données horaires insuffisantes ({_total}/50) — "
+                f"utilisation de la dernière analyse sauvegardée "
+                f"({saved_fav.get('total_games','?')} jeux, "
+                f"calculée le {saved_fav.get('computed_at','?')[:16]})"
+            )
+        else:
+            favorables = compute_heures_favorables()
+        if not favorables:
+            return
+
+        fav_heures = [e['heure'] for e in favorables]
+
+        # Chercher une heure favorable dans les 2h30
+        target_heure = None
+        for h in sorted(fav_heures):
+            delta = (h * 60 - now_min) % (24 * 60)
+            if 5 <= delta <= 150:
+                target_heure = h
+                break
+
+        if target_heure is None:
+            logger.info("🟦 Restauration panneau : aucune heure favorable dans les 2h30")
+            return
+
+        # Calculer intervalle complet
+        fav_sorted = sorted(fav_heures)
+        idx = fav_sorted.index(target_heure) if target_heure in fav_sorted else -1
+        grp_start, grp_end = target_heure, target_heure + 1
+        if idx >= 0:
+            for hh in fav_sorted[idx + 1:]:
+                if hh == grp_end:
+                    grp_end = hh + 1
+                else:
+                    break
+        interval_str  = f"{grp_start:02d}h00 → {grp_end:02d}h00"
+        start_minute  = target_heure * 60
+        minutes_left  = (start_minute - now_min) % (24 * 60)
+        total_minutes = minutes_left
+
+        panel = _build_countdown_panel(interval_str, minutes_left, total_minutes, False)
+        sent  = await client.send_message(canal_entity, panel, parse_mode='markdown')
+        heures_fav_countdown_msg_id = sent.id
+
+        countdown_panel_counter += 1
+        await db.db_save_countdown_panel(
+            countdown_panel_counter, interval_str, grp_start, grp_end, minutes_left
+        )
+        await _save_active_panel(
+            countdown_panel_counter, interval_str,
+            grp_start, grp_end, start_minute, total_minutes, sent.id
+        )
+        logger.info(
+            f"🟦 Panneau #{countdown_panel_counter} envoyé au démarrage : "
+            f"{interval_str} dans {minutes_left}min"
+        )
+
+        heures_fav_countdown_task = asyncio.create_task(
+            _heures_fav_countdown_runner(
+                sent.id, canal_entity, interval_str, start_minute, total_minutes
+            )
+        )
+    except Exception as e:
+        logger.error(f"❌ restore_countdown_panel_if_needed: {e}")
+
+
 async def heures_favorables_countdown_loop():
     """
-    Vérifie toutes les 30 min si une heure favorable démarre dans l'heure.
+    Vérifie toutes les 30 min si une heure favorable démarre dans les 4 heures.
     Si oui, envoie un panneau compte à rebours dans le canal + détails admin en privé.
     Annulation automatique du countdown précédent si un nouveau est détecté.
     """
@@ -1657,22 +1840,29 @@ async def heures_favorables_countdown_loop():
                 continue
 
             _total = sum(hourly_game_count[h] for h in range(24))
-            if _total < 100:
+            if _total < 50:
                 continue
             favorables = compute_heures_favorables()
             if not favorables:
                 continue
 
+            # Sauvegarder le dernier résultat d'analyse pour reprise après redémarrage
+            db.db_schedule(db.db_save_kv('last_heures_favorables', {
+                'favorables':   favorables,
+                'total_games':  _total,
+                'computed_at':  datetime.now().isoformat(),
+            }))
+
             now      = datetime.now()
             now_min  = now.hour * 60 + now.minute
             fav_heures = [e['heure'] for e in favorables]
 
-            # Chercher une heure favorable qui commence dans les 5 à 60 min
+            # Chercher une heure favorable qui commence dans les 5 à 150 min (2h30)
             target_heure = None
             for h in sorted(fav_heures):
                 target_min = h * 60
                 delta = (target_min - now_min) % (24 * 60)
-                if 5 <= delta <= 60:
+                if 5 <= delta <= 150:
                     target_heure = h
                     break
 
@@ -1730,7 +1920,23 @@ async def heures_favorables_countdown_loop():
                 panel = _build_countdown_panel(interval_str, minutes_left, total_minutes, False)
                 sent = await client.send_message(canal_entity, panel, parse_mode='markdown')
                 heures_fav_countdown_msg_id = sent.id
-                logger.info(f"🟦 Countdown heure favorable envoyé : {interval_str} dans {minutes_left}min")
+
+                # ── Enregistrement DB ─────────────────────────────────────────
+                global countdown_panel_counter
+                countdown_panel_counter += 1
+                await db.db_save_countdown_panel(
+                    countdown_panel_counter, interval_str,
+                    grp_start, grp_end, minutes_left
+                )
+                # Sauvegarder le panneau actif pour reprise après redémarrage
+                await _save_active_panel(
+                    countdown_panel_counter, interval_str,
+                    grp_start, grp_end, start_minute, total_minutes, sent.id
+                )
+                logger.info(
+                    f"🟦 Panneau #{countdown_panel_counter} envoyé : "
+                    f"{interval_str} dans {minutes_left}min"
+                )
 
                 # Démarrer la tâche de mise à jour
                 if heures_fav_countdown_task and not heures_fav_countdown_task.done():
@@ -1888,9 +2094,11 @@ async def load_compteur4_data():
     global compteur4_events
     try:
         raw = await db.db_load_kv('compteur4')
+        from_json = False
         if raw is None and os.path.exists(COMPTEUR4_DATA_FILE):
             with open(COMPTEUR4_DATA_FILE, 'r', encoding='utf-8') as f:
                 raw = json.load(f)
+            from_json = True
         if raw:
             compteur4_events = []
             for item in raw:
@@ -1898,6 +2106,9 @@ async def load_compteur4_data():
                 item['end_time']   = datetime.fromisoformat(item['end_time'])
                 compteur4_events.append(item)
             logger.info(f"📂 C4: {len(compteur4_events)} séries chargées")
+            if from_json:
+                save_compteur4_data()
+                logger.info("📂 C4: migration JSON → PostgreSQL effectuée")
     except Exception as e:
         logger.error(f"❌ Chargement C4 échoué: {e}")
         compteur4_events = []
@@ -1926,9 +2137,11 @@ async def load_compteur7_data():
     global compteur7_completed
     try:
         raw = await db.db_load_kv('compteur7')
+        from_json = False
         if raw is None and os.path.exists(COMPTEUR7_DATA_FILE):
             with open(COMPTEUR7_DATA_FILE, 'r', encoding='utf-8') as f:
                 raw = json.load(f)
+            from_json = True
         compteur7_completed = []
         if raw:
             for item in raw:
@@ -1936,6 +2149,9 @@ async def load_compteur7_data():
                 item['end_time']   = datetime.fromisoformat(item['end_time'])
                 compteur7_completed.append(item)
             logger.info(f"📂 C7: {len(compteur7_completed)} séries chargées")
+            if from_json:
+                save_compteur7_data()
+                logger.info("📂 C7: migration JSON → PostgreSQL effectuée")
     except Exception as e:
         logger.error(f"❌ Chargement C7 échoué: {e}")
         compteur7_completed = []
@@ -2054,9 +2270,11 @@ async def load_compteur8_data():
     global compteur8_completed
     try:
         data = await db.db_load_kv('compteur8')
+        from_json = False
         if data is None and os.path.exists(COMPTEUR8_DATA_FILE):
             with open(COMPTEUR8_DATA_FILE, 'r', encoding='utf-8') as f:
                 data = json.load(f)
+            from_json = True
         if data:
             compteur8_completed = []
             for s in data.get('completed', []):
@@ -2064,6 +2282,9 @@ async def load_compteur8_data():
                 s['end_time']   = datetime.fromisoformat(s['end_time'])
                 compteur8_completed.append(s)
             logger.info(f"✅ C8 chargé: {len(compteur8_completed)} série(s)")
+            if from_json:
+                save_compteur8_data()
+                logger.info("📂 C8: migration JSON → PostgreSQL effectuée")
     except Exception as e:
         logger.error(f"❌ Erreur load_compteur8: {e}")
 
@@ -3144,8 +3365,8 @@ def update_hourly_data(player_suits: Set[str]):
     for suit in player_suits:
         if suit in hourly_suit_data[h]:
             hourly_suit_data[h][suit] += 1
-    # Sauvegarde toutes les 10 parties pour ne pas surcharger le disque
-    if hourly_game_count[h] % 10 == 0:
+    # Sauvegarde toutes les 5 parties
+    if hourly_game_count[h] % 5 == 0:
         save_hourly_data()
 
 
@@ -3682,6 +3903,35 @@ def build_anim_bar(rattrapage: int, frame: int) -> str:
     return frozen + moving + empty
 
 
+async def safe_edit_message(entity, msg_id: int, text: str,
+                             parse_mode: str = 'markdown',
+                             max_retries: int = 4,
+                             label: str = '') -> bool:
+    """
+    Édite un message Telegram avec retry automatique sur FloodWait.
+    Retourne True si succès, False si échec définitif.
+    """
+    for attempt in range(max_retries):
+        try:
+            await client.edit_message(entity, msg_id, text, parse_mode=parse_mode)
+            return True
+        except FloodWaitError as fw:
+            wait_sec = fw.seconds + 1
+            logger.warning(f"⏳ FloodWait {wait_sec}s {label} (tentative {attempt + 1}/{max_retries})")
+            await asyncio.sleep(wait_sec)
+        except Exception as e:
+            err = str(e).lower()
+            if 'not modified' in err:
+                return True  # Pas d'erreur réelle
+            if 'message_id_invalid' in err or 'message to edit not found' in err:
+                logger.debug(f"Message introuvable {label}: {e}")
+                return False
+            logger.error(f"❌ Erreur édition {label}: {e}")
+            return False
+    logger.error(f"❌ Échec édition après {max_retries} tentatives {label}")
+    return False
+
+
 async def _run_animation(original_game: int, check_game: int, start_frame: int = 0):
     """Boucle d'animation: barre multicolore dont la couleur change selon le rattrapage."""
     global pending_predictions, animation_tasks
@@ -3722,14 +3972,11 @@ async def _run_animation(original_game: int, check_game: int, start_frame: int =
                 f"⏳ _Analyse{dots}_"
             )
 
-            try:
-                await client.edit_message(
-                    prediction_entity, msg_id, msg, parse_mode='markdown'
-                )
-            except Exception as e:
-                err = str(e).lower()
-                if 'not modified' not in err and 'message_id_invalid' not in err:
-                    logger.debug(f"🎬 Edit anim #{original_game}: {e}")
+            await safe_edit_message(
+                prediction_entity, msg_id, msg,
+                label=f"anim #{original_game}",
+                max_retries=2
+            )
 
             frame += 1
             await asyncio.sleep(ANIM_INTERVAL)
@@ -4029,25 +4276,23 @@ async def update_prediction_message(game_number: int, status: str, rattrapage: i
 
     # Arrêter l'animation AVANT d'éditer le résultat final
     stop_animation(game_number)
+    # Pause courte : laisse les édits d'animation en vol terminer avant l'édition finale
+    await asyncio.sleep(0.5)
     del pending_predictions[game_number]
     save_pending_predictions()  # Mise à jour persistance (prediction résolue)
 
-    try:
-        prediction_entity = await resolve_channel(PREDICTION_CHANNEL_ID)
-        if prediction_entity and msg_id:
-            await client.edit_message(prediction_entity, msg_id, new_msg, parse_mode='markdown')
-    except Exception as e:
-        logger.error(f"❌ Erreur édition message #{game_number}: {e}")
+    prediction_entity = await resolve_channel(PREDICTION_CHANNEL_ID)
+    if prediction_entity and msg_id:
+        await safe_edit_message(prediction_entity, msg_id, new_msg,
+                                label=f"finale #{game_number}")
 
     sec_msg_id = pred.get('secondary_message_id')
     sec_channel_id = pred.get('secondary_channel_id')
     if sec_msg_id and sec_channel_id:
-        try:
-            sec_entity = await resolve_channel(sec_channel_id)
-            if sec_entity:
-                await client.edit_message(sec_entity, sec_msg_id, new_msg, parse_mode='markdown')
-        except Exception as e:
-            logger.error(f"❌ Erreur édition canal secondaire #{game_number}: {e}")
+        sec_entity = await resolve_channel(sec_channel_id)
+        if sec_entity:
+            await safe_edit_message(sec_entity, sec_msg_id, new_msg,
+                                    label=f"finale-sec #{game_number}")
 
     # Envoyer la parole biblique (auto-supprimée après 60s)
     if parole_key:
@@ -4067,22 +4312,18 @@ async def update_prediction_progress(game_number: int, current_check: int):
     start_frame = BAR_MAX_BY_RATTRAPAGE[min(prev_rattrapage, len(BAR_MAX_BY_RATTRAPAGE) - 1)]
     start_animation(game_number, current_check, start_frame)
     msg = format_prediction_message(game_number, suit, 'en_cours', current_check, verified_games)
-    try:
-        prediction_entity = await resolve_channel(PREDICTION_CHANNEL_ID)
-        if prediction_entity:
-            await client.edit_message(prediction_entity, msg_id, msg, parse_mode='markdown')
-    except Exception as e:
-        logger.error(f"❌ Erreur update progress: {e}")
+    prediction_entity = await resolve_channel(PREDICTION_CHANNEL_ID)
+    if prediction_entity:
+        await safe_edit_message(prediction_entity, msg_id, msg,
+                                label=f"progress #{game_number}")
 
     sec_msg_id = pred.get('secondary_message_id')
     sec_channel_id = pred.get('secondary_channel_id')
     if sec_msg_id and sec_channel_id:
-        try:
-            sec_entity = await resolve_channel(sec_channel_id)
-            if sec_entity:
-                await client.edit_message(sec_entity, sec_msg_id, msg, parse_mode='markdown')
-        except Exception as e:
-            logger.error(f"❌ Erreur update progress canal secondaire: {e}")
+        sec_entity = await resolve_channel(sec_channel_id)
+        if sec_entity:
+            await safe_edit_message(sec_entity, sec_msg_id, msg,
+                                    label=f"progress-sec #{game_number}")
 
 async def check_prediction_result(game_number: int, player_suits: Set[str], is_finished: bool = False) -> bool:
     """
@@ -4709,6 +4950,15 @@ async def process_game_result(game_number: int, player_suits: Set[str], player_c
         # 3) Vérifier les triggers SS et gérer prédictions (HH:00-HH:29 seulement)
         c9_public_firing = False   # True si C9 envoie publiquement ce jeu → C2 bloqué
         if _c9_is_active():
+            # Log de progression des comptes C9 pour monitoring
+            _paire1_diff = abs(compteur9_counts['♦'] - compteur9_counts['♠'])
+            _paire2_diff = abs(compteur9_counts['♣'] - compteur9_counts['♥'])
+            logger.info(
+                f"📊 C9 actif jeu #{game_number}: "
+                f"♦={compteur9_counts['♦']} ♠={compteur9_counts['♠']} (diff={_paire1_diff}) | "
+                f"♣={compteur9_counts['♣']} ♥={compteur9_counts['♥']} (diff={_paire2_diff}) | "
+                f"SS={compteur9_ss}"
+            )
             for fort9, faible9, diff9 in _c9_check_triggers():
                 if compteur9_send_next_public and not pending_predictions:
                     # Dernière prédiction silencieuse perdue → envoyer celle-ci dans le canal
@@ -4874,14 +5124,12 @@ async def cleanup_stale_predictions():
             suit = pred.get('suit', '?')
             logger.warning(f"🧹 #{game_number} ({suit}) expiré (timeout)")
             stop_animation(game_number)
-            try:
-                prediction_entity = await resolve_channel(PREDICTION_CHANNEL_ID)
-                if prediction_entity and pred.get('message_id'):
-                    suit_display = SUIT_DISPLAY.get(suit, suit)
-                    expired_msg = f"⏰ **PRÉDICTION #{game_number}**\n🎯 {suit_display}\n⌛ **EXPIRÉE**"
-                    await client.edit_message(prediction_entity, pred['message_id'], expired_msg, parse_mode='markdown')
-            except Exception as e:
-                logger.debug(f"Édition message expiré #{game_number} ignorée: {e}")
+            prediction_entity = await resolve_channel(PREDICTION_CHANNEL_ID)
+            if prediction_entity and pred.get('message_id'):
+                suit_display = SUIT_DISPLAY.get(suit, suit)
+                expired_msg = f"⏰ **PRÉDICTION #{game_number}**\n🎯 {suit_display}\n⌛ **EXPIRÉE**"
+                await safe_edit_message(prediction_entity, pred['message_id'], expired_msg,
+                                        label=f"expirée #{game_number}", max_retries=2)
             del pending_predictions[game_number]
             save_pending_predictions()
 
@@ -4949,16 +5197,13 @@ async def auto_watchdog_task():
                         stop_animation(gn)
                         suit = pred.get('suit', '?')
                         actions.append(f"🧹 Prédiction #{gn} ({suit}) forcée hors mémoire")
-                        try:
-                            entity = await resolve_channel(PREDICTION_CHANNEL_ID)
-                            if entity and pred.get('message_id'):
-                                sd = SUIT_DISPLAY.get(suit, suit)
-                                await client.edit_message(
-                                    entity, pred['message_id'],
-                                    f"⏰ **PRÉDICTION #{gn}**\n🎯 {sd}\n⌛ **EXPIRÉE (watchdog)**",
-                                    parse_mode='markdown')
-                        except Exception:
-                            pass
+                        entity = await resolve_channel(PREDICTION_CHANNEL_ID)
+                        if entity and pred.get('message_id'):
+                            sd = SUIT_DISPLAY.get(suit, suit)
+                            await safe_edit_message(
+                                entity, pred['message_id'],
+                                f"⏰ **PRÉDICTION #{gn}**\n🎯 {sd}\n⌛ **EXPIRÉE (watchdog)**",
+                                label=f"watchdog #{gn}", max_retries=2)
 
             # ── 2. Tous les costumes simultanément bloqués ──────────────────
             blocked_suits = [s for s in ALL_SUITS if s in suit_block_until and now < suit_block_until[s]]
@@ -6196,7 +6441,8 @@ async def cmd_help(event):
         return
 
     help_text = (
-        f"📖 **BACCARAT AI — COMMANDES**\n\n"
+        f"📖 **BACCARAT AI — AIDE**\n\n"
+        f"💡 **Recommandé : utilisez `/menu` pour accéder à tout via des boutons cliquables.**\n\n"
         f"**⚙️ Configuration:**\n"
         f"`/df [1-10]` — Décalage prédiction (actuel: df={PREDICTION_DF})\n"
         f"`/gap [2-10]` — Écart min entre prédictions ({MIN_GAP_BETWEEN_PREDICTIONS})\n\n"
@@ -6235,7 +6481,7 @@ async def cmd_help(event):
         f"`/b` — Seuils B par costume\n\n"
         f"🤖 Baccarat AI | Source: 1xBet API"
     )
-    await event.respond(help_text)
+    await event.respond(help_text, buttons=[[Button.inline("🤖 Ouvrir le Menu", b"mn")]])
 
 
 async def cmd_reset(event):
@@ -6291,12 +6537,16 @@ async def cmd_debloquer(event):
 # ============================================================================
 
 def pdf_safe(text: str) -> str:
-    """Remplace les symboles de costumes (hors Latin-1) par leur nom texte pour FPDF/Helvetica."""
+    """Remplace les symboles hors Latin-1 par leur équivalent ASCII pour FPDF/Helvetica."""
     subs = [
         ('♠️', 'Pique'),  ('❤️', 'Coeur'),  ('♦️', 'Carreau'), ('♣️', 'Trefle'),
         ('♠', 'Pique'),   ('❤', 'Coeur'),   ('♦', 'Carreau'),  ('♣', 'Trefle'),
         ('♥', 'Coeur'),   ('\ufe0f', ''),
         ('Cœur', 'Coeur'), ('Trèfle', 'Trefle'),
+        ('→', '->'),       ('←', '<-'),       ('–', '-'),        ('—', '-'),
+        ('é', 'e'),        ('è', 'e'),        ('ê', 'e'),        ('à', 'a'),
+        ('â', 'a'),        ('î', 'i'),        ('ô', 'o'),        ('ù', 'u'),
+        ('û', 'u'),        ('ç', 'c'),        ('ï', 'i'),        ('ë', 'e'),
     ]
     for old, new in subs:
         text = text.replace(old, new)
@@ -7215,6 +7465,14 @@ async def cmd_favorables(event):
             if entity:
                 txt = generate_heures_favorables_text()
                 await client.send_message(entity, txt, parse_mode='markdown')
+            _fav_cmd = compute_heures_favorables()
+            _tot_cmd = sum(hourly_game_count[h] for h in range(24))
+            if _fav_cmd and _tot_cmd >= 100:
+                await db.db_save_kv('last_heures_favorables', {
+                    'favorables':   _fav_cmd,
+                    'total_games':  _tot_cmd,
+                    'computed_at':  datetime.now().isoformat(),
+                })
             await event.respond("✅ Heures favorables envoyées dans le canal.")
             return
 
@@ -7232,12 +7490,20 @@ async def cmd_favorables(event):
             await event.respond(f"✅ Annonces heures favorables **réactivées** — prochaine à **{next_h:02d}h00**.")
             return
 
-        # Affichage direct à l'admin
+        # Affichage direct à l'admin + sauvegarde en DB
         now = datetime.now()
         hours_since_last = now.hour % 3
         hours_until_next = 3 - hours_since_last
         next_h = (now.hour + hours_until_next) % 24
         statut = "✅ Actif" if heures_favorables_active else "🔕 Désactivé"
+        _fav_view = compute_heures_favorables()
+        _tot_view = sum(hourly_game_count[h] for h in range(24))
+        if _fav_view and _tot_view >= 100:
+            await db.db_save_kv('last_heures_favorables', {
+                'favorables':   _fav_view,
+                'total_games':  _tot_view,
+                'computed_at':  datetime.now().isoformat(),
+            })
         txt = generate_heures_favorables_text()
         await event.respond(
             f"{txt}\n\n"
@@ -7250,6 +7516,112 @@ async def cmd_favorables(event):
         )
     except Exception as e:
         logger.error(f"Erreur cmd_favorables: {e}")
+        await event.respond(f"❌ Erreur: {e}")
+
+
+# ============================================================================
+# COMMANDE /panneaux — PDF historique des panneaux countdown
+# ============================================================================
+
+def generate_panneaux_pdf(panels: List[Dict]) -> bytes:
+    """Génère un PDF avec l'historique complet des panneaux countdown envoyés."""
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+
+    # ── En-tête ──────────────────────────────────────────────────────────────
+    pdf.set_font('Helvetica', 'B', 16)
+    pdf.set_fill_color(0, 60, 160)
+    pdf.set_text_color(255, 255, 255)
+    pdf.cell(0, 12, 'BACCARAT AI - Historique Panneaux Heures Favorables',
+             new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C', fill=True)
+    pdf.ln(3)
+
+    pdf.set_font('Helvetica', '', 10)
+    pdf.set_text_color(80, 80, 80)
+    pdf.cell(0, 6,
+        f'Total panneaux : {len(panels)} | '
+        f'Genere le {datetime.now().strftime("%d/%m/%Y a %Hh%M")} (heure Cote d\'Ivoire)',
+        new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C'
+    )
+    pdf.ln(6)
+
+    # ── Tableau ───────────────────────────────────────────────────────────────
+    col_widths = [18, 45, 22, 22, 35, 38]
+    headers    = ['N°', 'Intervalle', 'De (h)', 'A (h)', 'Envoyé avant', 'Date & Heure']
+
+    pdf.set_font('Helvetica', 'B', 11)
+    pdf.set_fill_color(0, 60, 160)
+    pdf.set_text_color(255, 255, 255)
+    for h, w in zip(headers, col_widths):
+        pdf.cell(w, 9, h, border=1, fill=True, align='C')
+    pdf.ln()
+
+    pdf.set_font('Helvetica', '', 10)
+    alt = False
+    for p in panels:
+        if alt:
+            pdf.set_fill_color(220, 232, 255)
+        else:
+            pdf.set_fill_color(255, 255, 255)
+        pdf.set_text_color(0, 0, 0)
+        alt = not alt
+
+        num_str    = f"#{p['panel_number']}"
+        itv_str    = pdf_safe(p['interval_str'])
+        start_str  = f"{p['start_h']:02d}h00"
+        end_str    = f"{p['end_h']:02d}h00"
+        mb         = p['minutes_before']
+        avant_str  = f"{mb // 60}h {mb % 60:02d}min" if mb >= 60 else f"{mb}min"
+        sent_at    = p['sent_at']
+        if hasattr(sent_at, 'strftime'):
+            dt_str = sent_at.strftime('%d/%m/%Y %Hh%M')
+        else:
+            dt_str = str(sent_at)[:16]
+
+        row = [num_str, itv_str, start_str, end_str, avant_str, dt_str]
+        for val, w in zip(row, col_widths):
+            pdf.cell(w, 8, val, border=1, fill=True, align='C')
+        pdf.ln()
+
+    return bytes(pdf.output())
+
+
+async def cmd_panneaux(event):
+    """
+    /panneaux — Admin : envoie un PDF avec l'historique de tous les panneaux countdown.
+    """
+    if event.is_group or event.is_channel:
+        return
+    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+        await event.respond("🔒 Admin uniquement")
+        return
+    try:
+        await event.respond("⏳ Génération du PDF panneaux...")
+        panels = await db.db_load_countdown_panels(limit=500)
+        if not panels:
+            await event.respond("🟦 Aucun panneau countdown enregistré pour l'instant.")
+            return
+        pdf_bytes = generate_panneaux_pdf(panels)
+        fname = f"panneaux_countdown_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf"
+        with open(fname, 'wb') as f:
+            f.write(pdf_bytes)
+        admin_entity = await client.get_entity(ADMIN_ID)
+        await client.send_file(
+            admin_entity, fname,
+            caption=(
+                f"🟦 **Panneaux Heures Favorables**\n"
+                f"📋 {len(panels)} panneau(x) enregistré(s)\n"
+                f"🔢 Dernier N° : #{panels[0]['panel_number']}"
+            ),
+            parse_mode='markdown'
+        )
+        import os as _os
+        try: _os.remove(fname)
+        except Exception: pass
+        logger.info(f"📄 PDF panneaux envoyé ({len(panels)} entrées)")
+    except Exception as e:
+        logger.error(f"Erreur cmd_panneaux: {e}")
         await event.respond(f"❌ Erreur: {e}")
 
 
@@ -7486,10 +7858,667 @@ async def on_reaction_event(update):
 
 
 # ============================================================================
+# MENU BOUTONS — INTERFACE INLINE KEYBOARD ADMIN
+# ============================================================================
+
+def _fake_ev(chat_id: int, cmd_text: str):
+    """Crée un faux événement pour appeler les handlers de commandes depuis les boutons."""
+    class _FE:
+        is_group   = False
+        is_channel = False
+        async def respond(self, text, **kw):
+            await client.send_message(self._cid, text, **kw)
+    fe = _FE()
+    fe.sender_id = ADMIN_ID
+    fe._cid      = chat_id
+    fe.chat_id   = chat_id
+    fe.message   = type('M', (), {'message': cmd_text})()
+    return fe
+
+
+def _btns_main():
+    return [
+        [Button.inline("⚙️ Configuration",   b"cfg"), Button.inline("📊 Compteurs",    b"cmp")],
+        [Button.inline("📋 Prédictions",      b"prd"), Button.inline("📡 Canaux",       b"cnx")],
+        [Button.inline("📈 Analyse",          b"anl"), Button.inline("🛠️ Outils",       b"ool")],
+    ]
+
+
+def _btns_cfg():
+    return [
+        [Button.inline(f"⏭️  df = {PREDICTION_DF}   [modifier]",         b"df_s")],
+        [Button.inline(f"📏  gap = {MIN_GAP_BETWEEN_PREDICTIONS}   [modifier]", b"gp_s")],
+        [Button.inline("⏰  Heures de prédiction",                        b"hrs")],
+        [Button.inline("⬅️  Retour",                                      b"mn")],
+    ]
+
+
+def _btns_hrs():
+    return [
+        [Button.inline("👁  Voir plages actives",   b"h_v"),  Button.inline("➕  Ajouter HH-HH", b"h_a")],
+        [Button.inline("❌  Supprimer une plage",   b"h_d"),  Button.inline("🗑  Tout effacer",   b"h_c")],
+        [Button.inline("⬅️  Config",                b"cfg")],
+    ]
+
+
+def _btns_cmp():
+    return [
+        [Button.inline("C2 — Absences préd.",  b"c2"), Button.inline("C4 — Longues abs.", b"c4")],
+        [Button.inline("C5 — Patterns",        b"c5"), Button.inline("C6 — Dynamique Wj", b"c6")],
+        [Button.inline("C7 — Présences cons.", b"c7"), Button.inline("C8 — Absences mir.", b"c8")],
+        [Button.inline("C9 — Silencieux SS",   b"c9"), Button.inline("📊  Stats C1",       b"st_v")],
+        [Button.inline("⬅️  Retour",            b"mn")],
+    ]
+
+
+def _btns_c2():
+    s = "✅ ON" if compteur2_active else "❌ OFF"
+    return [
+        [Button.inline(f"📊  Voir statut  ({s})",            b"c2_v")],
+        [Button.inline("✅  Activer",  b"c2_on"), Button.inline("❌  Désactiver", b"c2_off")],
+        [Button.inline(f"⚙️  Seuil B  (actuel: {compteur2_seuil_B})", b"c2_b"),
+         Button.inline("🔄  Reset",    b"c2_rs")],
+        [Button.inline("⬅️  Compteurs", b"cmp")],
+    ]
+
+
+def _btns_c4():
+    return [
+        [Button.inline("📊  Voir statut",                          b"c4_v")],
+        [Button.inline("📄  PDF",  b"c4_p"), Button.inline("🔄  Reset", b"c4_r")],
+        [Button.inline(f"⚙️  Seuil  (actuel: {COMPTEUR4_THRESHOLD})", b"c4_s")],
+        [Button.inline("⬅️  Compteurs", b"cmp")],
+    ]
+
+
+def _btns_c7():
+    return [
+        [Button.inline("📊  Voir statut",                            b"c7_v")],
+        [Button.inline("📄  PDF",  b"c7_p"), Button.inline("🔄  Reset", b"c7_r")],
+        [Button.inline(f"⚙️  Seuil  (actuel: {COMPTEUR7_THRESHOLD})", b"c7_s")],
+        [Button.inline("⬅️  Compteurs", b"cmp")],
+    ]
+
+
+def _btns_c8():
+    return [
+        [Button.inline("📊  Voir statut",                           b"c8_v")],
+        [Button.inline("📄  PDF",  b"c8_p"), Button.inline("🔄  Reset", b"c8_r")],
+        [Button.inline("⬅️  Compteurs", b"cmp")],
+    ]
+
+
+def _btns_c9():
+    return [
+        [Button.inline("📊  Voir statut",                          b"c9_v")],
+        [Button.inline("📄  PDF",  b"c9_p"), Button.inline("🔄  Reset", b"c9_r")],
+        [Button.inline(f"⚙️  Seuil SS  (actuel: {compteur9_ss})",  b"c9_s")],
+        [Button.inline("⬅️  Compteurs", b"cmp")],
+    ]
+
+
+def _btns_prd():
+    return [
+        [Button.inline("📋  15 dernières raisons", b"rz_l"), Button.inline("📋  Raison jeu #N", b"rz_n")],
+        [Button.inline("📄  PDF toutes raisons",   b"rz_p")],
+        [Button.inline("⏳  Pending",  b"pnd"), Button.inline("📂  Queue", b"que"), Button.inline("📡  Status", b"sts")],
+        [Button.inline("🔓  Débloquer urgence",    b"dbl"), Button.inline("🔄  Reset bot",        b"rst")],
+        [Button.inline("⬅️  Retour", b"mn")],
+    ]
+
+
+def _btns_cnx():
+    dist = f"✅ {DISTRIBUTION_CHANNEL_ID}" if DISTRIBUTION_CHANNEL_ID else "❌ inactif"
+    c2ch = f"✅ {COMPTEUR2_CHANNEL_ID}"    if COMPTEUR2_CHANNEL_ID    else "❌ inactif"
+    return [
+        [Button.inline("📡  Voir config canaux",                    b"cn_v")],
+        [Button.inline(f"🎯  Distribution : {dist}",                b"cn_dm")],
+        [Button.inline("   ✏️  Modifier ID", b"cn_ds"), Button.inline("   ❌  Désactiver", b"cn_do")],
+        [Button.inline(f"📊  Compteur2 : {c2ch}",                   b"cn_cm")],
+        [Button.inline("   ✏️  Modifier ID", b"cn_cs"), Button.inline("   ❌  Désactiver", b"cn_co")],
+        [Button.inline("⬅️  Retour", b"mn")],
+    ]
+
+
+def _btns_anl():
+    fav_state = "✅ ON" if heures_favorables_active else "❌ OFF"
+    return [
+        [Button.inline("📉  PDF Perdus",       b"pd_v"), Button.inline("📊  Comparaison", b"cmp_v")],
+        [Button.inline(f"⭐  Heures favorables  ({fav_state})", b"fv_v")],
+        [Button.inline("✅  Fav ON", b"fv_on"), Button.inline("❌  Fav OFF", b"fv_off"),
+         Button.inline("📤  → Canal", b"fv_c")],
+        [Button.inline("📈  Bilan actuel",     b"bl_v"), Button.inline("📈  Bilan maintenant", b"bl_n")],
+        [Button.inline("⬅️  Retour", b"mn")],
+    ]
+
+
+def _btns_ool():
+    return [
+        [Button.inline("📖  Mode emploi",      b"em_v"), Button.inline("💰  Seuils B",     b"bv")],
+        [Button.inline("🖼  Panneaux",          b"pn_v"), Button.inline("✅  Vérifier",     b"vr_v")],
+        [Button.inline("🧪  Test prédiction #N", b"tp")],
+        [Button.inline("⬅️  Retour", b"mn")],
+    ]
+
+
+async def cmd_menu(event):
+    """Affiche le menu principal avec boutons inline."""
+    if event.is_group or event.is_channel:
+        return
+    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+        await event.respond("🔒 Admin uniquement")
+        return
+    await event.respond("🤖 **BACCARAT AI — Menu principal**\nChoisissez une section :", buttons=_btns_main())
+
+
+async def handle_callback(event):
+    """Gestionnaire central de tous les boutons inline."""
+    global PREDICTION_DF, MIN_GAP_BETWEEN_PREDICTIONS, PREDICTION_HOURS
+    global compteur2_active, compteur2_seuil_B, compteur2_seuil_B_per_suit
+    global COMPTEUR4_THRESHOLD, COMPTEUR7_THRESHOLD, COMPTEUR8_THRESHOLD, compteur9_ss
+    global DISTRIBUTION_CHANNEL_ID, COMPTEUR2_CHANNEL_ID, heures_favorables_active
+    global compteur4_trackers, compteur4_current, compteur4_events
+    global compteur7_current, compteur8_current
+
+    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+        await event.answer("🔒 Admin uniquement", alert=True)
+        return
+
+    data = event.data.decode('utf-8')
+    cid  = event.chat_id
+
+    try:
+        # ── Navigation principale ─────────────────────────────────────────────
+        if data == 'mn':
+            await event.edit("🤖 **BACCARAT AI — Menu principal**\nChoisissez une section :", buttons=_btns_main())
+            await event.answer()
+
+        elif data == 'cfg':
+            await event.edit("⚙️ **CONFIGURATION**", buttons=_btns_cfg())
+            await event.answer()
+
+        elif data == 'hrs':
+            now     = datetime.now()
+            allowed = "✅ OUI" if is_prediction_time_allowed() else "❌ NON"
+            txt = (f"⏰ **HEURES DE PRÉDICTION**\n"
+                   f"Heure actuelle : **{now.strftime('%H:%M')}**  |  Autorisé : {allowed}\n"
+                   f"Plages actives : {format_hours_config()}")
+            await event.edit(txt, buttons=_btns_hrs())
+            await event.answer()
+
+        elif data == 'cmp':
+            await event.edit("📊 **COMPTEURS** — Choisissez :", buttons=_btns_cmp())
+            await event.answer()
+
+        elif data == 'prd':
+            await event.edit("📋 **PRÉDICTIONS**", buttons=_btns_prd())
+            await event.answer()
+
+        elif data == 'cnx':
+            await event.edit("📡 **CANAUX**", buttons=_btns_cnx())
+            await event.answer()
+
+        elif data == 'anl':
+            await event.edit("📈 **ANALYSE**", buttons=_btns_anl())
+            await event.answer()
+
+        elif data == 'ool':
+            await event.edit("🛠️ **OUTILS**", buttons=_btns_ool())
+            await event.answer()
+
+        # ── Configuration ─────────────────────────────────────────────────────
+        elif data == 'df_s':
+            pending_input[event.sender_id] = {'action': 'set_df', 'cid': cid}
+            await event.answer()
+            await client.send_message(cid, f"⏭️ **Modifier df**\nValeur actuelle : **{PREDICTION_DF}**\nEnvoyez la nouvelle valeur (1-10) :")
+
+        elif data == 'gp_s':
+            pending_input[event.sender_id] = {'action': 'set_gap', 'cid': cid}
+            await event.answer()
+            await client.send_message(cid, f"📏 **Modifier gap**\nValeur actuelle : **{MIN_GAP_BETWEEN_PREDICTIONS}**\nEnvoyez la nouvelle valeur (2-10) :")
+
+        elif data == 'h_v':
+            now     = datetime.now()
+            allowed = "✅ OUI" if is_prediction_time_allowed() else "❌ NON"
+            txt = (f"⏰ **Plages actives**\nHeure : {now.strftime('%H:%M')}  |  Autorisé : {allowed}\n{format_hours_config()}")
+            await event.answer(txt, alert=True)
+
+        elif data == 'h_a':
+            pending_input[event.sender_id] = {'action': 'h_add', 'cid': cid}
+            await event.answer()
+            await client.send_message(cid, "➕ **Ajouter plage horaire**\nFormat **HH-HH** (ex: `18-23`) :")
+
+        elif data == 'h_d':
+            pending_input[event.sender_id] = {'action': 'h_del', 'cid': cid}
+            await event.answer()
+            await client.send_message(cid, f"❌ **Supprimer plage**\nPlages actuelles : {format_hours_config()}\nFormat **HH-HH** (ex: `18-23`) :")
+
+        elif data == 'h_c':
+            PREDICTION_HOURS.clear()
+            await event.answer("✅ Toutes les plages supprimées — prédictions 24h/24", alert=True)
+
+        # ── Compteur 2 ────────────────────────────────────────────────────────
+        elif data == 'c2':
+            s = "✅ ON" if compteur2_active else "❌ OFF"
+            await event.edit(f"📊 **COMPTEUR 2** — Statut : {s} | Seuil B : {compteur2_seuil_B}", buttons=_btns_c2())
+            await event.answer()
+
+        elif data == 'c2_v':
+            await event.answer()
+            await cmd_compteur2(_fake_ev(cid, '/compteur2'))
+
+        elif data == 'c2_on':
+            compteur2_active = True
+            await event.answer("✅ Compteur2 activé", alert=True)
+
+        elif data == 'c2_off':
+            compteur2_active = False
+            await event.answer("❌ Compteur2 désactivé", alert=True)
+
+        elif data == 'c2_rs':
+            for tr in compteur2_trackers.values():
+                tr.counter = 0
+            await event.answer("🔄 Compteur2 reset", alert=True)
+
+        elif data == 'c2_b':
+            pending_input[event.sender_id] = {'action': 'set_c2b', 'cid': cid}
+            await event.answer()
+            await client.send_message(cid, f"⚙️ **Seuil B — Compteur2**\nValeur actuelle : **{compteur2_seuil_B}**\nEnvoyez la nouvelle valeur (2-10) :")
+
+        # ── Compteur 4 ────────────────────────────────────────────────────────
+        elif data == 'c4':
+            await event.edit(f"🔴 **COMPTEUR 4** — Seuil : {COMPTEUR4_THRESHOLD}", buttons=_btns_c4())
+            await event.answer()
+
+        elif data == 'c4_v':
+            await event.answer()
+            await cmd_compteur4(_fake_ev(cid, '/compteur4'))
+
+        elif data == 'c4_p':
+            await event.answer("📄 Génération PDF C4…")
+            await send_compteur4_pdf()
+
+        elif data == 'c4_r':
+            for suit in ALL_SUITS:
+                compteur4_trackers[suit] = 0
+                compteur4_current[suit]  = {'count': 0, 'start_game': None, 'start_time': None, 'alerted': False}
+            compteur4_events.clear()
+            save_compteur4_data()
+            await event.answer("🔄 Compteur4 reset", alert=True)
+
+        elif data == 'c4_s':
+            pending_input[event.sender_id] = {'action': 'set_c4s', 'cid': cid}
+            await event.answer()
+            await client.send_message(cid, f"⚙️ **Seuil — Compteur4**\nValeur actuelle : **{COMPTEUR4_THRESHOLD}**\nEnvoyez la nouvelle valeur (5-50) :")
+
+        # ── Compteur 5 ────────────────────────────────────────────────────────
+        elif data == 'c5':
+            await event.answer("📊 Chargement C5…")
+            await cmd_compteur5(_fake_ev(cid, '/compteur5'))
+
+        # ── Compteur 6 ────────────────────────────────────────────────────────
+        elif data == 'c6':
+            await event.answer("📊 Chargement C6…")
+            await cmd_compteur6(_fake_ev(cid, '/compteur6'))
+
+        # ── Compteur 7 ────────────────────────────────────────────────────────
+        elif data == 'c7':
+            await event.edit(f"🟢 **COMPTEUR 7** — Seuil : {COMPTEUR7_THRESHOLD}", buttons=_btns_c7())
+            await event.answer()
+
+        elif data == 'c7_v':
+            await event.answer()
+            await cmd_compteur7(_fake_ev(cid, '/compteur7'))
+
+        elif data == 'c7_p':
+            await event.answer("📄 Génération PDF C7…")
+            await send_compteur7_pdf()
+
+        elif data == 'c7_r':
+            for suit in ALL_SUITS:
+                compteur7_current[suit] = {'count': 0, 'start_game': None, 'start_time': None}
+            save_compteur7_data()
+            await event.answer("🔄 Compteur7 reset", alert=True)
+
+        elif data == 'c7_s':
+            pending_input[event.sender_id] = {'action': 'set_c7s', 'cid': cid}
+            await event.answer()
+            await client.send_message(cid, f"⚙️ **Seuil — Compteur7**\nValeur actuelle : **{COMPTEUR7_THRESHOLD}**\nEnvoyez la nouvelle valeur (3-20) :")
+
+        # ── Compteur 8 ────────────────────────────────────────────────────────
+        elif data == 'c8':
+            await event.edit(f"🔴 **COMPTEUR 8** — Seuil : {COMPTEUR8_THRESHOLD}", buttons=_btns_c8())
+            await event.answer()
+
+        elif data == 'c8_v':
+            await event.answer()
+            await cmd_compteur8(_fake_ev(cid, '/compteur8'))
+
+        elif data == 'c8_p':
+            await event.answer("📄 Génération PDF C8…")
+            await send_compteur8_pdf()
+
+        elif data == 'c8_r':
+            for suit in ALL_SUITS:
+                compteur8_current[suit] = {'count': 0, 'start_game': None, 'start_time': None}
+            save_compteur8_data()
+            await event.answer("🔄 Compteur8 reset", alert=True)
+
+        # ── Compteur 9 ────────────────────────────────────────────────────────
+        elif data == 'c9':
+            await event.edit(f"📈 **COMPTEUR 9** — SS = {compteur9_ss}", buttons=_btns_c9())
+            await event.answer()
+
+        elif data == 'c9_v':
+            await event.answer()
+            await cmd_compteur9(_fake_ev(cid, '/compteur9'))
+
+        elif data == 'c9_p':
+            await event.answer("📄 Génération PDF C9…")
+            await send_compteur9_pdf()
+
+        elif data == 'c9_r':
+            reset_compteur9_now()
+            await event.answer("🔄 Compteur9 reset", alert=True)
+
+        elif data == 'c9_s':
+            pending_input[event.sender_id] = {'action': 'set_c9s', 'cid': cid}
+            await event.answer()
+            await client.send_message(cid, f"⚙️ **Seuil SS — Compteur9**\nValeur actuelle : **{compteur9_ss}**\nEnvoyez la nouvelle valeur (1-50) :")
+
+        # ── Prédictions ───────────────────────────────────────────────────────
+        elif data == 'rz_l':
+            await event.answer("📋 Chargement…")
+            await cmd_raison(_fake_ev(cid, '/raison'))
+
+        elif data == 'rz_p':
+            await event.answer("📄 Génération PDF raisons…")
+            await cmd_raison(_fake_ev(cid, '/raison pdf'))
+
+        elif data == 'rz_n':
+            pending_input[event.sender_id] = {'action': 'raison_n', 'cid': cid}
+            await event.answer()
+            await client.send_message(cid, "📋 **Raison pour un jeu précis**\nEnvoyez le numéro du jeu :")
+
+        elif data == 'pnd':
+            await event.answer("⏳ Chargement…")
+            await cmd_pending(_fake_ev(cid, '/pending'))
+
+        elif data == 'que':
+            await event.answer("📂 Chargement…")
+            await cmd_queue(_fake_ev(cid, '/queue'))
+
+        elif data == 'sts':
+            await event.answer("📡 Chargement…")
+            await cmd_status(_fake_ev(cid, '/status'))
+
+        elif data == 'dbl':
+            await event.answer("🔓 Déblocage…")
+            await cmd_debloquer(_fake_ev(cid, '/debloquer'))
+
+        elif data == 'rst':
+            await event.answer("🔄 Reset en cours…")
+            await client.send_message(cid, "🔄 Reset en cours…")
+            await perform_full_reset("Reset via menu boutons")
+            await client.send_message(cid, "✅ Reset effectué !")
+
+        # ── Canaux ────────────────────────────────────────────────────────────
+        elif data == 'cn_v':
+            dist = f"`{DISTRIBUTION_CHANNEL_ID}`" if DISTRIBUTION_CHANNEL_ID else "❌ inactif"
+            c2ch = f"`{COMPTEUR2_CHANNEL_ID}`"    if COMPTEUR2_CHANNEL_ID    else "❌ inactif"
+            txt  = (f"📡 **CONFIGURATION DES CANAUX**\n\n"
+                    f"📤 Principal   : `{PREDICTION_CHANNEL_ID}`\n"
+                    f"🎯 Distribution : {dist}\n"
+                    f"📊 Compteur2   : {c2ch}")
+            await event.answer()
+            await client.send_message(cid, txt)
+
+        elif data in ('cn_dm', 'cn_cm'):
+            await event.answer()
+
+        elif data == 'cn_ds':
+            pending_input[event.sender_id] = {'action': 'set_cn_dist', 'cid': cid}
+            await event.answer()
+            cur = f"`{DISTRIBUTION_CHANNEL_ID}`" if DISTRIBUTION_CHANNEL_ID else "inactif"
+            await client.send_message(cid, f"🎯 **Canal Distribution** (actuel : {cur})\nEnvoyez le nouvel ID de canal (nombre négatif) :")
+
+        elif data == 'cn_do':
+            old = DISTRIBUTION_CHANNEL_ID
+            DISTRIBUTION_CHANNEL_ID = None
+            await event.answer(f"❌ Canal distribution désactivé (était : {old})", alert=True)
+
+        elif data == 'cn_cs':
+            pending_input[event.sender_id] = {'action': 'set_cn_c2', 'cid': cid}
+            await event.answer()
+            cur = f"`{COMPTEUR2_CHANNEL_ID}`" if COMPTEUR2_CHANNEL_ID else "inactif"
+            await client.send_message(cid, f"📊 **Canal Compteur2** (actuel : {cur})\nEnvoyez le nouvel ID de canal (nombre négatif) :")
+
+        elif data == 'cn_co':
+            old = COMPTEUR2_CHANNEL_ID
+            COMPTEUR2_CHANNEL_ID = None
+            await event.answer(f"❌ Canal compteur2 désactivé (était : {old})", alert=True)
+
+        # ── Analyse ───────────────────────────────────────────────────────────
+        elif data == 'pd_v':
+            await event.answer("📄 Génération PDF perdus…")
+            await cmd_perdus(_fake_ev(cid, '/perdus'))
+
+        elif data == 'fv_v':
+            await event.answer("⭐ Chargement…")
+            await cmd_favorables(_fake_ev(cid, '/favorables'))
+
+        elif data == 'fv_on':
+            heures_favorables_active = True
+            now    = datetime.now()
+            next_h = (now.hour + (3 - now.hour % 3)) % 24
+            await event.answer(f"✅ Heures favorables ON — prochain : {next_h:02d}h00", alert=True)
+
+        elif data == 'fv_off':
+            heures_favorables_active = False
+            await event.answer("🔕 Heures favorables OFF", alert=True)
+
+        elif data == 'fv_c':
+            await event.answer("📤 Envoi dans le canal…")
+            await cmd_favorables(_fake_ev(cid, '/favorables canal'))
+
+        elif data == 'cmp_v':
+            await event.answer("📊 Génération comparaison…")
+            await cmd_comparaison(_fake_ev(cid, '/comparaison'))
+
+        elif data == 'bl_v':
+            await event.answer("📈 Génération bilan…")
+            await cmd_bilan(_fake_ev(cid, '/bilan'))
+
+        elif data == 'bl_n':
+            await event.answer("📈 Envoi bilan maintenant…")
+            await cmd_bilan(_fake_ev(cid, '/bilan now'))
+
+        elif data == 'st_v':
+            await event.answer("📊 Génération stats C1…")
+            await cmd_stats(_fake_ev(cid, '/stats'))
+
+        # ── Outils ────────────────────────────────────────────────────────────
+        elif data == 'em_v':
+            await event.answer("📖 Génération…")
+            await cmd_emploi(_fake_ev(cid, '/emploi'))
+
+        elif data == 'bv':
+            await event.answer("💰 Chargement…")
+            await cmd_b(_fake_ev(cid, '/b'))
+
+        elif data == 'pn_v':
+            await event.answer("🖼 Chargement…")
+            await cmd_panneaux(_fake_ev(cid, '/panneaux'))
+
+        elif data == 'vr_v':
+            await event.answer("✅ Vérification…")
+            await cmd_verifier(_fake_ev(cid, '/verifier'))
+
+        elif data == 'tp':
+            pending_input[event.sender_id] = {'action': 'testpred', 'cid': cid}
+            await event.answer()
+            await client.send_message(cid, "🧪 **Test prédiction**\nEnvoyez le numéro du jeu cible (ex : `1080`) :")
+
+        else:
+            await event.answer()
+
+    except Exception as e:
+        logger.error(f"❌ Erreur handle_callback [{data}]: {e}", exc_info=True)
+        try:
+            await event.answer(f"❌ Erreur: {e}", alert=True)
+        except Exception:
+            pass
+
+
+async def handle_admin_input(event):
+    """Intercepte la saisie de valeurs numériques/texte après clic sur un bouton."""
+    global PREDICTION_DF, MIN_GAP_BETWEEN_PREDICTIONS, PREDICTION_HOURS
+    global compteur2_seuil_B, compteur2_seuil_B_per_suit
+    global COMPTEUR4_THRESHOLD, COMPTEUR7_THRESHOLD, compteur9_ss
+    global DISTRIBUTION_CHANNEL_ID, COMPTEUR2_CHANNEL_ID
+
+    if event.is_group or event.is_channel:
+        return
+    if event.sender_id not in pending_input:
+        return
+    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+        return
+    text = event.message.message.strip()
+    if text.startswith('/'):
+        pending_input.pop(event.sender_id, None)
+        return
+
+    state  = pending_input.pop(event.sender_id)
+    action = state['action']
+
+    try:
+        if action == 'set_df':
+            val = int(text)
+            if not 1 <= val <= 10:
+                await event.respond("❌ df doit être entre 1 et 10")
+                return
+            old = PREDICTION_DF
+            PREDICTION_DF = val
+            await event.respond(f"✅ **df : {old} → {val}**\n_Prédit le jeu N+{val} à la fin de N._")
+
+        elif action == 'set_gap':
+            val = int(text)
+            if not 2 <= val <= 10:
+                await event.respond("❌ gap doit être entre 2 et 10")
+                return
+            old = MIN_GAP_BETWEEN_PREDICTIONS
+            MIN_GAP_BETWEEN_PREDICTIONS = val
+            await event.respond(f"✅ **gap : {old} → {val}**")
+
+        elif action == 'h_add':
+            if '-' not in text:
+                await event.respond("❌ Format : HH-HH (ex : `18-23`)")
+                return
+            s_str, e_str = text.split('-', 1)
+            s_h, e_h = int(s_str.strip()), int(e_str.strip())
+            if not (0 <= s_h <= 23 and 0 <= e_h <= 23):
+                await event.respond("❌ Heures entre 0 et 23")
+                return
+            PREDICTION_HOURS.append((s_h, e_h))
+            await event.respond(f"✅ **Plage ajoutée : {s_h:02d}h → {e_h:02d}h**\nPlages : {format_hours_config()}")
+
+        elif action == 'h_del':
+            if '-' not in text:
+                await event.respond("❌ Format : HH-HH")
+                return
+            s_str, e_str = text.split('-', 1)
+            s_h, e_h = int(s_str.strip()), int(e_str.strip())
+            if (s_h, e_h) in PREDICTION_HOURS:
+                PREDICTION_HOURS.remove((s_h, e_h))
+                await event.respond(f"✅ **Plage supprimée : {s_h:02d}h → {e_h:02d}h**")
+            else:
+                await event.respond(f"❌ Plage {s_h:02d}h-{e_h:02d}h introuvable")
+
+        elif action == 'set_c2b':
+            val = int(text)
+            if not 2 <= val <= 10:
+                await event.respond("❌ B entre 2 et 10")
+                return
+            old_b = compteur2_seuil_B
+            compteur2_seuil_B = val
+            for s in ALL_SUITS:
+                cur    = compteur2_seuil_B_per_suit.get(s, old_b)
+                excess = cur - old_b
+                compteur2_seuil_B_per_suit[s] = val + max(0, excess)
+            await event.respond(f"✅ **Seuil B Compteur2 : {old_b} → {val}**")
+
+        elif action == 'set_c4s':
+            val = int(text)
+            if not 5 <= val <= 50:
+                await event.respond("❌ Seuil entre 5 et 50")
+                return
+            old = COMPTEUR4_THRESHOLD
+            COMPTEUR4_THRESHOLD = val
+            await event.respond(f"✅ **Seuil Compteur4 : {old} → {val}**")
+
+        elif action == 'set_c7s':
+            val = int(text)
+            if not 3 <= val <= 20:
+                await event.respond("❌ Seuil entre 3 et 20")
+                return
+            old = COMPTEUR7_THRESHOLD
+            COMPTEUR7_THRESHOLD = val
+            await event.respond(f"✅ **Seuil Compteur7 : {old} → {val}**")
+
+        elif action == 'set_c9s':
+            val = int(text)
+            if not 1 <= val <= 50:
+                await event.respond("❌ Seuil entre 1 et 50")
+                return
+            old = compteur9_ss
+            compteur9_ss = val
+            await event.respond(f"✅ **Seuil SS Compteur9 : {old} → {val}**")
+
+        elif action == 'set_cn_dist':
+            new_id = int(text)
+            if not await resolve_channel(new_id):
+                await event.respond(f"❌ Canal `{new_id}` inaccessible")
+                return
+            old = DISTRIBUTION_CHANNEL_ID
+            DISTRIBUTION_CHANNEL_ID = new_id
+            await event.respond(f"✅ **Canal distribution : {old} → {new_id}**")
+
+        elif action == 'set_cn_c2':
+            new_id = int(text)
+            if not await resolve_channel(new_id):
+                await event.respond(f"❌ Canal `{new_id}` inaccessible")
+                return
+            old = COMPTEUR2_CHANNEL_ID
+            COMPTEUR2_CHANNEL_ID = new_id
+            await event.respond(f"✅ **Canal Compteur2 : {old} → {new_id}**")
+
+        elif action == 'raison_n':
+            if not text.isdigit():
+                await event.respond("❌ Entrez un numéro de jeu valide (ex : `1062`)")
+                return
+            await cmd_raison(_fake_ev(event.chat_id, f'/raison {text}'))
+
+        elif action == 'testpred':
+            await cmd_testpred(_fake_ev(event.chat_id, f'/testpred {text}'))
+
+    except ValueError:
+        await event.respond("❌ Valeur invalide — entrez un nombre.")
+    except Exception as e:
+        await event.respond(f"❌ Erreur : {e}")
+
+
+# ============================================================================
 # SETUP ET DÉMARRAGE
 # ============================================================================
 
 def setup_handlers():
+    # ── Saisie de valeurs (intercepté en priorité avant les commandes) ─────────
+    client.add_event_handler(handle_admin_input, events.NewMessage(outgoing=False))
+    # ── Boutons inline ─────────────────────────────────────────────────────────
+    client.add_event_handler(handle_callback, events.CallbackQuery())
+    # ── Menu principal ─────────────────────────────────────────────────────────
+    client.add_event_handler(cmd_menu,      events.NewMessage(pattern=r'^/menu$'))
+    # ── Commandes texte (toujours disponibles) ─────────────────────────────────
     client.add_event_handler(cmd_heures,    events.NewMessage(pattern=r'^/heures'))
     client.add_event_handler(cmd_df,        events.NewMessage(pattern=r'^/df'))
     client.add_event_handler(cmd_gap,       events.NewMessage(pattern=r'^/gap'))
@@ -7515,6 +8544,7 @@ def setup_handlers():
     client.add_event_handler(cmd_compteur9, events.NewMessage(pattern=r'^/compteur9'))
     client.add_event_handler(cmd_comparaison, events.NewMessage(pattern=r'^/comparaison'))
     client.add_event_handler(cmd_favorables,  events.NewMessage(pattern=r'^/favorables'))
+    client.add_event_handler(cmd_panneaux,    events.NewMessage(pattern=r'^/panneaux$'))
     client.add_event_handler(cmd_testpred,    events.NewMessage(pattern=r'^/testpred'))
     client.add_event_handler(cmd_verifier,    events.NewMessage(pattern=r'^/verifier$'))
     client.add_event_handler(on_reaction_event, events.Raw(UpdateMessageReactions))
@@ -7548,9 +8578,14 @@ async def start_bot():
         await load_compteur8_data()
         await load_compteur9_data()
         await load_hourly_data()
+        save_hourly_data()                # Persiste immédiatement en DB (migration JSON si besoin)
         await load_compteur11()           # Charge les perdus d'hier pour les rejouer aujourd'hui
         await load_pending_predictions()  # Reprend les prédictions en cours après redémarrage
         await load_prediction_history()   # Charge l'historique pour les heures favorables
+        # Charger le compteur de panneaux depuis la DB
+        global countdown_panel_counter
+        countdown_panel_counter = await db.db_get_countdown_panel_count()
+        logger.info(f"🟦 {countdown_panel_counter} panneau(x) countdown chargé(s) depuis DB")
 
         if PREDICTION_CHANNEL_ID:
             try:
@@ -7605,6 +8640,7 @@ async def main():
                 asyncio.create_task(bilan_loop())
                 asyncio.create_task(heures_favorables_loop())
                 asyncio.create_task(heures_favorables_countdown_loop())
+                asyncio.create_task(restore_countdown_panel_if_needed())
                 asyncio.create_task(mode_emploi_loop())
                 asyncio.create_task(compteur9_reset_loop())
                 background_started = True
