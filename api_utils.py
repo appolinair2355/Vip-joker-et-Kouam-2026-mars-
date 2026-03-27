@@ -66,7 +66,7 @@ def get_latest_results():
           champ["G"] → liste de jeux
     """
     try:
-        response = requests.get(API_URL, params=API_PARAMS, headers=API_HEADERS, timeout=30)
+        response = requests.get(API_URL, params=API_PARAMS, headers=API_HEADERS, timeout=(5, 8))
         data = response.json()
 
         if "Value" not in data or not isinstance(data["Value"], list):

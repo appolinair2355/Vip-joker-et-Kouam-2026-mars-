@@ -103,47 +103,6 @@ countdown_panel_counter: int = 0                          # Numéro incrémental
 
 comparaison_nb_jours: int = 3          # Nombre de jours à comparer (modifiable par admin)
 
-# Mode d'emploi automatique vers le canal de prédiction
-MODE_EMPLOI_DEFAULT = """📌 *BOT BACCARAT — MODE D'EMPLOI*
-
-Le bot analyse les manches en temps réel et prédit l'enseigne que le joueur recevra :
-♠️ Pique · ♦️ Carreau · ♣️ Trèfle · ❤️ Cœur
-
-━━━━━━━━━━━━━━━━━━━━━━
-🟢 *DÉBUTANTS*
-
-1️⃣ Repérez le numéro de manche affiché sur votre bookmaker.
-2️⃣ Misez sur *« Le joueur reçoit une carte [enseigne indiquée] »*.
-3️⃣ Suivez la couleur de la barre affichée par le bot :
-
-🟦 *Barre bleue — R0* : mise de départ (niveau initial)
-🟩 *Barre verte — R1* : 1er rattrapage — augmentez la mise
-🟨 *Barre jaune — R2* : 2ème rattrapage — augmentez encore
-🟥 *Barre rouge — R3* : 3ème rattrapage — niveau maximum
-
-4️⃣ Dès un gain, revenez immédiatement à la barre bleue (R0).
-
-• Démarrez toujours par la mise la plus basse.
-• Ne franchissez jamais le niveau rouge (R3).
-
-━━━━━━━━━━━━━━━━━━━━━━
-🔵 *PROFESSIONNELS*
-
-Vous maîtrisez déjà la gestion de mise — Kouamé n'a pas grand-chose à vous apprendre.
-Fiez-vous simplement à la couleur de la barre et gérez votre bankroll comme à votre habitude.
-
-━━━━━━━━━━━━━━━━━━━━━━
-🧠 *Règles essentielles*
-• Ne dépassez jamais le niveau R3 (barre rouge).
-• Revenez systématiquement au R0 (barre bleue) après chaque gain.
-• Limitez-vous à quatre séries par jour.
-
-━━━━━━━━━━━━━━━━━━━━━━
-Pour en savoir plus ou paiement écrivez directement 👉🏻 @Kouam2025_bot"""
-
-mode_emploi_text: str = MODE_EMPLOI_DEFAULT        # Texte modifiable par l'admin
-mode_emploi_interval_hours: int = 0               # Désactivé — envoi basé sur jeu #480/#960/#1440
-
 # Compteur1 - Gestion des costumes présents consécutifs
 compteur1_trackers: Dict[str, 'Compteur1Tracker'] = {}
 compteur1_history: List[Dict] = []
@@ -1414,48 +1373,6 @@ def generate_heures_favorables_text() -> str:
         "_Seuils : ≥15 jeux/h · écart ≥+10% pour être retenu._"
     )
     return "\n".join(lines)
-
-
-def generate_heures_favorables_intervals() -> str:
-    """
-    Bloc heures favorables pour le mode d'emploi du canal.
-    Affiche uniquement le prochain créneau favorable (pas la liste complète).
-    Retourne "" si données insuffisantes ou aucun créneau identifié.
-    """
-    SIGNATURE = "\n\n_En Dieu nous comptons, Sossou Kouamé prediction 🔥_"
-    now_ci  = datetime.now(timezone.utc).replace(tzinfo=None)
-    now_h   = now_ci.hour
-
-    stat_results = compute_heures_favorables()
-    all_heures   = sorted(e['heure'] for e in stat_results)
-    total_games  = sum(hourly_game_count[h] for h in range(24))
-
-    if total_games < 50 or not all_heures:
-        return ""
-
-    upcoming = [h for h in all_heures if h > now_h] or all_heures
-    nxt   = upcoming[0]
-    nxt_i = group_heures_into_intervals([nxt])[0]
-    dans  = _temps_restant(now_ci, nxt)
-
-    header = "\n\n━━━━━━━━━━━━━━━━━━━━━━\n⏰ *Heures favorables* _(heure de Côte d'Ivoire)_"
-    return header + f"\n⏩ *Prochain créneau : {nxt_i}* _{dans}_" + SIGNATURE
-
-
-async def send_mode_emploi_with_heures():
-    """Envoie le mode d'emploi + heures favorables dans le canal de prédiction."""
-    global mode_emploi_text
-    if not PREDICTION_CHANNEL_ID:
-        return
-    try:
-        entity = await resolve_channel(PREDICTION_CHANNEL_ID)
-        if entity:
-            txt = mode_emploi_text
-            sent = await client.send_message(entity, txt, parse_mode='markdown')
-            logger.info("📋 Mode d'emploi envoyé dans le canal")
-            asyncio.create_task(auto_delete_canal_message(sent.id))
-    except Exception as e:
-        logger.error(f"❌ Erreur send_mode_emploi_with_heures: {e}")
 
 
 async def send_heures_favorables_simple():
@@ -5040,10 +4957,15 @@ async def api_polling_loop():
 
     logger.info("🔄 Démarrage boucle de polling API (toutes les 4s)...")
     loop = asyncio.get_event_loop()
+    _api_sem = asyncio.Semaphore(1)  # 1 seul appel API simultané max
 
     while True:
         try:
-            results = await loop.run_in_executor(None, get_latest_results)
+            async with _api_sem:
+                results = await asyncio.wait_for(
+                    loop.run_in_executor(None, get_latest_results),
+                    timeout=12  # 12s max — libère le thread même si requests freeze
+                )
 
             if results:
                 last_api_success_time = datetime.now()
@@ -6478,7 +6400,6 @@ async def cmd_help(event):
         f"**📊 Bilans:**\n"
         f"`/bilan` — Bilan actuel (auto: 00h,04h,08h,12h,16h,20h)\n"
         f"`/bilan now` — Envoyer le bilan maintenant\n"
-        f"`/emploi` — Mode d'emploi automatique\n"
         f"`/b` — Seuils B par costume\n\n"
         f"🤖 Baccarat AI | Source: 1xBet API"
     )
@@ -6941,144 +6862,6 @@ async def cmd_bilan(event):
         "`/bilan now` — Envoyer maintenant\n"
         "`/bilan on` — Activer\n"
         "`/bilan 0` — Désactiver"
-    )
-
-
-# ============================================================================
-# MODE D'EMPLOI AUTOMATIQUE
-# ============================================================================
-
-async def mode_emploi_loop():
-    """Envoie le mode d'emploi 3 fois par jour : matin (8h), midi (12h), soirée (22h)."""
-    # Heures cibles d'envoi (heure locale)
-    MODE_EMPLOI_HEURES = [8, 12, 22]
-    sent_today: set = set()   # Heures déjà envoyées aujourd'hui
-    last_day: int = -1        # Jour calendaire du dernier envoi (pour réarmer)
-
-    while True:
-        try:
-            await asyncio.sleep(30)
-            now = datetime.now()
-
-            # Réarmer le suivi au changement de jour
-            if now.day != last_day:
-                sent_today.clear()
-                last_day = now.day
-
-            # Vérifier si l'heure courante correspond à une heure cible (tranche de 5 min)
-            for h in MODE_EMPLOI_HEURES:
-                if now.hour == h and now.minute < 5 and h not in sent_today:
-                    sent_today.add(h)
-                    await send_mode_emploi_with_heures()
-                    logger.info(f"📋 Mode d'emploi envoyé à {h:02d}h00")
-                    break
-
-        except Exception as e:
-            logger.error(f"❌ Erreur mode_emploi_loop: {e}")
-            await asyncio.sleep(60)
-
-
-async def cmd_emploi(event):
-    """Commande /emploi — gère le mode d'emploi automatique."""
-    global mode_emploi_text, mode_emploi_interval_hours
-    if event.is_group or event.is_channel:
-        return
-    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
-        await event.respond("🔒 Admin uniquement")
-        return
-
-    raw = event.message.message.strip()
-    parts = raw.split(None, 1)  # max 2 parties : commande + reste
-
-    # ── /emploi seul : affiche le statut et le texte actuel ─────────────────
-    if len(parts) == 1:
-        interval = mode_emploi_interval_hours
-        now = datetime.now()
-        if interval > 0:
-            hours_since_last = now.hour % interval
-            hours_until_next = interval - hours_since_last
-            next_heure = (now.hour + hours_until_next) % 24
-            status = f"✅ Actif — toutes les {interval}h (prochain: {next_heure:02d}:00)"
-        else:
-            status = "🔕 Désactivé"
-
-        await event.respond(
-            f"📋 **MODE D'EMPLOI AUTOMATIQUE**\n\n"
-            f"Statut: {status}\n\n"
-            f"**Commandes:**\n"
-            f"`/emploi now` — Envoyer maintenant dans le canal\n"
-            f"`/emploi interval 4` — Changer l'intervalle (ex: 4h)\n"
-            f"`/emploi interval 0` — Désactiver\n"
-            f"`/emploi set [texte]` — Remplacer le texte\n"
-            f"`/emploi reset` — Restaurer le texte par défaut\n\n"
-            f"**Texte actuel (aperçu) :**\n"
-            f"_{mode_emploi_text[:300]}{'…' if len(mode_emploi_text) > 300 else ''}_",
-            parse_mode='markdown'
-        )
-        return
-
-    sub = parts[1].strip()
-
-    # ── /emploi now ──────────────────────────────────────────────────────────
-    if sub.lower() == 'now':
-        entity = await resolve_channel(PREDICTION_CHANNEL_ID)
-        if entity:
-            await client.send_message(entity, mode_emploi_text, parse_mode='markdown')
-        await event.respond("✅ Mode d'emploi envoyé dans le canal.")
-        return
-
-    # ── /emploi reset ─────────────────────────────────────────────────────────
-    if sub.lower() == 'reset':
-        mode_emploi_text = MODE_EMPLOI_DEFAULT
-        await event.respond("🔄 Mode d'emploi réinitialisé au texte par défaut.")
-        return
-
-    # ── /emploi interval [N] ──────────────────────────────────────────────────
-    if sub.lower().startswith('interval'):
-        sub_parts = sub.split()
-        if len(sub_parts) < 2:
-            await event.respond("❌ Usage: `/emploi interval [1-24]` ou `/emploi interval 0` pour désactiver")
-            return
-        try:
-            val = int(sub_parts[1])
-            if val < 0 or val > 24:
-                await event.respond("❌ Intervalle entre 0 et 24 heures.")
-                return
-            mode_emploi_interval_hours = val
-            if val == 0:
-                await event.respond("🔕 Mode d'emploi automatique désactivé.")
-            else:
-                now = datetime.now()
-                hours_until_next = val - (now.hour % val) if val > 0 else 0
-                next_h = (now.hour + hours_until_next) % 24
-                await event.respond(
-                    f"✅ Mode d'emploi toutes les **{val}h**.\n"
-                    f"Prochain envoi: **{next_h:02d}:00**"
-                )
-        except ValueError:
-            await event.respond("❌ Valeur invalide. Exemple: `/emploi interval 4`")
-        return
-
-    # ── /emploi set [texte] ───────────────────────────────────────────────────
-    if sub.lower().startswith('set '):
-        new_text = sub[4:].strip()
-        if len(new_text) < 10:
-            await event.respond("❌ Texte trop court (minimum 10 caractères).")
-            return
-        mode_emploi_text = new_text
-        await event.respond(
-            f"✅ Nouveau texte enregistré ({len(new_text)} caractères).\n"
-            f"Utilisez `/emploi now` pour l'envoyer immédiatement."
-        )
-        return
-
-    await event.respond(
-        "❌ Commande inconnue.\n"
-        "`/emploi` — Voir statut\n"
-        "`/emploi now` — Envoyer maintenant\n"
-        "`/emploi interval 4` — Toutes les 4h\n"
-        "`/emploi set [texte]` — Changer le texte\n"
-        "`/emploi reset` — Texte par défaut"
     )
 
 
@@ -8339,10 +8122,6 @@ async def handle_callback(event):
             await cmd_stats(_fake_ev(cid, '/stats'))
 
         # ── Outils ────────────────────────────────────────────────────────────
-        elif data == 'em_v':
-            await event.answer("📖 Génération…")
-            await cmd_emploi(_fake_ev(cid, '/emploi'))
-
         elif data == 'bv':
             await event.answer("💰 Chargement…")
             await cmd_b(_fake_ev(cid, '/b'))
@@ -8535,7 +8314,6 @@ def setup_handlers():
     client.add_event_handler(cmd_perdus,    events.NewMessage(pattern=r'^/perdus$'))
     client.add_event_handler(cmd_bilan,     events.NewMessage(pattern=r'^/bilan'))
     client.add_event_handler(cmd_b,         events.NewMessage(pattern=r'^/b($|\s)'))
-    client.add_event_handler(cmd_emploi,    events.NewMessage(pattern=r'^/emploi'))
     client.add_event_handler(cmd_compteur2, events.NewMessage(pattern=r'^/compteur2'))
     client.add_event_handler(cmd_compteur4, events.NewMessage(pattern=r'^/compteur4'))
     client.add_event_handler(cmd_compteur5, events.NewMessage(pattern=r'^/compteur5'))
@@ -8554,9 +8332,19 @@ def setup_handlers():
 async def start_bot():
     global client, prediction_channel_ok
 
-    session = os.getenv('TELEGRAM_SESSION', '')
+    # ── Initialiser PostgreSQL en premier pour charger la session persistée ──
+    await db.init_db()
+
+    # ── Charger la session depuis la DB (aucune variable d'environnement requise) ──
+    saved = await db.db_load_kv('bot_session')
+    session_str = saved.get('session', '') if isinstance(saved, dict) else ''
+    if session_str:
+        logger.info("🔑 Session bot chargée depuis la DB")
+    else:
+        logger.info("🔑 Aucune session en DB — nouvelle authentification avec BOT_TOKEN")
+
     client = TelegramClient(
-        StringSession(session),
+        StringSession(session_str),
         API_ID,
         API_HASH,
         connection_retries=10,
@@ -8567,11 +8355,14 @@ async def start_bot():
 
     try:
         await client.start(bot_token=BOT_TOKEN)
+
+        # ── Sauvegarder la session en DB après connexion réussie ─────────────
+        new_session = client.session.save()
+        await db.db_save_kv('bot_session', {'session': new_session})
+        logger.info("💾 Session bot sauvegardée en DB")
+
         setup_handlers()
         initialize_trackers()
-
-        # Initialiser PostgreSQL
-        await db.init_db()
 
         # Charger données persistantes depuis PostgreSQL (avec fallback JSON)
         await load_compteur4_data()
@@ -8594,7 +8385,6 @@ async def start_bot():
                 if pred_entity:
                     prediction_channel_ok = True
                     logger.info(f"✅ Canal prédiction OK")
-                    asyncio.create_task(send_mode_emploi_with_heures())  # Envoi au démarrage
                     asyncio.create_task(send_heures_favorables_simple())  # Heures favorables au démarrage
             except Exception as e:
                 logger.error(f"❌ Erreur canal prédiction: {e}")
@@ -8603,8 +8393,8 @@ async def start_bot():
         return True
 
     except (AuthKeyError, SessionExpiredError) as e:
-        logger.error(f"❌ Session Telegram invalide ou expirée: {e}")
-        logger.error("❌ La variable TELEGRAM_SESSION doit être régénérée sur ce serveur.")
+        logger.error(f"❌ Session invalide ou expirée: {e} — suppression et retry au prochain démarrage")
+        await db.db_save_kv('bot_session', {'session': ''})
         return False
     except Exception as e:
         logger.error(f"❌ Erreur démarrage: {e}")
@@ -8642,7 +8432,6 @@ async def main():
                 asyncio.create_task(heures_favorables_loop())
                 asyncio.create_task(heures_favorables_countdown_loop())
                 asyncio.create_task(restore_countdown_panel_if_needed())
-                asyncio.create_task(mode_emploi_loop())
                 asyncio.create_task(compteur9_reset_loop())
                 background_started = True
 
@@ -8661,17 +8450,10 @@ async def main():
             logger.info("Arrêt manuel demandé.")
             break
         except (AuthKeyError, SessionExpiredError) as e:
-            logger.error(f"❌ Session Telegram invalide: {e}")
-            logger.error("❌ TELEGRAM_SESSION invalide sur ce serveur — arrêt définitif.")
-            if ADMIN_ID:
-                try:
-                    await client.send_message(ADMIN_ID,
-                        "🚨 **BOT ARRÊTÉ** — Session Telegram invalide.\n"
-                        "La variable `TELEGRAM_SESSION` doit être régénérée.",
-                        parse_mode='markdown')
-                except Exception:
-                    pass
-            break  # session invalide → inutile de réessayer
+            logger.error(f"❌ Session expirée: {e} — réinitialisation et retry dans 30s")
+            await db.db_save_kv('bot_session', {'session': ''})
+            await asyncio.sleep(30)
+            continue
         except Exception as e:
             logger.error(f"❌ Erreur boucle principale: {e} — reconnexion dans {retry_delay}s")
 
