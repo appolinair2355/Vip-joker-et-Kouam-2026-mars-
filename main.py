@@ -5240,23 +5240,24 @@ async def auto_watchdog_task():
 async def keep_alive_task():
     """
     Anti-spin-down pour Render.com (plan gratuit).
-    Ping le propre endpoint /health toutes les 4 minutes pour maintenir le service actif.
+    Ping le propre endpoint /health toutes les 3 minutes pour maintenir le service actif.
+    Premier ping immédiat au démarrage (pas d'attente initiale).
     Utilise RENDER_EXTERNAL_URL si disponible, sinon localhost.
     """
     ping_url = f"{RENDER_EXTERNAL_URL}/health" if RENDER_EXTERNAL_URL else f"http://localhost:{PORT}/health"
-    logger.info(f"💓 Keep-alive démarré → {ping_url} (toutes les 4 min)")
+    logger.info(f"💓 Keep-alive démarré → {ping_url} (toutes les 3 min)")
 
     while True:
-        await asyncio.sleep(240)  # 4 minutes
         try:
             async with _aiohttp.ClientSession() as session:
-                async with session.get(ping_url, timeout=_aiohttp.ClientTimeout(total=10)) as resp:
+                async with session.get(ping_url, timeout=_aiohttp.ClientTimeout(total=15)) as resp:
                     if resp.status == 200:
                         logger.debug("💓 Keep-alive OK")
                     else:
                         logger.warning(f"⚠️ Keep-alive: status {resp.status}")
         except Exception as e:
             logger.debug(f"Keep-alive ping ignoré: {e}")
+        await asyncio.sleep(180)  # 3 minutes — ping d'abord, attente ensuite
 
 async def perform_full_reset(reason: str):
     global pending_predictions, last_prediction_time

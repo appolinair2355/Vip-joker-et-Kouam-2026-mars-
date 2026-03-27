@@ -43,7 +43,7 @@ PREDICTION_CHANNEL_ID = int(os.environ.get("PREDICTION_CHANNEL_ID") or -10033298
 # ============================================================================
 
 PORT                = int(os.environ.get("PORT") or 10000)
-RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL") or "https://vip-joker-et-kouam-2026-mars.onrender.com"
+RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL") or "https://vip-joker-et-kouam-2026-mars-i9hq.onrender.com"
 
 # ============================================================================
 # CONFIGURATION COSTUMES
