@@ -10,6 +10,7 @@ from typing import List, Optional, Dict, Set, Tuple
 from datetime import datetime, timedelta, timezone
 from telethon import TelegramClient, events, utils
 from telethon.sessions import StringSession
+from telethon.tl.types import UpdateMessageReactions
 from telethon.errors import (
     ChatWriteForbiddenError, UserBannedInChannelError,
     AuthKeyError, SessionExpiredError, UserDeactivatedBanError
@@ -55,6 +56,8 @@ if not BOT_TOKEN:
 # ============================================================================
 
 pending_predictions: Dict[int, dict] = {}
+canal_pred_msg_ids: Dict[int, int] = {}   # {telegram_msg_id → game_number} — suivi réactions canal
+notified_reactions: Set[tuple] = set()    # {(msg_id, user_id, emoji)} déjà notifiés
 current_game_number = 0
 last_prediction_time: Optional[datetime] = None
 prediction_channel_ok = False
@@ -93,6 +96,8 @@ bilan_1440_sent: bool = False  # Évite le double envoi au jeu #1440
 
 # Heures favorables automatique vers le canal
 heures_favorables_active: bool = True  # Annonce toutes les 3h pile
+heures_fav_countdown_msg_id: Optional[int] = None       # ID du message compte à rebours en cours
+heures_fav_countdown_task: Optional[asyncio.Task] = None  # Task de mise à jour du countdown
 
 comparaison_nb_jours: int = 3          # Nombre de jours à comparer (modifiable par admin)
 
@@ -1545,6 +1550,206 @@ async def heures_favorables_loop():
             await asyncio.sleep(60)
 
 
+# ── Compte à rebours heures favorables ──────────────────────────────────────
+
+def _build_countdown_panel(interval_str: str, minutes_left: int,
+                            total_minutes: int, blink_state: bool = False) -> str:
+    """
+    Génère le panneau visuel bleu de compte à rebours pour le canal.
+    Coins colorés selon la fraction de temps ÉCOULÉ :
+      0–25%  → 🟦 bleu (aucun coin coloré)
+      25–50% → 🟢 vert
+      50–75% → 🟡 jaune
+      75%+   → 🔴 rouge
+    'blink_state' alterne l'affichage pour simuler le clignotement.
+    """
+    elapsed_frac = 1.0 - (minutes_left / total_minutes) if total_minutes > 0 else 1.0
+
+    if elapsed_frac < 0.25:
+        corner = "🟦"
+    elif elapsed_frac < 0.50:
+        corner = "🟢" if not blink_state else "⬜"
+    elif elapsed_frac < 0.75:
+        corner = "🟡" if not blink_state else "⬜"
+    else:
+        corner = "🔴" if not blink_state else "⬜"
+
+    h, m = divmod(minutes_left, 60)
+    if h > 0 and m > 0:
+        temps = f"{h}h {m:02d}min"
+    elif h > 0:
+        temps = f"{h}h"
+    else:
+        temps = f"{m}min"
+
+    panel = (
+        f"{corner}🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦{corner}\n"
+        f"🟦                              🟦\n"
+        f"🟦   ⏰ **HEURE FAVORABLE**   🟦\n"
+        f"🟦   🕐 _{interval_str}_   🟦\n"
+        f"🟦   🇨🇮 _(heure Côte d'Ivoire)_   🟦\n"
+        f"🟦   ⏳ Dans **{temps}**   🟦\n"
+        f"🟦                              🟦\n"
+        f"{corner}🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦{corner}"
+    )
+    return panel
+
+
+async def _heures_fav_countdown_runner(msg_id: int, canal_entity,
+                                        interval_str: str,
+                                        start_minute: int, total_minutes: int):
+    """
+    Tâche de fond : met à jour le panneau de compte à rebours toutes les 5 min.
+    - Supprime le message quand l'heure favorable commence.
+    - Supprime aussi si 30 min max ont été atteintes.
+    """
+    global heures_fav_countdown_msg_id, heures_fav_countdown_task
+    CHECK_INTERVAL = 5 * 60      # mise à jour toutes les 5 min
+    MAX_AGE        = 30 * 60     # 30 min maximum
+    blink_state    = False
+    start_time     = datetime.now()
+
+    while True:
+        await asyncio.sleep(CHECK_INTERVAL)
+        try:
+            now = datetime.now()
+            now_min   = now.hour * 60 + now.minute
+            remaining = (start_minute - now_min) % (24 * 60)
+            elapsed_sec = (now - start_time).total_seconds()
+
+            # Supprimer si heure arrivée ou 30 min écoulées
+            if remaining <= 0 or elapsed_sec >= MAX_AGE:
+                try:
+                    await client.delete_messages(canal_entity, [msg_id])
+                    logger.info(f"🟦 Countdown heure favorable supprimé (arrivé ou expiré)")
+                except Exception:
+                    pass
+                heures_fav_countdown_msg_id = None
+                heures_fav_countdown_task   = None
+                break
+
+            blink_state = not blink_state
+            panel = _build_countdown_panel(interval_str, remaining, total_minutes, blink_state)
+            await client.edit_message(canal_entity, msg_id, panel, parse_mode='markdown')
+            logger.debug(f"🟦 Countdown mis à jour : {remaining}min restantes")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.debug(f"⚠️ Countdown update: {e}")
+            break
+
+    heures_fav_countdown_task = None
+
+
+async def heures_favorables_countdown_loop():
+    """
+    Vérifie toutes les 30 min si une heure favorable démarre dans l'heure.
+    Si oui, envoie un panneau compte à rebours dans le canal + détails admin en privé.
+    Annulation automatique du countdown précédent si un nouveau est détecté.
+    """
+    global heures_fav_countdown_msg_id, heures_fav_countdown_task
+
+    while True:
+        try:
+            await asyncio.sleep(30 * 60)   # vérifier toutes les 30 min
+
+            if not heures_favorables_active or not PREDICTION_CHANNEL_ID:
+                continue
+
+            _total = sum(hourly_game_count[h] for h in range(24))
+            if _total < 100:
+                continue
+            favorables = compute_heures_favorables()
+            if not favorables:
+                continue
+
+            now      = datetime.now()
+            now_min  = now.hour * 60 + now.minute
+            fav_heures = [e['heure'] for e in favorables]
+
+            # Chercher une heure favorable qui commence dans les 5 à 60 min
+            target_heure = None
+            for h in sorted(fav_heures):
+                target_min = h * 60
+                delta = (target_min - now_min) % (24 * 60)
+                if 5 <= delta <= 60:
+                    target_heure = h
+                    break
+
+            if target_heure is None:
+                continue
+
+            # Si un countdown est déjà actif pour la même heure → ignorer
+            if heures_fav_countdown_msg_id is not None:
+                continue
+
+            # Calculer l'intervalle complet (heures consécutives favorables)
+            fav_heures_sorted = sorted(fav_heures)
+            idx = fav_heures_sorted.index(target_heure) if target_heure in fav_heures_sorted else -1
+            grp_start = target_heure
+            grp_end   = target_heure + 1
+            if idx >= 0:
+                for hh in fav_heures_sorted[idx + 1:]:
+                    if hh == grp_end:
+                        grp_end = hh + 1
+                    else:
+                        break
+            interval_str = f"{grp_start:02d}h00 → {grp_end:02d}h00"
+
+            start_minute  = target_heure * 60
+            minutes_left  = (start_minute - now_min) % (24 * 60)
+            total_minutes = minutes_left   # on part de ce moment
+
+            # ── Notification admin (détails complets) ───────────────────────
+            if ADMIN_ID and ADMIN_ID != 0:
+                try:
+                    admin_entity = await client.get_entity(ADMIN_ID)
+                    suit_names = {'♠': 'Pique', '♥': 'Cœur', '♦': 'Carreau', '♣': 'Trèfle'}
+                    lines = [
+                        f"📈 **Heure favorable imminente**",
+                        f"⏰ Créneau : **{interval_str}** _(Côte d'Ivoire)_",
+                        f"⏳ Début dans **{minutes_left}min**\n",
+                    ]
+                    for entry in favorables:
+                        if grp_start <= entry['heure'] < grp_end:
+                            suits_str = " · ".join(
+                                f"{s['suit']} {suit_names.get(s['suit'], s['suit'])} "
+                                f"({s['pct']}%, +{s['bonus']}%)"
+                                for s in entry['suits']
+                            )
+                            lines.append(f"  🕐 **{entry['heure']:02d}h** → {suits_str}")
+                    await client.send_message(admin_entity, "\n".join(lines), parse_mode='markdown')
+                except Exception as e:
+                    logger.error(f"❌ Admin countdown heures: {e}")
+
+            # ── Panneau canal ────────────────────────────────────────────────
+            try:
+                canal_entity = await resolve_channel(PREDICTION_CHANNEL_ID)
+                if not canal_entity:
+                    continue
+                panel = _build_countdown_panel(interval_str, minutes_left, total_minutes, False)
+                sent = await client.send_message(canal_entity, panel, parse_mode='markdown')
+                heures_fav_countdown_msg_id = sent.id
+                logger.info(f"🟦 Countdown heure favorable envoyé : {interval_str} dans {minutes_left}min")
+
+                # Démarrer la tâche de mise à jour
+                if heures_fav_countdown_task and not heures_fav_countdown_task.done():
+                    heures_fav_countdown_task.cancel()
+                heures_fav_countdown_task = asyncio.create_task(
+                    _heures_fav_countdown_runner(
+                        sent.id, canal_entity, interval_str, start_minute, total_minutes
+                    )
+                )
+            except Exception as e:
+                logger.error(f"❌ Countdown canal heures: {e}")
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"❌ heures_favorables_countdown_loop: {e}")
+            await asyncio.sleep(60)
+
+
 def update_compteur4(game_number: int, player_suits: Set[str], player_cards_raw: list) -> tuple:
     """
     Met à jour Compteur4 — logique série complète (comme Compteur7 pour les absences).
@@ -2061,8 +2266,10 @@ def _c9_check_triggers() -> List[Tuple[str, str, int]]:
 
 async def send_compteur9_public(faible: str, fort: str, diff: int, game_number: int):
     """
-    Envoie une prédiction C9 en PRIVÉ À L'ADMINISTRATEUR uniquement.
-    C9 n'est jamais envoyé dans le canal de prédiction.
+    Envoie une prédiction C9 après LOSS silencieux :
+    - Admin privé : toujours (détail C9)
+    - Canal de prédiction : aussi (prédiction visible après loss)
+    C9 canal a priorité sur C2 et C11 (c9_public_firing=True).
     """
     try:
         _suit_text = {'♠': 'Pique', '♥': 'Coeur', '♦': 'Carreau', '♣': 'Trefle'}
@@ -2072,19 +2279,32 @@ async def send_compteur9_public(faible: str, fort: str, diff: int, game_number: 
             f"vs {_suit_text.get(faible, faible)}({compteur9_counts[faible]}) "
             f"ecart={diff} >= SS={compteur9_ss} — apres LOSS silencieux."
         )
-        add_prediction_to_history(pred_num, faible, [], 'compteur9', reason)
+
+        # ── 1. Notification admin privé (détail technique C9) ────────────────
         if ADMIN_ID and ADMIN_ID != 0:
             suit_names = {'♠': 'Pique', '♥': 'Cœur', '♦': 'Carreau', '♣': 'Trèfle'}
-            msg = (
-                f"🔵 **C9 — Prédiction privée** (admin uniquement)\n"
+            msg_admin = (
+                f"🔵 **C9 — Prédiction canal** (après LOSS silencieux)\n"
                 f"Jeu #{pred_num} → **{suit_names.get(faible, faible)}** {faible}\n"
                 f"_{_suit_text.get(fort, fort)}({compteur9_counts[fort]}) "
                 f"vs {_suit_text.get(faible, faible)}({compteur9_counts[faible]}) "
                 f"— écart={diff}, SS={compteur9_ss}_"
             )
             admin_entity = await client.get_entity(ADMIN_ID)
-            await client.send_message(admin_entity, msg, parse_mode='markdown')
-            logger.info(f"🔵 C9 admin privé: #{pred_num} {faible} (après LOSS silencieux)")
+            await client.send_message(admin_entity, msg_admin, parse_mode='markdown')
+            logger.info(f"🔵 C9 admin notifié: #{pred_num} {faible} (après LOSS silencieux)")
+
+        # ── 2. Envoi dans le canal de prédiction (visible aux abonnés) ───────
+        success = await send_prediction_multi_channel(
+            pred_num, faible, prediction_type='compteur9', skip_c6=True
+        )
+        if success:
+            logger.info(f"🔵 C9 prédiction canal: #{pred_num} {faible} (après LOSS silencieux)")
+        else:
+            # Fallback : ajouter en file si le canal n'est pas disponible
+            add_prediction_to_history(pred_num, faible, [], 'compteur9', reason)
+            logger.warning(f"⚠️ C9 canal indisponible, prédiction #{pred_num} en file")
+
     except Exception as e:
         logger.error(f"❌ Erreur send_compteur9_public: {e}")
 
@@ -2153,26 +2373,37 @@ async def load_prediction_history():
     Charge l'historique des prédictions depuis PostgreSQL dans la liste
     prediction_history en mémoire. Normalise les anciens statuts 'win'/'loss'
     vers 'gagne_rN'/'perdu' pour la compatibilité.
+    Remplit aussi canal_pred_msg_ids pour le suivi des réactions sur toutes les
+    prédictions (y compris les anciennes).
     """
-    global prediction_history
+    global prediction_history, canal_pred_msg_ids
     try:
         rows = await db.db_load_prediction_history(limit=500)
         if not rows:
             return
         normalized = []
+        loaded_msg_ids = 0
         for entry in rows:
             status = entry.get('status', '')
-            # Normalisation des anciens statuts du seed initial
             if status == 'win':
                 level = entry.get('rattrapage_level', 0) or 0
                 entry['status'] = f'gagne_r{level}'
             elif status == 'loss':
                 entry['status'] = 'perdu'
             normalized.append(entry)
+            # Reconstruire canal_pred_msg_ids depuis la DB (réactions sur anciennes prédictions)
+            mid = entry.get('canal_message_id')
+            if mid:
+                canal_pred_msg_ids[int(mid)] = entry['predicted_game']
+                loaded_msg_ids += 1
         prediction_history = normalized
         wins   = sum(1 for p in normalized if p['status'].startswith('gagne'))
         losses = sum(1 for p in normalized if p['status'] == 'perdu')
-        logger.info(f"📂 Prediction history chargée: {len(normalized)} entrées ({wins} gagnées, {losses} perdues)")
+        logger.info(
+            f"📂 Prediction history chargée: {len(normalized)} entrées "
+            f"({wins} gagnées, {losses} perdues) | "
+            f"{loaded_msg_ids} message_id(s) chargés pour suivi réactions"
+        )
     except Exception as e:
         logger.error(f"❌ Erreur load_prediction_history: {e}")
 
@@ -3684,7 +3915,9 @@ async def send_prediction_multi_channel(game_number: int, suit: str, prediction_
             last_prediction_time = datetime.now()
             pending_predictions[game_number]['message_id'] = msg_id
             pending_predictions[game_number]['status'] = 'en_cours'
+            canal_pred_msg_ids[msg_id] = game_number
             add_prediction_to_history(game_number, suit, [game_number, game_number + 1, game_number + 2], prediction_type, queued_reason)
+            db.db_schedule(db.db_set_prediction_message_id(game_number, suit, msg_id))
             success = True
             logger.info(f"✅ Prédiction #{game_number} {suit} envoyée ({prediction_type})")
             # Démarrer l'animation dès l'envoi
@@ -4356,6 +4589,14 @@ async def send_bilan_and_reset_at_1440():
 
     # ⚠️ perdu_events N'EST JAMAIS EFFACÉ — comparaison inter-journées préservée
 
+    # Données horaires (heures favorables) : reset quotidien pour que les heures
+    # reflètent le JOUR ACTUEL et non l'historique cumulé de tous les jours
+    global hourly_suit_data, hourly_game_count
+    hourly_suit_data  = {h: {'♠': 0, '♥': 0, '♦': 0, '♣': 0} for h in range(24)}
+    hourly_game_count = {h: 0 for h in range(24)}
+    save_hourly_data()
+    logger.info("🔄 Données horaires remises à 0 (heures favorables recalculées demain)")
+
     logger.info("🔄 Reset complet du stock #1440 — configs admin et perdu_events préservés.")
 
     # ── ÉTAPE 5 : Notification de reset → admin ──────────────────────────────
@@ -4435,10 +4676,13 @@ async def process_game_result(game_number: int, player_suits: Set[str], player_c
             asyncio.create_task(send_compteur4_pdf())
 
         # Compteur5: détecter les présences consécutives de 10
+        # PRIORITÉ C9 : si C9 public fire ce jeu, l'alerte C5 est différée (C9 > C5)
         triggered5 = update_compteur5(game_number, player_suits, player_cards_raw)
-        if triggered5:
+        if triggered5 and not c9_public_firing:
             asyncio.create_task(send_compteur5_alert(triggered5, game_number))
             asyncio.create_task(send_compteur5_pdf())
+        elif triggered5 and c9_public_firing:
+            logger.info(f"⏭️ C5 alerte différée jeu #{game_number} (C9 public prioritaire)")
 
         # Compteur6: mettre à jour le compteur d'apparitions par costume
         update_compteur6(player_suits)
@@ -4486,13 +4730,19 @@ async def process_game_result(game_number: int, player_suits: Set[str], player_c
         # ── Pré-détection C11 : C11 a-t-il priorité sur ce jeu ? ────────────
         # C11 se déclenche quand game_number == game_number_perdu_hier - PREDICTION_DF
         # Si oui, C2 est bloqué (C11 prioritaire, indépendant de C2 et C6)
+        # MAIS C9 public > C11 : si C9 envoie ce jeu, C11 est aussi bloqué
         c11_firing = False
-        if compteur11_perdu_hier and is_finished:
+        if compteur11_perdu_hier and is_finished and not c9_public_firing:
             for entry in compteur11_perdu_hier:
                 trigger_at = entry['game_number'] - PREDICTION_DF
                 if game_number == trigger_at:
                     c11_firing = True
                     break
+        elif c9_public_firing and compteur11_perdu_hier and is_finished:
+            for entry in compteur11_perdu_hier:
+                trigger_at = entry['game_number'] - PREDICTION_DF
+                if game_number == trigger_at:
+                    logger.info(f"⏭️ C11 bloqué jeu #{game_number} (C9 public prioritaire)")
         # ────────────────────────────────────────────────────────────────────
 
         # Prédictions Compteur2 — bloquées si C9 envoie publiquement OU si C11 prioritaire
@@ -4513,7 +4763,8 @@ async def process_game_result(game_number: int, player_suits: Set[str], player_c
     # ── Compteur 11 : perdu hier → prédit aujourd'hui ───────────────────────
     # Déclenchement à game_number_perdu_hier - PREDICTION_DF (respecte l'écart df)
     # C11 est indépendant : priorité sur C2, bypass C6
-    if compteur11_perdu_hier and is_finished:
+    # PRIORITÉ : C9 public > C11. Si C9 envoie ce jeu, C11 est bloqué.
+    if compteur11_perdu_hier and is_finished and not c9_public_firing:
         for entry in compteur11_perdu_hier:
             trigger_at = entry['game_number'] - PREDICTION_DF
             if game_number == trigger_at:
@@ -7003,6 +7254,238 @@ async def cmd_favorables(event):
 
 
 # ============================================================================
+# COMMANDE /testpred — envoie une prédiction test sur le canal
+# ============================================================================
+
+async def cmd_testpred(event):
+    """
+    /testpred [♠/♥/♦/♣] — Admin : envoie une prédiction test sur le canal immédiatement.
+    Utile pour vérifier que les réactions sont bien remontées.
+    """
+    if event.is_group or event.is_channel:
+        return
+    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+        await event.respond("🔒 Admin uniquement")
+        return
+    try:
+        parts = event.message.message.strip().split()
+        suit = parts[1] if len(parts) > 1 and parts[1] in ('♠', '♥', '♦', '♣') else '♠'
+        fake_game = 9999
+
+        if not PREDICTION_CHANNEL_ID:
+            await event.respond("❌ PREDICTION_CHANNEL_ID non configuré")
+            return
+
+        channel_entity = await resolve_channel(PREDICTION_CHANNEL_ID)
+        if not channel_entity:
+            await event.respond("❌ Canal inaccessible")
+            return
+
+        msg = format_prediction_message(fake_game, suit, 'en_cours', fake_game, [])
+        msg = "🧪 *[TEST]* " + msg
+        sent = await client.send_message(channel_entity, msg, parse_mode='markdown')
+        mid = sent.id
+
+        canal_pred_msg_ids[mid] = fake_game
+        # Insérer en DB pour que le message_id survive un redémarrage
+        await db.db_add_prediction_history({
+            'predicted_game': fake_game, 'suit': suit,
+            'type': 'test', 'reason': 'test manuel', 'status': 'en_cours',
+            'rattrapage_level': 0
+        })
+        await db.db_set_prediction_message_id(fake_game, suit, mid)
+
+        await event.respond(
+            f"✅ Prédiction test envoyée sur le canal\n"
+            f"👁 message_id = `{mid}` → game #{fake_game} {suit}\n"
+            f"Réagis au message dans le canal pour tester 🔔"
+        )
+    except Exception as e:
+        logger.error(f"Erreur cmd_testpred: {e}")
+        await event.respond(f"❌ Erreur: {e}")
+
+
+# ============================================================================
+# COMMANDE /verifier — test du suivi réactions
+# ============================================================================
+
+async def cmd_verifier(event):
+    """
+    /verifier — Admin : vérifie si le bot a déjà prédit et si le suivi réactions est actif.
+    Affiche les dernières prédictions avec leur message_id Telegram.
+    """
+    if event.is_group or event.is_channel:
+        return
+    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+        await event.respond("🔒 Admin uniquement")
+        return
+    try:
+        total_preds = len(prediction_history)
+        total_tracked = len(canal_pred_msg_ids)
+
+        lines = [
+            "🔍 **VÉRIFICATION — Prédictions & Réactions**\n",
+            f"📊 Total prédictions en mémoire : **{total_preds}**",
+            f"👁 Messages suivis pour réactions : **{total_tracked}**\n",
+        ]
+
+        if total_preds == 0:
+            lines.append("_Aucune prédiction trouvée. Le bot n'a pas encore prédit._")
+        else:
+            suit_names = {'♠': 'Pique', '♥': 'Cœur', '♦': 'Carreau', '♣': 'Trèfle'}
+            status_icons = {
+                'en_cours': '⏳', 'perdu': '❌', 'void': '⬜',
+            }
+            lines.append("📋 **15 dernières prédictions :**\n")
+            for p in prediction_history[:15]:
+                gn    = p.get('predicted_game', '?')
+                suit  = p.get('suit', '?')
+                st    = p.get('status', '?')
+                mid   = p.get('canal_message_id')
+                icon  = '✅' if str(st).startswith('gagne') else status_icons.get(st, '❓')
+                react = '🔔' if mid else '🔕'
+                name  = suit_names.get(suit, suit)
+                mid_str = f"msg#{mid}" if mid else "pas de msg_id"
+                lines.append(f"  {icon} #{gn} {suit} {name} — {react} {mid_str}")
+
+        lines += [
+            "",
+            f"🔔 = suivi réactions actif",
+            f"🔕 = pas encore de message_id enregistré",
+        ]
+        await event.respond("\n".join(lines), parse_mode='markdown')
+    except Exception as e:
+        logger.error(f"Erreur cmd_verifier: {e}")
+        await event.respond(f"❌ Erreur: {e}")
+
+
+# ============================================================================
+# RÉACTIONS AUX MESSAGES DE PRÉDICTION
+# ============================================================================
+
+REACTIONS_SUIVIES = {
+    # ── Réactions Telegram officielles ──────────────────────────────────────
+    '👍', '👎', '❤', '❤️', '🔥', '🥰', '👏', '😁', '🤔', '🤯',
+    '😱', '🤬', '😢', '🎉', '🤩', '🤮', '💩', '🙏', '👌', '🕊',
+    '🤡', '🥱', '🥴', '😍', '🐳', '❤‍🔥', '🌚', '🌭', '💯', '🤣',
+    '⚡', '🍌', '🏆', '💔', '🤨', '😐', '🍓', '🍾', '💋', '🖕',
+    '😈', '😴', '😭', '🤓', '👻', '🎃', '🙈', '😇', '😨', '🤝',
+    '✍', '🤗', '🫡', '🎅', '🎄', '☃', '💅', '🤪', '🗿', '🆒',
+    '💘', '🙉', '🦄', '😘', '💊', '🙊', '😎', '👾', '😡', '🥳',
+    '🫠', '😤', '🤭', '🥺', '😏', '🙄', '😒', '🤑', '😜', '😝',
+    '😛', '😋', '🤤', '🤢', '🤧', '🥵', '🥶', '😵', '🤠', '🤥',
+    '🤫', '🧐', '😬', '😳', '😞', '😔', '😟', '😕', '😣', '😖',
+    # ── Variantes peau claire (🏻) ───────────────────────────────────────
+    '👍🏻', '👎🏻', '👏🏻', '🙏🏻', '👌🏻', '✍🏻', '🤝🏻', '💅🏻', '🤗🏻',
+    '👊🏻', '✊🏻', '🤛🏻', '🤜🏻', '🤞🏻', '🖖🏻', '🤙🏻', '💪🏻', '🦾',
+    # ── Variantes peau (🏼🏽🏾🏿) ─────────────────────────────────────────
+    '👍🏼', '👍🏽', '👍🏾', '👍🏿',
+    '👎🏼', '👎🏽', '👎🏾', '👎🏿',
+    '👏🏼', '👏🏽', '👏🏾', '👏🏿',
+    '🙏🏼', '🙏🏽', '🙏🏾', '🙏🏿',
+    '👌🏼', '👌🏽', '👌🏾', '👌🏿',
+    # ── Symboles et divers ───────────────────────────────────────────────
+    '💯', '✅', '❌', '‼️', '⁉️', '💢', '💥', '💫', '⭐', '🌟',
+    '🎯', '🎰', '🃏', '🀄', '♠️', '♥️', '♦️', '♣️', '🃁', '🂡',
+    '💰', '💵', '💸', '🤑', '💎', '👑', '🏅', '🥇', '🎖', '🎗',
+    # ── Réactions spéciales et gestuelle ───────────────────────────────
+    '🤷‍♂️', '🤷‍♀️', '🤷', '😚', '🫶', '🫶🏻', '🫶🏽', '🫶🏿',
+    '🙌', '🙌🏻', '🙌🏽', '🙌🏿', '🫂', '💝', '💖', '💗', '💓', '💞',
+}
+
+async def on_reaction_event(update):
+    """Notifie l'admin quand un membre réagit à un message de prédiction du canal."""
+    global notified_reactions
+    try:
+        if not isinstance(update, UpdateMessageReactions):
+            return
+        msg_id = update.msg_id
+        logger.info(f"🔔 UpdateMessageReactions reçu → msg_id={msg_id} | suivi={msg_id in canal_pred_msg_ids} | dict_size={len(canal_pred_msg_ids)}")
+        if msg_id not in canal_pred_msg_ids:
+            return
+        game_number = canal_pred_msg_ids[msg_id]
+
+        reactions = update.reactions
+        if not reactions:
+            return
+
+        # ── Cas 1 : recent_reactors disponible (groupes / petits canaux) ───
+        recent = getattr(reactions, 'recent_reactors', None) or []
+        if recent:
+            for reactor in recent:
+                try:
+                    reaction_obj = getattr(reactor, 'reaction', None)
+                    emoji = getattr(reaction_obj, 'emoticon', None)
+                    if not emoji or emoji not in REACTIONS_SUIVIES:
+                        continue
+                    peer = getattr(reactor, 'peer_id', None)
+                    user_id = getattr(peer, 'user_id', None)
+                    if not user_id:
+                        continue
+                    key = (msg_id, user_id, emoji)
+                    if key in notified_reactions:
+                        continue
+                    notified_reactions.add(key)
+                    if len(notified_reactions) > 2000:
+                        notified_reactions = set(list(notified_reactions)[-1000:])
+                    try:
+                        user = await client.get_entity(user_id)
+                        first = getattr(user, 'first_name', '') or ''
+                        last  = getattr(user, 'last_name',  '') or ''
+                        name  = f"{first} {last}".strip() or f"@{getattr(user, 'username', user_id)}"
+                    except Exception:
+                        name = f"ID#{user_id}"
+                    if ADMIN_ID and ADMIN_ID != 0:
+                        admin_entity = await client.get_entity(ADMIN_ID)
+                        await client.send_message(
+                            admin_entity,
+                            f"🔔 **Réaction détectée**\n"
+                            f"👤 **{name}** a réagi avec **{emoji}**\n"
+                            f"📌 Prédiction jeu **#{game_number}**",
+                            parse_mode='markdown'
+                        )
+                        logger.info(f"🔔 Réaction {emoji} de {name} sur prédiction #{game_number}")
+                except Exception as e:
+                    logger.info(f"⚠️ Réaction ignorée: {e}")
+            return
+
+        # ── Cas 2 : canal broadcast — recent_reactors vide, on notifie par comptage ──
+        results = getattr(reactions, 'results', None) or []
+        summary_parts = []
+        for r in results:
+            reaction_obj = getattr(r, 'reaction', None)
+            emoji = getattr(reaction_obj, 'emoticon', None)
+            count = getattr(r, 'count', 0)
+            if emoji and count > 0 and emoji in REACTIONS_SUIVIES:
+                summary_parts.append(f"{emoji} ×{count}")
+
+        if not summary_parts:
+            return
+
+        # Clé de déduplication basée sur l'état total des réactions
+        state_key = (msg_id, tuple(sorted(summary_parts)))
+        if state_key in notified_reactions:
+            return
+        notified_reactions.add(state_key)
+        if len(notified_reactions) > 2000:
+            notified_reactions = set(list(notified_reactions)[-1000:])
+
+        if ADMIN_ID and ADMIN_ID != 0:
+            admin_entity = await client.get_entity(ADMIN_ID)
+            await client.send_message(
+                admin_entity,
+                f"🔔 **Réaction sur canal** (broadcast)\n"
+                f"📌 Prédiction jeu **#{game_number}**\n"
+                f"{'  '.join(summary_parts)}",
+                parse_mode='markdown'
+            )
+            logger.info(f"🔔 Réaction canal sur prédiction #{game_number}: {' '.join(summary_parts)}")
+
+    except Exception as e:
+        logger.info(f"⚠️ on_reaction_event: {e}")
+
+
+# ============================================================================
 # SETUP ET DÉMARRAGE
 # ============================================================================
 
@@ -7032,6 +7515,9 @@ def setup_handlers():
     client.add_event_handler(cmd_compteur9, events.NewMessage(pattern=r'^/compteur9'))
     client.add_event_handler(cmd_comparaison, events.NewMessage(pattern=r'^/comparaison'))
     client.add_event_handler(cmd_favorables,  events.NewMessage(pattern=r'^/favorables'))
+    client.add_event_handler(cmd_testpred,    events.NewMessage(pattern=r'^/testpred'))
+    client.add_event_handler(cmd_verifier,    events.NewMessage(pattern=r'^/verifier$'))
+    client.add_event_handler(on_reaction_event, events.Raw(UpdateMessageReactions))
 
 
 async def start_bot():
@@ -7118,6 +7604,7 @@ async def main():
                 asyncio.create_task(keep_alive_task())         # anti spin-down Render.com
                 asyncio.create_task(bilan_loop())
                 asyncio.create_task(heures_favorables_loop())
+                asyncio.create_task(heures_favorables_countdown_loop())
                 asyncio.create_task(mode_emploi_loop())
                 asyncio.create_task(compteur9_reset_loop())
                 background_started = True

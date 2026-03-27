@@ -109,6 +109,10 @@ async def _create_tables():
                 UNIQUE (predicted_game, suit)
             )
         """)
+        await conn.execute("""
+            ALTER TABLE prediction_history
+            ADD COLUMN IF NOT EXISTS canal_message_id BIGINT DEFAULT NULL
+        """)
     logger.info("📋 Tables PostgreSQL prêtes")
 
 
@@ -358,7 +362,8 @@ async def db_load_prediction_history(limit: int = 200) -> List[Dict]:
         async with _pool.acquire() as conn:
             rows = await conn.fetch("""
                 SELECT predicted_game, suit, prediction_type, reason, status,
-                       rattrapage_level, predicted_at, verified_at, verified_by_game
+                       rattrapage_level, predicted_at, verified_at, verified_by_game,
+                       canal_message_id
                 FROM prediction_history
                 ORDER BY predicted_at DESC
                 LIMIT $1
@@ -366,18 +371,34 @@ async def db_load_prediction_history(limit: int = 200) -> List[Dict]:
         result = []
         for row in rows:
             result.append({
-                'predicted_game':  row['predicted_game'],
-                'suit':            row['suit'],
-                'type':            row['prediction_type'],
-                'reason':          row['reason'],
-                'status':          row['status'],
-                'rattrapage_level':row['rattrapage_level'],
-                'predicted_at':    row['predicted_at'],
-                'verified_at':     row['verified_at'],
-                'verified_by_game':row['verified_by_game'],
+                'predicted_game':    row['predicted_game'],
+                'suit':              row['suit'],
+                'type':              row['prediction_type'],
+                'reason':            row['reason'],
+                'status':            row['status'],
+                'rattrapage_level':  row['rattrapage_level'],
+                'predicted_at':      row['predicted_at'],
+                'verified_at':       row['verified_at'],
+                'verified_by_game':  row['verified_by_game'],
                 'verification_games': [],
+                'canal_message_id':  row['canal_message_id'],
             })
         return result
     except Exception as e:
         logger.error(f"❌ db_load_prediction_history: {e}")
         return []
+
+
+async def db_set_prediction_message_id(predicted_game: int, suit: str, canal_message_id: int):
+    """Met à jour le canal_message_id d'une prédiction dans l'historique."""
+    if _pool is None:
+        return
+    try:
+        async with _pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE prediction_history
+                SET canal_message_id = $1
+                WHERE predicted_game = $2 AND suit = $3
+            """, canal_message_id, predicted_game, suit)
+    except Exception as e:
+        logger.error(f"❌ db_set_prediction_message_id: {e}")
