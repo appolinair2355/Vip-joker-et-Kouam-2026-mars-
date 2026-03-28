@@ -26,9 +26,8 @@ from config import (
     PREDICTION_CHANNEL_ID, PORT, RENDER_EXTERNAL_URL,
     ALL_SUITS, SUIT_DISPLAY, API_SILENCE_ALERT_MINUTES,
     PREDICTION_DF_DEFAULT,
-    COMPTEUR9_SS_DEFAULT,
+    GH_DEFAULT, GK_DEFAULT, B_INCREMENT_DEFAULT,
     COMPTEUR8_THRESHOLD, COMPTEUR8_DATA_FILE,
-    COMPTEUR9_DATA_FILE,
     DATABASE_URL,
 )
 import db as db
@@ -121,6 +120,11 @@ prediction_history: List[Dict] = []
 prediction_queue: List[Dict] = []
 PREDICTION_SEND_AHEAD = 2   # gardé pour compatibilité /queue affichage
 PREDICTION_DF = PREDICTION_DF_DEFAULT  # df: quand jeu N finit → prédit N+df
+
+# Offsets de prédiction C2 (modifiables par admin)
+GH: int = GH_DEFAULT          # offset pour prédire le manquant confirmé (C6 OK)
+GK: int = GK_DEFAULT          # offset pour prédire l'inverse du manquant (C6 redirige)
+B_LOSS_INCREMENT: int = B_INCREMENT_DEFAULT  # incrément du B après un PERDU
 
 # Tâches d'animation en cours (original_game → asyncio.Task)
 animation_tasks: Dict[int, asyncio.Task] = {}
@@ -244,21 +248,6 @@ hourly_suit_data:  Dict[int, Dict[str, int]] = {h: {'♠': 0, '♥': 0, '♦': 0
 hourly_game_count: Dict[int, int]            = {h: 0 for h in range(24)}
 
 # ============================================================================
-# SYSTÈME COMPTEUR9 — ACCUMULATION PAR HEURE + PRÉDICTION SUR ÉCART SS
-# Compte chaque carte du joueur (carte à carte) depuis le dernier reset horaire.
-# Reset automatique à chaque heure pile. Prédit quand écart ≥ SS.
-# ============================================================================
-compteur9_counts: Dict[str, int] = {'♠': 0, '♥': 0, '♦': 0, '♣': 0}
-compteur9_reset_time: Optional[datetime] = None       # Heure du dernier reset
-compteur9_triggered_pairs: Set = set()                # Paires (fort, faible) déjà traitées ce cycle
-compteur9_ss: int = COMPTEUR9_SS_DEFAULT              # Seuil d'écart SS (modifiable par admin)
-
-# Prédictions silencieuses : C9 prédit sans envoyer dans le canal
-# Visible uniquement via /compteur9
-compteur9_silent_history: List[Dict] = []    # Historique (max 50 entrées)
-compteur9_pending_silent: Optional[Dict] = None  # Prédiction silencieuse en cours de vérification
-compteur9_last_result: str = 'none'          # 'win' / 'loss' / 'none'
-compteur9_send_next_public: bool = False     # Après un LOSS → prochaine prédiction va dans le canal
 
 pending_input: dict = {}                     # {user_id: {'action': str, 'chat_id': int}} — saisie valeur via bouton
 
@@ -1567,6 +1556,8 @@ async def _heures_fav_countdown_runner(msg_id: int, canal_entity,
                 heures_fav_countdown_msg_id = None
                 heures_fav_countdown_task   = None
                 await _clear_active_panel()
+                # ── Immédiatement chercher la prochaine heure favorable ────────
+                asyncio.create_task(_try_send_new_countdown_panel())
                 break
 
             blink_state = not blink_state
@@ -1739,6 +1730,88 @@ async def restore_countdown_panel_if_needed():
         )
     except Exception as e:
         logger.error(f"❌ restore_countdown_panel_if_needed: {e}")
+
+
+async def _try_send_new_countdown_panel():
+    """
+    Tente d'envoyer un nouveau panneau countdown si une heure favorable est
+    imminente (entre 5 et 150 min). Appelée notamment après l'expiration d'un panel.
+    Retourne True si un nouveau panneau a été envoyé, False sinon.
+    """
+    global heures_fav_countdown_msg_id, heures_fav_countdown_task, countdown_panel_counter
+
+    if not heures_favorables_active or not PREDICTION_CHANNEL_ID:
+        return False
+    if heures_fav_countdown_msg_id is not None:
+        return False   # un panel est déjà actif
+
+    _total = sum(hourly_game_count[h] for h in range(24))
+    if _total < 50:
+        return False
+    favorables = compute_heures_favorables()
+    if not favorables:
+        return False
+
+    now     = datetime.now()
+    now_min = now.hour * 60 + now.minute
+    fav_heures = [e['heure'] for e in favorables]
+
+    target_heure = None
+    for h in sorted(fav_heures):
+        target_min = h * 60
+        delta = (target_min - now_min) % (24 * 60)
+        if 5 <= delta <= 150:
+            target_heure = h
+            break
+
+    if target_heure is None:
+        return False
+
+    fav_heures_sorted = sorted(fav_heures)
+    idx = fav_heures_sorted.index(target_heure) if target_heure in fav_heures_sorted else -1
+    grp_start = target_heure
+    grp_end   = target_heure + 1
+    if idx >= 0:
+        for hh in fav_heures_sorted[idx + 1:]:
+            if hh == grp_end:
+                grp_end = hh + 1
+            else:
+                break
+    interval_str  = f"{grp_start:02d}h00 → {grp_end:02d}h00"
+    start_minute  = target_heure * 60
+    minutes_left  = (start_minute - now_min) % (24 * 60)
+    total_minutes = minutes_left
+
+    try:
+        canal_entity = await resolve_channel(PREDICTION_CHANNEL_ID)
+        if not canal_entity:
+            return False
+        panel = _build_countdown_panel(interval_str, minutes_left, total_minutes, False)
+        sent  = await client.send_message(canal_entity, panel, parse_mode='markdown')
+        heures_fav_countdown_msg_id = sent.id
+        countdown_panel_counter += 1
+        await db.db_save_countdown_panel(
+            countdown_panel_counter, interval_str, grp_start, grp_end, minutes_left
+        )
+        await _save_active_panel(
+            countdown_panel_counter, interval_str,
+            grp_start, grp_end, start_minute, total_minutes, sent.id
+        )
+        logger.info(
+            f"🟦 Panneau #{countdown_panel_counter} envoyé (après expiration précédente) : "
+            f"{interval_str} dans {minutes_left}min"
+        )
+        if heures_fav_countdown_task and not heures_fav_countdown_task.done():
+            heures_fav_countdown_task.cancel()
+        heures_fav_countdown_task = asyncio.create_task(
+            _heures_fav_countdown_runner(
+                sent.id, canal_entity, interval_str, start_minute, total_minutes
+            )
+        )
+        return True
+    except Exception as e:
+        logger.error(f"❌ _try_send_new_countdown_panel: {e}")
+        return False
 
 
 async def heures_favorables_countdown_loop():
@@ -2252,540 +2325,6 @@ def update_compteur8(game_number: int, player_suits: Set[str]) -> List[Dict]:
 
 
 # ============================================================================
-# SYSTÈME COMPTEUR9 — ACCUMULATION HORAIRE + INTERCEPTION + PRÉDICTIONS SILENCIEUSES
-# Rôle 1 : Intercepteur — avant d'envoyer une prédiction d'un autre compteur,
-#           C9 vérifie si le costume proposé est le "fort" (SS-level) → override
-# Rôle 2 : Prédictions silencieuses — C9 prédit sans envoyer au canal ;
-#           après un LOSS → prochaine prédiction va dans le canal (si HH:mm ≤ HH:30)
-# Règle   : C9 est inactif après HH:30 (pas de prédiction, pas de silence)
-# ============================================================================
-
-def _c9_is_active() -> bool:
-    """C9 actif uniquement dans la 1ère moitié de chaque heure (HH:00 à HH:29:59)."""
-    return datetime.now().minute < 30
-
-
-def c9_get_override(proposed_suit: str) -> Optional[str]:
-    """
-    Vérifie si C9 recommande un costume différent de proposed_suit.
-    Vérifie uniquement la paire inverse de proposed_suit (♦↔♠, ♣↔♥).
-    Si proposed_suit est le fort (écart ≥ SS), retourne le faible (son inverse).
-    Retourne None si C9 n'intervient pas.
-    """
-    if not _c9_is_active():
-        return None
-    # Uniquement la paire inverse du costume proposé
-    inverse = COMPTEUR6_PAIRS.get(proposed_suit)
-    if not inverse:
-        return None
-    diff = compteur9_counts[proposed_suit] - compteur9_counts[inverse]
-    if diff >= compteur9_ss:
-        logger.info(
-            f"🔄 C9 override: {proposed_suit}({compteur9_counts[proposed_suit]}) "
-            f"→ {inverse}({compteur9_counts[inverse]}) diff={diff}"
-        )
-        return inverse
-    return None
-
-
-def _c9_add_silent(suit: str, fort: str, diff: int, game_number: int):
-    """
-    Enregistre une nouvelle prédiction silencieuse C9 (ne s'affiche que via /compteur9).
-    Une seule prédiction en attente à la fois ; pas d'écrasement si déjà en cours.
-    """
-    global compteur9_pending_silent
-    if compteur9_pending_silent is not None:
-        return  # Prédiction précédente pas encore résolue
-    compteur9_pending_silent = {
-        'game_number': game_number,
-        'target_game': game_number + 1,
-        'suit':        suit,
-        'fort':        fort,
-        'diff':        diff,
-        'result':      'pending',
-        'created_at':  datetime.now(),
-    }
-    logger.info(f"📊 C9 silent: prédit {suit} au jeu #{game_number + 1} (fort={fort}, diff={diff})")
-
-
-def _c9_verify_pending(game_number: int, player_suits: Set[str]):
-    """
-    Vérifie le résultat de la prédiction silencieuse C9 en cours.
-    Appelé à chaque jeu terminé (is_finished=True).
-    Après un LOSS → active send_next_public pour la prochaine prédiction.
-    """
-    global compteur9_pending_silent, compteur9_last_result, compteur9_send_next_public
-    global compteur9_silent_history
-    if compteur9_pending_silent is None:
-        return
-    pred = compteur9_pending_silent
-    if game_number < pred['target_game']:
-        return  # Pas encore le jeu cible
-    # Vérifier
-    if pred['suit'] in player_suits:
-        pred['result'] = 'win'
-        compteur9_last_result = 'win'
-    else:
-        pred['result'] = 'loss'
-        compteur9_last_result = 'loss'
-        compteur9_send_next_public = True  # Prochaine prédiction → canal
-    pred['resolved_at'] = datetime.now()
-    compteur9_silent_history.append(dict(pred))
-    if len(compteur9_silent_history) > 50:
-        compteur9_silent_history = compteur9_silent_history[-50:]
-    compteur9_pending_silent = None
-    logger.info(
-        f"📊 C9 silent #{pred['target_game']}: {pred['suit']} → {pred['result'].upper()}"
-        + (" [send_next=ON]" if compteur9_send_next_public else "")
-    )
-
-    # ── Enregistrer dans prediction_history pour que /raison le montre ────────
-    _suit_text = {'♠': 'Pique', '♥': 'Coeur', '♦': 'Carreau', '♣': 'Trefle'}
-    suite_vers_canal = " Perdu → prochaine prediction envoyee dans le canal." if pred['result'] == 'loss' else ""
-    reason_c9 = (
-        f"C9 silencieux: paire {_suit_text.get(pred['fort'], pred['fort'])}"
-        f"({compteur9_counts.get(pred['fort'], '?')}) vs "
-        f"{_suit_text.get(pred['suit'], pred['suit'])}"
-        f"({compteur9_counts.get(pred['suit'], '?')}) "
-        f"ecart={pred['diff']} >= SS={compteur9_ss}."
-        + suite_vers_canal
-    )
-    add_prediction_to_history(
-        pred['target_game'], pred['suit'],
-        [pred['target_game']], 'compteur9_silent', reason_c9
-    )
-    final_status = 'gagne_r0' if pred['result'] == 'win' else 'perdu'
-    update_prediction_in_history(pred['target_game'], pred['suit'], pred['target_game'], 0, final_status)
-    # ──────────────────────────────────────────────────────────────────────────
-
-    save_compteur9_data()  # Persistance immédiate après résolution
-
-
-def update_compteur9_counts(player_cards_raw: list):
-    """Compte les cartes du joueur dans C9 (TOUJOURS, sans restriction horaire)."""
-    global compteur9_counts
-    for card in player_cards_raw:
-        suit = normalize_suit(card.get('S', ''))
-        if suit in compteur9_counts:
-            compteur9_counts[suit] += 1
-
-
-def _c9_check_triggers() -> List[Tuple[str, str, int]]:
-    """
-    Vérifie uniquement les paires inverses (♦↔♠ et ♣↔♥) pour les nouveaux écarts ≥ SS.
-    Retourne les nouvelles paires (fort, faible, diff) qui viennent de passer le seuil.
-    Chaque paire n'est retournée qu'une fois par cycle horaire.
-    """
-    global compteur9_triggered_pairs
-    newly = []
-    # Uniquement les paires inverses définies — pas toutes les combinaisons
-    checked_pairs = set()
-    for suit_a, suit_b in COMPTEUR6_PAIRS.items():
-        pair_key = tuple(sorted([suit_a, suit_b]))
-        if pair_key in checked_pairs:
-            continue
-        checked_pairs.add(pair_key)
-        count_a = compteur9_counts[suit_a]
-        count_b = compteur9_counts[suit_b]
-        # Déterminer fort et faible dans cette paire
-        if count_a >= count_b:
-            fort, faible, diff = suit_a, suit_b, count_a - count_b
-        else:
-            fort, faible, diff = suit_b, suit_a, count_b - count_a
-        if diff >= compteur9_ss and (fort, faible) not in compteur9_triggered_pairs:
-            compteur9_triggered_pairs.add((fort, faible))
-            newly.append((fort, faible, diff))
-            logger.info(
-                f"📊 C9: {fort}({compteur9_counts[fort]}) - "
-                f"{faible}({compteur9_counts[faible]}) = {diff} ≥ SS={compteur9_ss}"
-            )
-    return newly
-
-
-async def send_compteur9_public(faible: str, fort: str, diff: int, game_number: int):
-    """
-    Envoie une prédiction C9 après LOSS silencieux :
-    - Admin privé : toujours (détail C9)
-    - Canal de prédiction : aussi (prédiction visible après loss)
-    C9 canal a priorité sur C2 et C11 (c9_public_firing=True).
-    """
-    try:
-        _suit_text = {'♠': 'Pique', '♥': 'Coeur', '♦': 'Carreau', '♣': 'Trefle'}
-        pred_num = game_number + PREDICTION_DF
-        reason = (
-            f"C9: {_suit_text.get(fort, fort)}({compteur9_counts[fort]}) "
-            f"vs {_suit_text.get(faible, faible)}({compteur9_counts[faible]}) "
-            f"ecart={diff} >= SS={compteur9_ss} — apres LOSS silencieux."
-        )
-
-        # ── 1. Notification admin privé (détail technique C9) ────────────────
-        if ADMIN_ID and ADMIN_ID != 0:
-            suit_names = {'♠': 'Pique', '♥': 'Cœur', '♦': 'Carreau', '♣': 'Trèfle'}
-            msg_admin = (
-                f"🔵 **C9 — Prédiction canal** (après LOSS silencieux)\n"
-                f"Jeu #{pred_num} → **{suit_names.get(faible, faible)}** {faible}\n"
-                f"_{_suit_text.get(fort, fort)}({compteur9_counts[fort]}) "
-                f"vs {_suit_text.get(faible, faible)}({compteur9_counts[faible]}) "
-                f"— écart={diff}, SS={compteur9_ss}_"
-            )
-            admin_entity = await client.get_entity(ADMIN_ID)
-            await client.send_message(admin_entity, msg_admin, parse_mode='markdown')
-            logger.info(f"🔵 C9 admin notifié: #{pred_num} {faible} (après LOSS silencieux)")
-
-        # ── 2. Envoi dans le canal de prédiction (visible aux abonnés) ───────
-        success = await send_prediction_multi_channel(
-            pred_num, faible, prediction_type='compteur9', skip_c6=True
-        )
-        if success:
-            logger.info(f"🔵 C9 prédiction canal: #{pred_num} {faible} (après LOSS silencieux)")
-        else:
-            # Fallback : ajouter en file si le canal n'est pas disponible
-            add_prediction_to_history(pred_num, faible, [], 'compteur9', reason)
-            logger.warning(f"⚠️ C9 canal indisponible, prédiction #{pred_num} en file")
-
-    except Exception as e:
-        logger.error(f"❌ Erreur send_compteur9_public: {e}")
-
-
-def reset_compteur9_now():
-    """Remet les compteurs C9 à zéro et vide toute l'état courant."""
-    global compteur9_counts, compteur9_triggered_pairs, compteur9_reset_time
-    global compteur9_pending_silent, compteur9_send_next_public
-    compteur9_counts          = {'♠': 0, '♥': 0, '♦': 0, '♣': 0}
-    compteur9_triggered_pairs = set()
-    compteur9_reset_time      = datetime.now()
-    # Si une prédiction silencieuse était en cours, on la marque 'void' et on l'archive
-    if compteur9_pending_silent is not None:
-        compteur9_pending_silent['result'] = 'void'
-        compteur9_pending_silent['resolved_at'] = compteur9_reset_time
-        compteur9_silent_history.append(dict(compteur9_pending_silent))
-        compteur9_pending_silent = None
-    compteur9_send_next_public = False  # Reset de la condition d'envoi public
-    logger.info(f"🔄 Compteur9 remis à 0 ({compteur9_reset_time.strftime('%H:%M')})")
-    save_compteur9_data()
-
-
-def save_pending_predictions():
-    """Sauvegarde pending_predictions dans PostgreSQL."""
-    try:
-        def _dt(v):
-            return v.isoformat() if isinstance(v, datetime) else v
-        serializable = {}
-        for gn, pred in pending_predictions.items():
-            serializable[str(gn)] = {k: _dt(v) for k, v in pred.items()}
-        db.db_schedule(db.db_save_all_pending(serializable))
-    except Exception as e:
-        logger.error(f"❌ Erreur save_pending_predictions: {e}")
-
-
-async def load_pending_predictions():
-    """Charge pending_predictions depuis PostgreSQL (fallback JSON)."""
-    global pending_predictions
-    try:
-        data = await db.db_load_pending()
-        if not data and os.path.exists(PENDING_PRED_FILE):
-            with open(PENDING_PRED_FILE, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-        if not data:
-            return
-        loaded = {}
-        for gn_str, pred in data.items():
-            gn = int(gn_str)
-            for field in ('sent_time',):
-                if field in pred and pred[field]:
-                    try:
-                        pred[field] = datetime.fromisoformat(pred[field])
-                    except Exception:
-                        pass
-            pred['status'] = 'en_cours'
-            loaded[gn] = pred
-        if loaded:
-            pending_predictions = loaded
-            logger.info(f"✅ Pending predictions rechargées: {list(loaded.keys())}")
-    except Exception as e:
-        logger.error(f"❌ Erreur load_pending_predictions: {e}")
-
-
-async def load_prediction_history():
-    """
-    Charge l'historique des prédictions depuis PostgreSQL dans la liste
-    prediction_history en mémoire. Normalise les anciens statuts 'win'/'loss'
-    vers 'gagne_rN'/'perdu' pour la compatibilité.
-    Remplit aussi canal_pred_msg_ids pour le suivi des réactions sur toutes les
-    prédictions (y compris les anciennes).
-    """
-    global prediction_history, canal_pred_msg_ids
-    try:
-        rows = await db.db_load_prediction_history(limit=500)
-        if not rows:
-            return
-        normalized = []
-        loaded_msg_ids = 0
-        for entry in rows:
-            status = entry.get('status', '')
-            if status == 'win':
-                level = entry.get('rattrapage_level', 0) or 0
-                entry['status'] = f'gagne_r{level}'
-            elif status == 'loss':
-                entry['status'] = 'perdu'
-            normalized.append(entry)
-            # Reconstruire canal_pred_msg_ids depuis la DB (réactions sur anciennes prédictions)
-            mid = entry.get('canal_message_id')
-            if mid:
-                canal_pred_msg_ids[int(mid)] = entry['predicted_game']
-                loaded_msg_ids += 1
-        prediction_history = normalized
-        wins   = sum(1 for p in normalized if p['status'].startswith('gagne'))
-        losses = sum(1 for p in normalized if p['status'] == 'perdu')
-        logger.info(
-            f"📂 Prediction history chargée: {len(normalized)} entrées "
-            f"({wins} gagnées, {losses} perdues) | "
-            f"{loaded_msg_ids} message_id(s) chargés pour suivi réactions"
-        )
-    except Exception as e:
-        logger.error(f"❌ Erreur load_prediction_history: {e}")
-
-
-def clear_pending_pred_file():
-    """Supprime le fichier de sauvegarde des prédictions en cours."""
-    try:
-        if os.path.exists(PENDING_PRED_FILE):
-            os.remove(PENDING_PRED_FILE)
-    except Exception:
-        pass
-
-
-def save_compteur9_data():
-    """Sauvegarde l'historique C9 dans PostgreSQL."""
-    try:
-        def _dt(v):
-            return v.isoformat() if isinstance(v, datetime) else v
-        data = {
-            'silent_history': [
-                {**{k: _dt(v) for k, v in p.items()}}
-                for p in compteur9_silent_history
-            ],
-            'last_result': compteur9_last_result,
-        }
-        db.db_schedule(db.db_save_kv('compteur9', data))
-    except Exception as e:
-        logger.error(f"❌ Erreur save_compteur9: {e}")
-
-
-async def load_compteur9_data():
-    """Charge l'historique C9 depuis PostgreSQL (fallback JSON)."""
-    global compteur9_silent_history, compteur9_last_result
-    try:
-        data = await db.db_load_kv('compteur9')
-        if data is None and os.path.exists(COMPTEUR9_DATA_FILE):
-            with open(COMPTEUR9_DATA_FILE, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-        if not data:
-            return
-        loaded = []
-        for p in data.get('silent_history', []):
-            for field in ('created_at', 'resolved_at'):
-                if field in p and p[field]:
-                    try:
-                        p[field] = datetime.fromisoformat(p[field])
-                    except Exception:
-                        pass
-            loaded.append(p)
-        compteur9_silent_history = loaded
-        compteur9_last_result    = data.get('last_result', 'none')
-        logger.info(
-            f"✅ C9 chargé: {len(compteur9_silent_history)} prédiction(s)"
-        )
-    except Exception as e:
-        logger.error(f"❌ Erreur load_compteur9: {e}")
-
-
-def generate_compteur9_pdf() -> bytes:
-    """
-    Génère un PDF Compteur9 — Prédictions silencieuses avec résultats.
-    Inclut tout l'historique persistant (sessions précédentes + en cours).
-    """
-    suit_names_map = {'♠': 'Pique', '♥': 'Coeur', '♦': 'Carreau', '♣': 'Trefle'}
-    suit_colors    = {'♠': (30, 30, 30), '♥': (180, 0, 0), '♦': (0, 80, 180), '♣': (0, 120, 0)}
-    res_colors     = {'win': (0, 140, 0), 'loss': (200, 0, 0), 'void': (150, 100, 0), 'pending': (100, 100, 100)}
-    res_labels     = {'win': 'WIN', 'loss': 'LOSS', 'void': 'VOID', 'pending': '...'}
-
-    total    = len(compteur9_silent_history)
-    wins     = sum(1 for p in compteur9_silent_history if p.get('result') == 'win')
-    losses   = sum(1 for p in compteur9_silent_history if p.get('result') == 'loss')
-    winrate  = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0.0
-
-    pdf = FPDF()
-    pdf.set_auto_page_break(auto=True, margin=15)
-
-    # ── PAGE 1 : TABLE DES PRÉDICTIONS ───────────────────────────────────────
-    pdf.add_page()
-    pdf.set_font('Helvetica', 'B', 16)
-    pdf.set_fill_color(20, 80, 160)
-    pdf.set_text_color(255, 255, 255)
-    pdf.cell(0, 12, 'BACCARAT AI - Compteur 9 : Predictions Silencieuses', new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C', fill=True)
-    pdf.ln(3)
-
-    pdf.set_font('Helvetica', '', 9)
-    pdf.set_text_color(100, 100, 100)
-    pdf.cell(0, 5,
-        f'Seuil SS={compteur9_ss} | '
-        f'Genere le {datetime.now().strftime("%d/%m/%Y %H:%M")} | '
-        f'Total: {total} | Win: {wins} | Loss: {losses} | Taux: {winrate:.1f}% | PERSISTANT', new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C'
-    )
-    pdf.ln(4)
-
-    # ── Récapitulatif ─────────────────────────────────────────────────────────
-    pdf.set_font('Helvetica', 'B', 11)
-    pdf.set_fill_color(230, 240, 255)
-    pdf.set_text_color(20, 80, 160)
-    pdf.cell(0, 8, f'  Bilan : {wins}W  {losses}L  {total - wins - losses} autres  |  Taux de reussite : {winrate:.1f}%', new_x=XPos.LMARGIN, new_y=YPos.NEXT, fill=True)
-    pdf.ln(4)
-
-    # ── En-tête table ─────────────────────────────────────────────────────────
-    col_w = [28, 22, 22, 22, 26, 20, 22, 18]
-    heads = ['Date', 'Heure', 'Jeu cible', 'Costume', 'Fort', 'Ecart', 'SS', 'Resultat']
-    pdf.set_font('Helvetica', 'B', 8)
-    pdf.set_fill_color(20, 80, 160)
-    pdf.set_text_color(255, 255, 255)
-    for w, h in zip(col_w, heads):
-        pdf.cell(w, 7, h, border=1, align='C', fill=True)
-    pdf.ln()
-
-    # ── Lignes ────────────────────────────────────────────────────────────────
-    sorted_preds = sorted(
-        compteur9_silent_history,
-        key=lambda p: p.get('created_at', datetime.min)
-        if isinstance(p.get('created_at'), datetime) else datetime.min
-    )
-
-    for i, p in enumerate(sorted_preds):
-        result   = p.get('result', 'pending')
-        suit     = p.get('suit', '?')
-        fort     = p.get('fort', '?')
-        diff     = p.get('diff', 0)
-        tg       = p.get('target_game', '?')
-        ca       = p.get('created_at')
-        date_str = ca.strftime('%d/%m/%Y') if isinstance(ca, datetime) else '--'
-        time_str = ca.strftime('%H:%M')    if isinstance(ca, datetime) else '--'
-
-        suit_color = suit_colors.get(suit, (0, 0, 0))
-        res_color  = res_colors.get(result, (0, 0, 0))
-        bg         = (245, 248, 255) if i % 2 == 0 else (255, 255, 255)
-
-        pdf.set_fill_color(*bg)
-        pdf.set_font('Helvetica', '', 8)
-
-        row_data = [
-            (date_str, (50, 50, 50)),
-            (time_str, (50, 50, 50)),
-            (f"#{tg}",  (50, 50, 50)),
-            (suit_names_map.get(suit, suit), suit_color),
-            (suit_names_map.get(fort, fort), suit_colors.get(fort, (50, 50, 50))),
-            (str(diff),                       (50, 50, 50)),
-            (str(compteur9_ss),               (100, 100, 100)),
-            (res_labels.get(result, '?'),      res_color),
-        ]
-        for (w, (txt, color)) in zip(col_w, row_data):
-            pdf.set_text_color(*color)
-            pdf.cell(w, 6, txt, border=1, align='C', fill=(w == col_w[0]))
-        pdf.ln()
-
-    if not sorted_preds:
-        pdf.set_text_color(150, 150, 150)
-        pdf.set_font('Helvetica', 'I', 10)
-        pdf.cell(0, 10, 'Aucune prediction silencieuse enregistree.', new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C')
-
-    # ── PAGE 2 : STATISTIQUES PAR COSTUME ─────────────────────────────────────
-    pdf.add_page()
-    pdf.set_font('Helvetica', 'B', 14)
-    pdf.set_fill_color(20, 80, 160)
-    pdf.set_text_color(255, 255, 255)
-    pdf.cell(0, 10, 'Compteur 9 - Statistiques par Costume', new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C', fill=True)
-    pdf.ln(6)
-
-    for suit in ALL_SUITS:
-        suit_preds = [p for p in compteur9_silent_history if p.get('suit') == suit]
-        sw = sum(1 for p in suit_preds if p.get('result') == 'win')
-        sl = sum(1 for p in suit_preds if p.get('result') == 'loss')
-        sr = (sw / (sw + sl) * 100) if (sw + sl) > 0 else 0.0
-        color = suit_colors.get(suit, (0, 0, 0))
-        pdf.set_text_color(*color)
-        pdf.set_font('Helvetica', 'B', 11)
-        pdf.cell(0, 7,
-            f'  {suit_names_map.get(suit, suit)} : '
-            f'{len(suit_preds)} predictions  |  {sw}W  {sl}L  |  {sr:.1f}%', new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.ln(6)
-
-    # Compteurs actuels de l'heure
-    pdf.set_font('Helvetica', 'B', 11)
-    pdf.set_fill_color(230, 240, 255)
-    pdf.set_text_color(20, 80, 160)
-    pdf.cell(0, 7, '  Compteurs horaires actuels (reset a chaque heure pile)', new_x=XPos.LMARGIN, new_y=YPos.NEXT, fill=True)
-    pdf.ln(3)
-    for suit in sorted(ALL_SUITS, key=lambda s: compteur9_counts[s], reverse=True):
-        color = suit_colors.get(suit, (0, 0, 0))
-        pdf.set_text_color(*color)
-        pdf.set_font('Helvetica', '', 10)
-        pdf.cell(0, 6,
-            f'    {suit_names_map.get(suit, suit)} : {compteur9_counts[suit]} cartes comptees', new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.ln(4)
-
-    reset_str = compteur9_reset_time.strftime('%H:%M') if compteur9_reset_time else '--:--'
-    pdf.set_font('Helvetica', 'I', 9)
-    pdf.set_text_color(120, 120, 120)
-    pdf.cell(0, 5, f'Dernier reset: {reset_str}  |  Le comptage continue toute l\'heure (HH:00 - HH:59)', new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C')
-
-    return pdf.output(dest='S').encode('latin-1')
-
-
-async def send_compteur9_pdf():
-    """Envoie le PDF Compteur9 en privé à l'admin."""
-    if not ADMIN_ID:
-        return
-    try:
-        pdf_bytes  = generate_compteur9_pdf()
-        pdf_buffer = io.BytesIO(pdf_bytes)
-        total      = len(compteur9_silent_history)
-        wins       = sum(1 for p in compteur9_silent_history if p.get('result') == 'win')
-        losses     = sum(1 for p in compteur9_silent_history if p.get('result') == 'loss')
-        caption    = (
-            f"📈 **Compteur9 — Prédictions Silencieuses**\n"
-            f"Total: **{total}** | ✅ {wins}W | ❌ {losses}L\n"
-            f"_Historique complet (persistant)_"
-        )
-        admin_entity = await client.get_entity(ADMIN_ID)
-        await client.send_file(
-            admin_entity, pdf_buffer,
-            caption=caption, parse_mode='markdown',
-            attributes=[], file_name="compteur9_silencieux.pdf"
-        )
-        logger.info("✅ PDF Compteur9 envoyé à l'admin")
-    except Exception as e:
-        logger.error(f"❌ Erreur send_compteur9_pdf: {e}")
-
-
-async def compteur9_reset_loop():
-    """
-    Boucle de reset Compteur9 : réinitialise les compteurs à chaque heure pile (HH:00:00).
-    Déclenché indépendamment des resets globaux du bot.
-    """
-    # Initialisation : premier reset maintenant (au démarrage du bot)
-    reset_compteur9_now()
-    while True:
-        try:
-            now = datetime.now()
-            # Attendre jusqu'à la prochaine heure pile exacte
-            seconds_until_next = 3600 - (now.minute * 60 + now.second)
-            if seconds_until_next <= 0:
-                seconds_until_next += 3600
-            await asyncio.sleep(seconds_until_next)
-            reset_compteur9_now()
-        except Exception as e:
-            logger.error(f"❌ Erreur compteur9_reset_loop: {e}")
-            await asyncio.sleep(60)
-
-
 def generate_compteur8_pdf() -> bytes:
     """Génère un PDF combiné : Compteur8 (absences ≥10) + Compteur7 (présences ≥5) + comparaison."""
     suit_names_map = {'♠': 'Pique', '♥': 'Coeur', '♦': 'Carreau', '♣': 'Trefle'}
@@ -3613,6 +3152,32 @@ def update_prediction_in_history(game_number: int, suit: str, verified_by_game: 
             db.db_schedule(db.db_update_prediction_history(game_number, suit, final_status, rattrapage_level, verified_by_game))
             break
 
+def save_pending_predictions():
+    """Sauvegarde les prédictions en attente dans PostgreSQL."""
+    db.db_schedule(db.db_save_all_pending(pending_predictions))
+
+async def load_pending_predictions():
+    """Charge les prédictions en attente depuis PostgreSQL."""
+    global pending_predictions
+    try:
+        loaded = await db.db_load_pending()
+        pending_predictions = loaded
+        logger.info(f"📂 {len(pending_predictions)} prédiction(s) en attente chargée(s)")
+    except Exception as e:
+        logger.error(f"❌ load_pending_predictions: {e}")
+        pending_predictions = {}
+
+async def load_prediction_history():
+    """Charge l'historique des prédictions depuis PostgreSQL."""
+    global prediction_history
+    try:
+        loaded = await db.db_load_prediction_history(limit=200)
+        prediction_history = loaded
+        logger.info(f"📂 {len(prediction_history)} prédiction(s) chargées depuis l'historique")
+    except Exception as e:
+        logger.error(f"❌ load_prediction_history: {e}")
+        prediction_history = []
+
 # ============================================================================
 # COMPTEUR 11 — PERDU HIER → PRÉDIT DEMAIN
 # ============================================================================
@@ -4013,14 +3578,14 @@ async def send_prediction_multi_channel(game_number: int, suit: str, prediction_
         return False
 
     # ── Filtre Compteur6 : redirection par paires inverses ──────────────────
-    # skip_c6=True quand C9 a déjà overridé le costume : C6 ne doit pas annuler l'override C9
+    # skip_c6=True : décision déjà prise à l'origine (ex. C2+C6 atomique) → ne pas re-décider
     suit_original = suit
     if not skip_c6:
         suit = apply_compteur6(suit)
         if suit != suit_original:
             logger.info(f"🔄 C6: prédiction #{game_number} redirigée {suit_original} → {suit}")
     else:
-        logger.info(f"⏭️ C6 ignoré (C9 override actif): costume {suit} conservé tel quel")
+        logger.info(f"🔵 C6: décision déjà appliquée à la source ({suit}) — skip apply_compteur6")
 
     success = False
 
@@ -4177,7 +3742,7 @@ async def update_prediction_message(game_number: int, status: str, rattrapage: i
         block_suit(suit, 5)
         # Enregistrer l'événement PERDU
         old_b = compteur2_seuil_B_per_suit.get(suit, compteur2_seuil_B)
-        new_b = old_b + 1
+        new_b = old_b + B_LOSS_INCREMENT
         compteur2_seuil_B_per_suit[suit] = new_b
         perdu_events.append({
             'game': game_number,
@@ -4423,7 +3988,9 @@ def can_accept_prediction(pred_number: int) -> bool:
 
     return True
 
-def add_to_prediction_queue(game_number: int, suit: str, prediction_type: str, reason: str = '') -> bool:
+def add_to_prediction_queue(game_number: int, suit: str, prediction_type: str, reason: str = '',
+                            trigger_game: Optional[int] = None,
+                            skip_c6: bool = False) -> bool:
     global prediction_queue
 
     for pred in prediction_queue:
@@ -4433,15 +4000,21 @@ def add_to_prediction_queue(game_number: int, suit: str, prediction_type: str, r
     if not can_accept_prediction(game_number):
         return False
 
+    # trigger_game = jeu lors duquel la prédiction sera envoyée
+    # Par défaut : game_number - PREDICTION_DF (comportement historique)
+    tg = trigger_game if trigger_game is not None else (game_number - PREDICTION_DF)
+
     prediction_queue.append({
         'game_number': game_number,
+        'trigger_game': tg,
         'suit': suit,
         'type': prediction_type,
         'reason': reason,
+        'skip_c6': skip_c6,   # si True, apply_compteur6 ne sera pas rappelé à l'envoi
         'added_at': datetime.now()
     })
     prediction_queue.sort(key=lambda x: x['game_number'])
-    logger.info(f"📥 #{game_number} ({suit}) en file. Total: {len(prediction_queue)}")
+    logger.info(f"📥 #{game_number} ({suit}) en file [envoi@{tg}, skip_c6={skip_c6}]. Total: {len(prediction_queue)}")
     return True
 
 async def process_prediction_queue(current_game: int, is_finished: bool = False):
@@ -4469,8 +4042,9 @@ async def process_prediction_queue(current_game: int, is_finished: bool = False)
             to_remove.append(pred)
             continue
 
-        # Envoi : jeu N vient de se terminer ET N+df correspond à ce pred
-        if is_finished and current_game + PREDICTION_DF == pred_number:
+        # Envoi : jeu courant == trigger_game stocké dans la file
+        trigger_g = pred.get('trigger_game', pred_number - PREDICTION_DF)
+        if is_finished and current_game == trigger_g:
             to_send = pred
             break
 
@@ -4484,30 +4058,9 @@ async def process_prediction_queue(current_game: int, is_finished: bool = False)
         suit           = to_send['suit']
         pred_type      = to_send['type']
 
-        # ── C9 INTERCEPTION ──────────────────────────────────────────────────
-        # Si C9 est actif (HH:mm < 30) et voit que le costume proposé est
-        # le "fort" avec un écart ≥ SS, il override vers le costume "faible".
-        original_suit  = suit
-        c9_ovr = c9_get_override(suit)
-        c9_did_override = False
-        if c9_ovr and c9_ovr != suit:
-            c9_did_override = True
-            # Annoter la raison dans la file pour que /raison le mentionne
-            _suit_text = {'♠': 'Pique', '♥': 'Coeur', '♦': 'Carreau', '♣': 'Trefle'}
-            to_send['reason'] = (to_send.get('reason') or '') + (
-                f" | C9 override: {_suit_text.get(suit, suit)} → {_suit_text.get(c9_ovr, c9_ovr)} "
-                f"(ecart SS={compteur9_ss}, diff={compteur9_counts.get(suit,0)-compteur9_counts.get(c9_ovr,0)})"
-            )
-            suit = c9_ovr
-            logger.info(f"🔄 C9 override appliqué: {original_suit} → {suit} (#pred {pred_number})")
-        # ─────────────────────────────────────────────────────────────────────
-
-        logger.info(f"📤 Envoi depuis file: #{pred_number} (jeu #{current_game} terminé, df={PREDICTION_DF})")
-        # Règle C6 :
-        #   - C2 seul (pas de C9 override) → C6 s'applique normalement
-        #   - C9 a overridé (SS gap détecté) → C6 ignoré : C9 prédit le faible directement
-        # C9 silencieux et C9 après LOSS sont gérés séparément (admin privé, aucun lien C6)
-        success = await send_prediction_multi_channel(pred_number, suit, pred_type, skip_c6=c9_did_override)
+        pred_skip_c6 = to_send.get('skip_c6', False)
+        logger.info(f"📤 Envoi depuis file: #{pred_number} (jeu #{current_game}, skip_c6={pred_skip_c6})")
+        success = await send_prediction_multi_channel(pred_number, suit, pred_type, skip_c6=pred_skip_c6)
         if success:
             prediction_queue.remove(to_send)
 
@@ -4525,49 +4078,75 @@ def update_compteur2(game_number: int, player_suits: Set[str]):
             tracker.increment(game_number)
 
 def get_compteur2_ready_predictions(current_game: int) -> List[tuple]:
+    """
+    Vérifie si le seuil B est atteint pour chaque costume et prépare les prédictions.
+
+    Règle C2 + C6 — décision prise ICI UNE SEULE FOIS, sans re-vérification à l'envoi :
+      • Si PAIR[manquant] a complété son cycle Wj → prédire le manquant  (offset GH)
+                                                    → signal C6 consommé ici
+      • Sinon                                       → prédire l'inverse   (offset GK)
+    Le costume FINAL est stocké dans la file.  skip_c6=True est positionné pour que
+    apply_compteur6 ne soit pas rappelé dans send_prediction_multi_channel.
+    Retourne : (final_suit, pred_number, reason, trigger_game, skip_c6=True)
+    """
     global compteur2_trackers, compteur2_seuil_B_per_suit
     ready = []
+    _suit_text = {'♠': 'Pique', '♥': 'Cœur', '♦': 'Carreau', '♣': 'Trèfle'}
+
     for suit in ALL_SUITS:
         tracker = compteur2_trackers[suit]
         b = compteur2_seuil_B_per_suit.get(suit, compteur2_seuil_B)
-        if tracker.check_threshold(b):
-            pred_number  = current_game + PREDICTION_DF
-            start_game   = tracker.last_increment_game - (tracker.counter - 1)
-            suit_display = SUIT_DISPLAY.get(suit, suit)
+        if not tracker.check_threshold(b):
+            continue
 
-            # Contexte C6 : état de l'inverse au moment du déclenchement
-            # Règle : si PAIR[manquant] a complété son cycle Wj → on confirme le manquant
-            #          sinon → on prédit PAIR[manquant] à la place
-            _suit_text = {'♠': 'Pique', '♥': 'Coeur', '♦': 'Carreau', '♣': 'Trefle'}
-            opposite    = COMPTEUR6_PAIRS.get(suit, '')
-            c6_count    = compteur6_trackers.get(opposite, 0)
-            c6_wj       = compteur6_seuil_Wj
-            opp_name    = _suit_text.get(opposite, opposite)
-            suit_name   = _suit_text.get(suit, suit)
-            inverse_ready = opposite in compteur6_ready  # cycle Wj complété ?
+        start_game = tracker.last_increment_game - (tracker.counter - 1)
+        suit_name  = _suit_text.get(suit, suit)
 
-            if opposite:
-                if inverse_ready:
-                    c6_line = (
-                        f"C6: l'inverse ({opp_name}) a complete son cycle Wj={c6_wj} "
-                        f"=> le manquant {suit_name} est confirme."
-                    )
-                else:
-                    c6_line = (
-                        f"C6: l'inverse ({opp_name}) est a {c6_count}/{c6_wj} "
-                        f"(cycle Wj non complete) => {opp_name} sera predit a la place."
-                    )
-            else:
-                c6_line = "C6: pas de paire definie pour ce costume."
+        # ── Décision C6 (unique, atomique) ────────────────────────────────────
+        opposite      = COMPTEUR6_PAIRS.get(suit, '')
+        opp_name      = _suit_text.get(opposite, opposite)
+        c6_wj         = compteur6_seuil_Wj
+        inverse_ready = bool(opposite) and (opposite in compteur6_ready)
 
-            reason = (
-                f"Du jeu #{start_game} au jeu #{tracker.last_increment_game}, "
-                f"{suit_name} etait absent {tracker.counter} fois de suite "
-                f"(seuil B={b}). Prediction lancee pour le jeu #{pred_number}. "
-                f"{c6_line}"
+        if inverse_ready:
+            # L'inverse a complété son cycle Wj → confirmer le manquant
+            final_suit  = suit
+            pred_number = current_game + GH
+            # Consommer le signal C6 maintenant (évite double consommation à l'envoi)
+            compteur6_ready.discard(opposite)
+            logger.info(
+                f"🔵 C6+C2: {opp_name} avait complété Wj={c6_wj} → confirme manquant "
+                f"{suit_name} | offset GH={GH} | pred #{pred_number}"
             )
-            ready.append((suit, pred_number, reason))
-            tracker.reset(current_game)
+            c6_line = (
+                f"C6: l'inverse ({opp_name}) a complete son cycle Wj={c6_wj} "
+                f"=> manquant {suit_name} confirme. Offset GH={GH}."
+            )
+        else:
+            # Inverse pas encore prêt → prédire l'inverse du manquant
+            final_suit  = opposite if opposite else suit
+            pred_number = current_game + GK
+            c6_count    = compteur6_trackers.get(opposite, 0)
+            logger.info(
+                f"🔄 C6+C2: {opp_name} a {c6_count}/{c6_wj} (cycle non complet) "
+                f"→ predit inverse {opp_name} | offset GK={GK} | pred #{pred_number}"
+            )
+            c6_line = (
+                f"C6: l'inverse ({opp_name}) est a {c6_count}/{c6_wj} "
+                f"(cycle Wj non complete) => {opp_name} predit a la place du manquant. Offset GK={GK}."
+            )
+
+        reason = (
+            f"Du jeu #{start_game} au jeu #{tracker.last_increment_game}, "
+            f"{suit_name} etait absent {tracker.counter} fois de suite "
+            f"(seuil B={b}). Prediction du costume final {_suit_text.get(final_suit, final_suit)} "
+            f"pour le jeu #{pred_number}. {c6_line}"
+        )
+
+        # (final_suit, pred_number, reason, trigger_game, skip_c6)
+        ready.append((final_suit, pred_number, reason, current_game, True))
+        tracker.reset(current_game)
+
     return ready
 
 # ============================================================================
@@ -4774,7 +4353,6 @@ async def send_bilan_and_reset_at_1440():
                 f"  • {len(compteur4_events)} séries Compteur4 (absences persistantes)\n"
                 f"  • {len(compteur7_completed)} séries Compteur7 (présences ≥{COMPTEUR7_THRESHOLD}) — PDF inchangé\n"
                 f"  • {len(compteur8_completed)} séries Compteur8 (absences ≥{COMPTEUR8_THRESHOLD}) — PDF inchangé\n"
-                f"  • {len(compteur9_silent_history)} prédictions Compteur9 silencieuses — PDF inchangé\n"
                 f"  • B admin : {compteur2_seuil_B}\n"
                 f"  • Seuil Compteur4 : {COMPTEUR4_THRESHOLD}\n"
                 f"  • Seuil Compteur5 : {COMPTEUR5_THRESHOLD}\n"
@@ -4792,7 +4370,7 @@ async def send_bilan_and_reset_at_1440():
 
 async def process_game_result(game_number: int, player_suits: Set[str], player_cards_raw: list, is_finished: bool = False):
     """Traite un résultat de jeu venant de l'API 1xBet."""
-    global current_game_number, processed_games, bilan_1440_sent, compteur9_send_next_public
+    global current_game_number, processed_games, bilan_1440_sent
 
     if game_number > current_game_number:
         current_game_number = game_number
@@ -4834,13 +4412,10 @@ async def process_game_result(game_number: int, player_suits: Set[str], player_c
             asyncio.create_task(send_compteur4_pdf())
 
         # Compteur5: détecter les présences consécutives de 10
-        # PRIORITÉ C9 : si C9 public fire ce jeu, l'alerte C5 est différée (C9 > C5)
         triggered5 = update_compteur5(game_number, player_suits, player_cards_raw)
-        if triggered5 and not c9_public_firing:
+        if triggered5:
             asyncio.create_task(send_compteur5_alert(triggered5, game_number))
             asyncio.create_task(send_compteur5_pdf())
-        elif triggered5 and c9_public_firing:
-            logger.info(f"⏭️ C5 alerte différée jeu #{game_number} (C9 public prioritaire)")
 
         # Compteur6: mettre à jour le compteur d'apparitions par costume
         update_compteur6(player_suits)
@@ -4857,81 +4432,53 @@ async def process_game_result(game_number: int, player_suits: Set[str], player_c
             asyncio.create_task(send_compteur8_series_alert(series8))
             asyncio.create_task(send_compteur8_pdf())
 
-        # ── COMPTEUR 9 ───────────────────────────────────────────────────────
-        # 1) Vérifier la prédiction silencieuse en cours (résoudre win/loss)
-        _c9_verify_pending(game_number, player_suits)
-
-        # 2) Compter les cartes du joueur (TOUJOURS, même après HH:30)
-        update_compteur9_counts(player_cards_raw)
-
-        # 3) Vérifier les triggers SS et gérer prédictions (HH:00-HH:29 seulement)
-        c9_public_firing = False   # True si C9 envoie publiquement ce jeu → C2 bloqué
-        if _c9_is_active():
-            # Log de progression des comptes C9 pour monitoring
-            _paire1_diff = abs(compteur9_counts['♦'] - compteur9_counts['♠'])
-            _paire2_diff = abs(compteur9_counts['♣'] - compteur9_counts['♥'])
-            logger.info(
-                f"📊 C9 actif jeu #{game_number}: "
-                f"♦={compteur9_counts['♦']} ♠={compteur9_counts['♠']} (diff={_paire1_diff}) | "
-                f"♣={compteur9_counts['♣']} ♥={compteur9_counts['♥']} (diff={_paire2_diff}) | "
-                f"SS={compteur9_ss}"
-            )
-            for fort9, faible9, diff9 in _c9_check_triggers():
-                if compteur9_send_next_public and not pending_predictions:
-                    # Dernière prédiction silencieuse perdue → envoyer celle-ci dans le canal
-                    # C9 prend la priorité : C2 sera bloqué pour ce jeu
-                    compteur9_send_next_public = False
-                    c9_public_firing = True
-                    asyncio.create_task(
-                        send_compteur9_public(faible9, fort9, diff9, game_number)
-                    )
-                    logger.info(f"🔵 C9 priorité: prédiction publique jeu #{game_number} → C2 bloqué ce jeu")
-                else:
-                    # Prédiction silencieuse normale (pas affichée dans le canal)
-                    _c9_add_silent(faible9, fort9, diff9, game_number)
-        # ─────────────────────────────────────────────────────────────────────
-
         # Données horaires pour /comparaison
         update_hourly_data(player_suits)
 
         # ── Pré-détection C11 : C11 a-t-il priorité sur ce jeu ? ────────────
         # C11 se déclenche quand game_number == game_number_perdu_hier - PREDICTION_DF
         # Si oui, C2 est bloqué (C11 prioritaire, indépendant de C2 et C6)
-        # MAIS C9 public > C11 : si C9 envoie ce jeu, C11 est aussi bloqué
         c11_firing = False
-        if compteur11_perdu_hier and is_finished and not c9_public_firing:
+        if compteur11_perdu_hier and is_finished:
             for entry in compteur11_perdu_hier:
                 trigger_at = entry['game_number'] - PREDICTION_DF
                 if game_number == trigger_at:
                     c11_firing = True
                     break
-        elif c9_public_firing and compteur11_perdu_hier and is_finished:
-            for entry in compteur11_perdu_hier:
-                trigger_at = entry['game_number'] - PREDICTION_DF
-                if game_number == trigger_at:
-                    logger.info(f"⏭️ C11 bloqué jeu #{game_number} (C9 public prioritaire)")
         # ────────────────────────────────────────────────────────────────────
 
-        # Prédictions Compteur2 — bloquées si C9 envoie publiquement OU si C11 prioritaire
-        blocked_by = ('C9 public' if c9_public_firing else '') or ('C11' if c11_firing else '')
-        if compteur2_active and not c9_public_firing and not c11_firing:
+        # Prédictions Compteur2 — bloquées si C11 prioritaire
+        blocked_by = ('C11' if c11_firing else '')
+        c2_just_queued = False
+        if compteur2_active and not c11_firing:
             compteur2_preds = get_compteur2_ready_predictions(game_number)
-            for suit, pred_num, reason in compteur2_preds:
-                added = add_to_prediction_queue(pred_num, suit, 'compteur2', reason)
+            for final_suit, pred_num, reason, trig_g, skip_c6_flag in compteur2_preds:
+                added = add_to_prediction_queue(
+                    pred_num, final_suit, 'compteur2', reason,
+                    trigger_game=trig_g, skip_c6=skip_c6_flag
+                )
                 if added:
-                    logger.info(f"📊 Compteur2: #{pred_num} {suit} en file")
-        elif compteur2_active and (c9_public_firing or c11_firing):
-            # C9 ou C11 prioritaire : consommer les trackers C2 sans envoyer
+                    logger.info(f"📊 Compteur2: #{pred_num} {final_suit} en file [trigger@{trig_g}, skip_c6={skip_c6_flag}]")
+                    c2_just_queued = True
+        elif compteur2_active and c11_firing:
+            # C11 prioritaire : consommer les trackers C2 sans envoyer
+            # (les signaux C6 sont aussi consommés pour rester cohérents)
             _ = get_compteur2_ready_predictions(game_number)
-            logger.info(f"⏭️ C2 ignoré ce jeu ({blocked_by} prioritaire) — trackers réinitialisés")
+            logger.info(f"⏭️ C2 ignoré ce jeu ({blocked_by} prioritaire) — trackers + signaux C6 réinitialisés")
+
+        # ── Dispatch immédiat C2 : la prédiction vient d'être mise en file ────
+        # process_prediction_queue a déjà été appelé (ligne ~4359) AVANT le bloc C2,
+        # donc on le rappelle ici pour que la prédiction parte dès que la main
+        # du joueur est définitive — sans attendre le prochain cycle de polling.
+        if c2_just_queued:
+            await process_prediction_queue(game_number, player_hand_complete)
 
         logger.info(f"📊 Jeu #{game_number}: joueur {player_suits} | C4={dict(compteur4_trackers)}")
 
     # ── Compteur 11 : perdu hier → prédit aujourd'hui ───────────────────────
     # Déclenchement à game_number_perdu_hier - PREDICTION_DF (respecte l'écart df)
     # C11 est indépendant : priorité sur C2, bypass C6
-    # PRIORITÉ : C9 public > C11. Si C9 envoie ce jeu, C11 est bloqué.
-    if compteur11_perdu_hier and is_finished and not c9_public_firing:
+    if compteur11_perdu_hier and is_finished:
         for entry in compteur11_perdu_hier:
             trigger_at = entry['game_number'] - PREDICTION_DF
             if game_number == trigger_at:
@@ -6037,6 +5584,64 @@ async def cmd_df(event):
         await event.respond(f"❌ Erreur: {e}")
 
 
+async def cmd_gh(event):
+    """Offset GH : distance de prédiction quand C6 confirme le manquant."""
+    global GH
+    if event.is_group or event.is_channel:
+        return
+    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+        await event.respond("🔒 Admin uniquement")
+        return
+    try:
+        parts = event.message.message.split()
+        if len(parts) == 1:
+            await event.respond(
+                f"🔷 **PARAMÈTRE GH** (offset manquant confirmé)\n\n"
+                f"Valeur actuelle : **{GH}**  (défaut: {GH_DEFAULT})\n\n"
+                f"**Usage :** `/gh [1-15]`\n\n"
+                f"_Quand C6 confirme le manquant, le bot prédit jeu trigger + GH._"
+            )
+            return
+        val = int(parts[1])
+        if not 1 <= val <= 15:
+            await event.respond("❌ GH doit être entre 1 et 15")
+            return
+        old = GH
+        GH = val
+        await event.respond(f"✅ **GH modifié : {old} → {val}**")
+    except Exception as e:
+        await event.respond(f"❌ Erreur: {e}")
+
+
+async def cmd_gk(event):
+    """Offset GK : distance de prédiction quand C6 redirige vers l'inverse."""
+    global GK
+    if event.is_group or event.is_channel:
+        return
+    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+        await event.respond("🔒 Admin uniquement")
+        return
+    try:
+        parts = event.message.message.split()
+        if len(parts) == 1:
+            await event.respond(
+                f"🔶 **PARAMÈTRE GK** (offset inverse manquant)\n\n"
+                f"Valeur actuelle : **{GK}**  (défaut: {GK_DEFAULT})\n\n"
+                f"**Usage :** `/gk [1-15]`\n\n"
+                f"_Quand C6 redirige (cycle Wj non complet), le bot prédit jeu trigger + GK._"
+            )
+            return
+        val = int(parts[1])
+        if not 1 <= val <= 15:
+            await event.respond("❌ GK doit être entre 1 et 15")
+            return
+        old = GK
+        GK = val
+        await event.respond(f"✅ **GK modifié : {old} → {val}**")
+    except Exception as e:
+        await event.respond(f"❌ Erreur: {e}")
+
+
 async def cmd_gap(event):
     global MIN_GAP_BETWEEN_PREDICTIONS
     if event.is_group or event.is_channel:
@@ -6378,8 +5983,7 @@ async def cmd_help(event):
         f"`/compteur5` — Patterns par costume\n"
         f"`/compteur6` — Compteur dynamique Wj\n"
         f"`/compteur7 [pdf/seuil N/reset]` — Présences ≥{COMPTEUR7_THRESHOLD} consécutives\n"
-        f"`/compteur8 [pdf/reset]` — Absences ≥{COMPTEUR8_THRESHOLD} (miroir C7)\n"
-        f"`/compteur9 [seuil N/reset/pdf]` — Contrôleur silencieux SS={compteur9_ss}\n\n"
+        f"`/compteur8 [pdf/reset]` — Absences ≥{COMPTEUR8_THRESHOLD} (miroir C7)\n\n"
         f"**📡 Canaux:**\n"
         f"`/canaux` — Voir config des canaux\n"
         f"`/canaux distribution [ID|off]` — Canal secondaire\n"
@@ -6415,6 +6019,80 @@ async def cmd_reset(event):
     await event.respond("🔄 Reset en cours...")
     await perform_full_reset("Reset manuel")
     await event.respond("✅ Reset effectué!")
+
+
+async def cmd_resetdb(event):
+    """
+    /resetdb confirm — efface TOUTES les données de la base PostgreSQL et remet
+    les compteurs mémoire à zéro. Action irréversible, admin seulement.
+    """
+    global prediction_queue, pending_predictions, prediction_history
+    global processed_games, game_history, game_result_cache
+    global compteur2_trackers, compteur2_seuil_B_per_suit
+    global compteur6_trackers, compteur6_ready
+    global countdown_panel_counter, hourly_game_count, hourly_suit_data, bilan_1440_sent
+    global perdu_events, b_change_history
+
+    if event.is_group or event.is_channel:
+        return
+    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+        await event.respond("🔒 Admin uniquement")
+        return
+
+    parts = event.message.message.strip().split()
+    if len(parts) < 2 or parts[1].lower() != 'confirm':
+        await event.respond(
+            "⚠️ **SUPPRESSION DE TOUTES LES DONNÉES DB**\n\n"
+            "Cette action efface :\n"
+            "• Toutes les prédictions (pending + historique)\n"
+            "• Toutes les données horaires\n"
+            "• Tous les panneaux countdown\n"
+            "• Toutes les clés kv_store (session, B, C7, C8, C11…)\n\n"
+            "🔴 **Action irréversible !**\n\n"
+            "Pour confirmer : `/resetdb confirm`"
+        )
+        return
+
+    await event.respond("⏳ Suppression en cours…")
+
+    # 1. Vider la base PostgreSQL
+    counts = await db.db_reset_all()
+
+    # 2. Remettre les compteurs mémoire à zéro
+    prediction_queue.clear()
+    pending_predictions.clear()
+    prediction_history.clear()
+    processed_games.clear()
+    game_history.clear()
+    game_result_cache.clear()
+    perdu_events.clear()
+    b_change_history.clear()
+    bilan_1440_sent = False
+    countdown_panel_counter = 0
+
+    # C2 trackers
+    for s in ALL_SUITS:
+        compteur2_trackers[s].reset(0)
+        compteur2_seuil_B_per_suit[s] = compteur2_seuil_B
+
+    # C6 trackers
+    for s in ALL_SUITS:
+        compteur6_trackers[s] = 0
+    compteur6_ready.clear()
+
+    # Données horaires
+    for h in range(24):
+        hourly_game_count[h] = 0
+        for s in ALL_SUITS:
+            hourly_suit_data[h][s] = 0
+
+    lines = ["✅ **RESET DB COMPLET**\n"]
+    for table, cnt in counts.items():
+        lines.append(f"• `{table}` : {cnt} ligne(s) supprimée(s)")
+    lines.append("\n🟢 Compteurs mémoire remis à zéro.")
+    lines.append("🔄 La session Telegram est aussi effacée — le bot va se reconnecter automatiquement au prochain démarrage.")
+    logger.warning("🔴 RESETDB COMPLET effectué par l'admin")
+    await event.respond("\n".join(lines), parse_mode='markdown')
 
 
 async def cmd_debloquer(event):
@@ -6550,9 +6228,7 @@ def generate_raison_pdf() -> bytes:
         jeu_str  = f"#{pred['predicted_game']}"
         suit_nm  = pdf_safe(suit_names.get(suit, suit))
         _pdf_type_labels = {
-            'compteur2':        'C2',
-            'compteur9_silent': 'C9-S',
-            'compteur9':        'C9-P',
+            'compteur2': 'C2',
         }
         cptr_str = _pdf_type_labels.get(pred.get('type', ''), 'Auto')
         reason   = pdf_safe(pred.get('reason', '') or '-')
@@ -6717,9 +6393,7 @@ async def cmd_raison(event):
         status  = STATUS_MAP.get(pred.get('status', ''), pred.get('status', '?'))
         pred_at = pred['predicted_at'].strftime('%d/%m %H:%M:%S')
         _type_labels = {
-            'compteur2':        'C2',
-            'compteur9_silent': '🔕 C9 (silence)',
-            'compteur9':        '📢 C9 (canal)',
+            'compteur2': 'C2',
         }
         ptype = _type_labels.get(pred.get('type', ''), 'Auto')
         reason  = pred.get('reason', '') or 'Raison non enregistree.'
@@ -6957,7 +6631,7 @@ def _analyse_b_suit(suit: str, window: int = 100) -> dict:
 
 async def cmd_b(event):
     """Commande /b — affiche et gère le B dynamique par costume."""
-    global compteur2_seuil_B_per_suit
+    global compteur2_seuil_B_per_suit, B_LOSS_INCREMENT
     if event.is_group or event.is_channel:
         return
     if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
@@ -6986,7 +6660,10 @@ async def cmd_b(event):
                 lines.append(f"• {dt.strftime('%d/%m %H:%M')} {sd}: {old}→{new} ({raison})")
 
         lines.append(
+            f"\n**Incrément B après perte : +{B_LOSS_INCREMENT}**\n"
             "\n**Commandes:**\n"
+            "`/b set ♠ N` — Définir directement B=N pour ♠\n"
+            "`/b increment N` — Changer l'incrément B après perte (défaut 1)\n"
             "`/b reset ♠` — Remettre ♠ au B admin\n"
             "`/b reset all` — Remettre tous les costumes au B admin\n"
             "`/b analyse` — Analyser et proposer un reset automatique\n"
@@ -6996,6 +6673,48 @@ async def cmd_b(event):
         return
 
     arg = parts[1].lower()
+
+    # ── /b set ♠ N — définit directement B d'un costume ──────────────────────
+    if arg == 'set' and len(parts) >= 4:
+        suit_input = parts[2]
+        target = None
+        for s in ALL_SUITS:
+            if suit_input in (s, SUIT_DISPLAY.get(s, ''), s.strip()):
+                target = s
+                break
+        if not target:
+            await event.respond(f"❌ Costume inconnu: `{suit_input}`\nUtilisez ♠ ♥ ♦ ♣")
+            return
+        try:
+            new_val = int(parts[3])
+            assert 1 <= new_val <= 30
+        except (ValueError, AssertionError):
+            await event.respond("❌ La valeur N doit être un entier entre 1 et 30.")
+            return
+        old_val = compteur2_seuil_B_per_suit.get(target, compteur2_seuil_B)
+        compteur2_seuil_B_per_suit[target] = new_val
+        sd = SUIT_DISPLAY.get(target, target)
+        await event.respond(
+            f"✅ B({sd}) défini manuellement : {old_val} → **{new_val}**\n"
+            f"(B admin reste à {compteur2_seuil_B})"
+        )
+        return
+
+    # ── /b increment N — change l'incrément B après perte ────────────────────
+    if arg == 'increment' and len(parts) >= 3:
+        try:
+            inc_val = int(parts[2])
+            assert 0 <= inc_val <= 10
+        except (ValueError, AssertionError):
+            await event.respond("❌ L'incrément doit être un entier entre 0 et 10.")
+            return
+        old_inc = B_LOSS_INCREMENT
+        B_LOSS_INCREMENT = inc_val
+        await event.respond(
+            f"✅ Incrément B après perte : **{old_inc}** → **{inc_val}**\n"
+            f"_(0 = pas d'augmentation automatique du B après une perte)_"
+        )
+        return
 
     # ── /b reset all ─────────────────────────────────────────────────────────
     if arg == 'reset' and len(parts) >= 3 and parts[2].lower() == 'all':
@@ -7094,138 +6813,6 @@ async def cmd_b(event):
         "`/b analyse` — Analyse automatique\n"
         "`/b cancel ♠` — Annuler un reset planifié"
     )
-
-
-async def cmd_compteur9(event):
-    """
-    /compteur9              — Affiche les compteurs C9 de l'heure en cours
-    /compteur9 seuil N      — Change le seuil SS (ex: /compteur9 seuil 10)
-    /compteur9 reset        — Remet les compteurs à zéro manuellement
-    """
-    global compteur9_ss
-    if event.is_group or event.is_channel:
-        return
-    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
-        await event.respond("🔒 Admin uniquement")
-        return
-    try:
-        parts = event.message.message.strip().split()
-        sub   = parts[1].lower() if len(parts) > 1 else ''
-
-        # ── Reset manuel ────────────────────────────────────────────────────
-        if sub == 'reset':
-            reset_compteur9_now()
-            await event.respond("🔄 **Compteur9 remis à zéro manuellement.**")
-            return
-
-        # ── Envoyer le PDF ──────────────────────────────────────────────────
-        if sub == 'pdf':
-            await event.respond("📄 Génération du PDF Compteur9…")
-            await send_compteur9_pdf()
-            return
-
-        # ── Changer le seuil SS ─────────────────────────────────────────────
-        if sub == 'seuil':
-            if len(parts) < 3 or not parts[2].isdigit():
-                await event.respond("❌ Usage: `/compteur9 seuil N` (ex: `/compteur9 seuil 10`)")
-                return
-            new_ss = int(parts[2])
-            if new_ss < 1 or new_ss > 50:
-                await event.respond("❌ Seuil SS doit être entre 1 et 50.")
-                return
-            compteur9_ss = new_ss
-            await event.respond(f"✅ Seuil SS Compteur9 → **{compteur9_ss}**")
-            return
-
-        # ── Affichage du statut ──────────────────────────────────────────────
-        now    = datetime.now()
-        next_h = (now.hour + 1) % 24
-        suit_emoji = {'♠': '♠️', '♥': '❤️', '♦': '♦️', '♣': '♣️'}
-        res_emoji  = {'win': '✅', 'loss': '❌', 'pending': '⏳', 'void': '🚫'}
-
-        # — Compteurs actuels —
-        sorted_suits = sorted(ALL_SUITS, key=lambda s: compteur9_counts[s], reverse=True)
-        counts_block = "\n".join(
-            f"  {suit_emoji.get(s, s)} : **{compteur9_counts[s]}**" for s in sorted_suits
-        )
-
-        # — Paires actives (écart actuel) —
-        paires_lines = []
-        for i, s_a in enumerate(ALL_SUITS):
-            for s_b in ALL_SUITS[i+1:]:
-                diff = abs(compteur9_counts[s_a] - compteur9_counts[s_b])
-                fort   = s_a if compteur9_counts[s_a] >= compteur9_counts[s_b] else s_b
-                faible = s_b if fort == s_a else s_a
-                fired  = (fort, faible) in compteur9_triggered_pairs
-                if diff > 0:
-                    if fired:
-                        marker = " ✅ traitée"
-                    elif diff >= compteur9_ss:
-                        marker = f" ⚠️ [{diff}/{compteur9_ss}]"
-                    else:
-                        marker = f" [{diff}/{compteur9_ss}]"
-                    paires_lines.append(
-                        f"  {suit_emoji.get(fort, fort)}({compteur9_counts[fort]}) — "
-                        f"{suit_emoji.get(faible, faible)}({compteur9_counts[faible]}) "
-                        f"= **{diff}**{marker}"
-                    )
-
-        reset_str  = compteur9_reset_time.strftime('%H:%M') if compteur9_reset_time else '--:--'
-        active_str = "🟢 ACTIF (< HH:30)" if _c9_is_active() else "🔴 INACTIF (≥ HH:30)"
-        last_res   = res_emoji.get(compteur9_last_result, '—') + f" {compteur9_last_result}" if compteur9_last_result != 'none' else '—'
-
-        lines = [
-            f"📈 **Compteur 9 — Contrôleur silencieux**\n",
-            f"⏰ Statut: {active_str}",
-            f"🕐 Reset: {reset_str}  |  Prochain: {next_h:02d}:00",
-            f"📏 Seuil SS: **{compteur9_ss}**",
-            f"📊 Dernier résultat silencieux: {last_res}",
-            f"🔔 Prochain envoi canal: {'**OUI** (après LOSS)' if compteur9_send_next_public else 'Non'}",
-            f"\n**Compteurs heure en cours:**",
-            counts_block,
-            f"\n**Paires (écart actuel):**",
-        ]
-        if paires_lines:
-            lines += paires_lines
-        else:
-            lines.append("  _(tous les costumes à zéro ou égaux)_")
-
-        # — Prédiction silencieuse en cours —
-        if compteur9_pending_silent:
-            p = compteur9_pending_silent
-            t = p['created_at'].strftime('%H:%M')
-            lines.append(
-                f"\n⏳ **Silencieuse en cours:** {suit_emoji.get(p['suit'], p['suit'])} "
-                f"au jeu #{p['target_game']} (crée {t})"
-            )
-
-        # — Historique des prédictions silencieuses (10 dernières) —
-        if compteur9_silent_history:
-            lines.append(f"\n📋 **Historique silencieux ({len(compteur9_silent_history)} total) :**")
-            for p in reversed(compteur9_silent_history[-10:]):
-                t     = p['created_at'].strftime('%H:%M')
-                res   = res_emoji.get(p['result'], '?')
-                s_em  = suit_emoji.get(p['suit'], p['suit'])
-                f_em  = suit_emoji.get(p['fort'], p['fort'])
-                lines.append(
-                    f"  {res} {s_em} au jeu #{p['target_game']} "
-                    f"_(fort={f_em} diff={p['diff']}, {t})_"
-                )
-        else:
-            lines.append("\n📋 **Historique silencieux:** _(vide)_")
-
-        lines += [
-            f"\n**Usage:**",
-            f"`/compteur9` — Afficher le statut complet",
-            f"`/compteur9 pdf` — Recevoir le PDF historique complet",
-            f"`/compteur9 seuil N` — Changer SS (actuel: {compteur9_ss})",
-            f"`/compteur9 reset` — Reset manuel (HH:00 = automatique)",
-        ]
-        await event.respond("\n".join(lines), parse_mode='markdown')
-
-    except Exception as e:
-        logger.error(f"Erreur cmd_compteur9: {e}")
-        await event.respond(f"❌ Erreur: {e}")
 
 
 async def cmd_favorables(event):
@@ -7690,7 +7277,7 @@ def _btns_cmp():
         [Button.inline("C2 — Absences préd.",  b"c2"), Button.inline("C4 — Longues abs.", b"c4")],
         [Button.inline("C5 — Patterns",        b"c5"), Button.inline("C6 — Dynamique Wj", b"c6")],
         [Button.inline("C7 — Présences cons.", b"c7"), Button.inline("C8 — Absences mir.", b"c8")],
-        [Button.inline("C9 — Silencieux SS",   b"c9"), Button.inline("📊  Stats C1",       b"st_v")],
+        [Button.inline("📊  Stats C1",          b"st_v")],
         [Button.inline("⬅️  Retour",            b"mn")],
     ]
 
@@ -7728,15 +7315,6 @@ def _btns_c8():
     return [
         [Button.inline("📊  Voir statut",                           b"c8_v")],
         [Button.inline("📄  PDF",  b"c8_p"), Button.inline("🔄  Reset", b"c8_r")],
-        [Button.inline("⬅️  Compteurs", b"cmp")],
-    ]
-
-
-def _btns_c9():
-    return [
-        [Button.inline("📊  Voir statut",                          b"c9_v")],
-        [Button.inline("📄  PDF",  b"c9_p"), Button.inline("🔄  Reset", b"c9_r")],
-        [Button.inline(f"⚙️  Seuil SS  (actuel: {compteur9_ss})",  b"c9_s")],
         [Button.inline("⬅️  Compteurs", b"cmp")],
     ]
 
@@ -7799,7 +7377,7 @@ async def handle_callback(event):
     """Gestionnaire central de tous les boutons inline."""
     global PREDICTION_DF, MIN_GAP_BETWEEN_PREDICTIONS, PREDICTION_HOURS
     global compteur2_active, compteur2_seuil_B, compteur2_seuil_B_per_suit
-    global COMPTEUR4_THRESHOLD, COMPTEUR7_THRESHOLD, COMPTEUR8_THRESHOLD, compteur9_ss
+    global COMPTEUR4_THRESHOLD, COMPTEUR7_THRESHOLD, COMPTEUR8_THRESHOLD
     global DISTRIBUTION_CHANNEL_ID, COMPTEUR2_CHANNEL_ID, heures_favorables_active
     global compteur4_trackers, compteur4_current, compteur4_events
     global compteur7_current, compteur8_current
@@ -7988,28 +7566,6 @@ async def handle_callback(event):
             save_compteur8_data()
             await event.answer("🔄 Compteur8 reset", alert=True)
 
-        # ── Compteur 9 ────────────────────────────────────────────────────────
-        elif data == 'c9':
-            await event.edit(f"📈 **COMPTEUR 9** — SS = {compteur9_ss}", buttons=_btns_c9())
-            await event.answer()
-
-        elif data == 'c9_v':
-            await event.answer()
-            await cmd_compteur9(_fake_ev(cid, '/compteur9'))
-
-        elif data == 'c9_p':
-            await event.answer("📄 Génération PDF C9…")
-            await send_compteur9_pdf()
-
-        elif data == 'c9_r':
-            reset_compteur9_now()
-            await event.answer("🔄 Compteur9 reset", alert=True)
-
-        elif data == 'c9_s':
-            pending_input[event.sender_id] = {'action': 'set_c9s', 'cid': cid}
-            await event.answer()
-            await client.send_message(cid, f"⚙️ **Seuil SS — Compteur9**\nValeur actuelle : **{compteur9_ss}**\nEnvoyez la nouvelle valeur (1-50) :")
-
         # ── Prédictions ───────────────────────────────────────────────────────
         elif data == 'rz_l':
             await event.answer("📋 Chargement…")
@@ -8154,7 +7710,7 @@ async def handle_admin_input(event):
     """Intercepte la saisie de valeurs numériques/texte après clic sur un bouton."""
     global PREDICTION_DF, MIN_GAP_BETWEEN_PREDICTIONS, PREDICTION_HOURS
     global compteur2_seuil_B, compteur2_seuil_B_per_suit
-    global COMPTEUR4_THRESHOLD, COMPTEUR7_THRESHOLD, compteur9_ss
+    global COMPTEUR4_THRESHOLD, COMPTEUR7_THRESHOLD
     global DISTRIBUTION_CHANNEL_ID, COMPTEUR2_CHANNEL_ID
 
     if event.is_group or event.is_channel:
@@ -8245,15 +7801,6 @@ async def handle_admin_input(event):
             COMPTEUR7_THRESHOLD = val
             await event.respond(f"✅ **Seuil Compteur7 : {old} → {val}**")
 
-        elif action == 'set_c9s':
-            val = int(text)
-            if not 1 <= val <= 50:
-                await event.respond("❌ Seuil entre 1 et 50")
-                return
-            old = compteur9_ss
-            compteur9_ss = val
-            await event.respond(f"✅ **Seuil SS Compteur9 : {old} → {val}**")
-
         elif action == 'set_cn_dist':
             new_id = int(text)
             if not await resolve_channel(new_id):
@@ -8301,6 +7848,8 @@ def setup_handlers():
     # ── Commandes texte (toujours disponibles) ─────────────────────────────────
     client.add_event_handler(cmd_heures,    events.NewMessage(pattern=r'^/heures'))
     client.add_event_handler(cmd_df,        events.NewMessage(pattern=r'^/df'))
+    client.add_event_handler(cmd_gh,        events.NewMessage(pattern=r'^/gh'))
+    client.add_event_handler(cmd_gk,        events.NewMessage(pattern=r'^/gk'))
     client.add_event_handler(cmd_gap,       events.NewMessage(pattern=r'^/gap'))
     client.add_event_handler(cmd_canaux,    events.NewMessage(pattern=r'^/canaux'))
     client.add_event_handler(cmd_stats,     events.NewMessage(pattern=r'^/stats$'))
@@ -8308,6 +7857,7 @@ def setup_handlers():
     client.add_event_handler(cmd_pending,   events.NewMessage(pattern=r'^/pending$'))
     client.add_event_handler(cmd_status,    events.NewMessage(pattern=r'^/status$'))
     client.add_event_handler(cmd_reset,     events.NewMessage(pattern=r'^/reset$'))
+    client.add_event_handler(cmd_resetdb,   events.NewMessage(pattern=r'^/resetdb'))
     client.add_event_handler(cmd_debloquer, events.NewMessage(pattern=r'^/debloquer$'))
     client.add_event_handler(cmd_help,      events.NewMessage(pattern=r'^/help$'))
     client.add_event_handler(cmd_raison,    events.NewMessage(pattern=r'^/raison'))
@@ -8320,7 +7870,6 @@ def setup_handlers():
     client.add_event_handler(cmd_compteur6, events.NewMessage(pattern=r'^/compteur6'))
     client.add_event_handler(cmd_compteur7, events.NewMessage(pattern=r'^/compteur7'))
     client.add_event_handler(cmd_compteur8, events.NewMessage(pattern=r'^/compteur8'))
-    client.add_event_handler(cmd_compteur9, events.NewMessage(pattern=r'^/compteur9'))
     client.add_event_handler(cmd_comparaison, events.NewMessage(pattern=r'^/comparaison'))
     client.add_event_handler(cmd_favorables,  events.NewMessage(pattern=r'^/favorables'))
     client.add_event_handler(cmd_panneaux,    events.NewMessage(pattern=r'^/panneaux$'))
@@ -8368,7 +7917,6 @@ async def start_bot():
         await load_compteur4_data()
         await load_compteur7_data()
         await load_compteur8_data()
-        await load_compteur9_data()
         await load_hourly_data()
         save_hourly_data()                # Persiste immédiatement en DB (migration JSON si besoin)
         await load_compteur11()           # Charge les perdus d'hier pour les rejouer aujourd'hui
@@ -8432,7 +7980,6 @@ async def main():
                 asyncio.create_task(heures_favorables_loop())
                 asyncio.create_task(heures_favorables_countdown_loop())
                 asyncio.create_task(restore_countdown_panel_if_needed())
-                asyncio.create_task(compteur9_reset_loop())
                 background_started = True
 
             logger.info(f"📏 Écart: {MIN_GAP_BETWEEN_PREDICTIONS}")

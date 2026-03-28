@@ -461,3 +461,33 @@ async def db_get_countdown_panel_count() -> int:
     except Exception as e:
         logger.error(f"❌ db_get_countdown_panel_count: {e}")
         return 0
+
+
+async def db_reset_all() -> dict:
+    """
+    Efface TOUTES les données des tables PostgreSQL.
+    Préserve la structure (tables non supprimées).
+    Retourne un dict {table: nb_lignes_supprimées}.
+    """
+    if _pool is None:
+        return {}
+    tables = [
+        'pending_predictions',
+        'prediction_history',
+        'countdown_panels',
+        'hourly_suit_data',
+        'kv_store',
+    ]
+    counts = {}
+    try:
+        async with _pool.acquire() as conn:
+            for table in tables:
+                row = await conn.fetchrow(f"SELECT COUNT(*) AS cnt FROM {table}")
+                cnt = int(row['cnt']) if row else 0
+                await conn.execute(f"DELETE FROM {table}")
+                counts[table] = cnt
+                logger.info(f"🗑️ DB reset: {table} → {cnt} ligne(s) supprimée(s)")
+        logger.warning("🔴 BASE DE DONNÉES ENTIÈREMENT VIDÉE (db_reset_all)")
+    except Exception as e:
+        logger.error(f"❌ db_reset_all: {e}")
+    return counts

@@ -74,13 +74,20 @@ COMPTEUR2_ACTIVE_DEFAULT  = True
 PREDICTION_DF_DEFAULT = 1
 
 # ============================================================================
-# COMPTEUR9 — ACCUMULATION PAR HEURE + PRÉDICTION SUR ÉCART (SS)
-# Compte les cartes joueur (carte à carte) depuis le dernier reset horaire.
-# Quand count_A - count_B >= SS → prédit le costume B (le plus faible).
-# Reset automatique à chaque heure pile (HH:00:00).
+# OFFSETS GH / GK — DISTANCES DE PRÉDICTION (Compteur2)
+# GH : offset pour prédire le manquant confirmé (B absent, C6 confirme)
+# GK : offset pour prédire l'inverse du manquant (C6 redirige vers l'inverse)
 # ============================================================================
 
-COMPTEUR9_SS_DEFAULT = 7
+GH_DEFAULT = 2   # prédit le manquant à dernier_numéro + GH
+GK_DEFAULT = 1   # prédit l'inverse  à dernier_numéro + GK
+
+# ============================================================================
+# INCRÉMENT B APRÈS ÉCHEC
+# B_INCREMENT_DEFAULT : combien de points est ajouté au B d'un costume après un PERDU
+# ============================================================================
+
+B_INCREMENT_DEFAULT = 1
 
 # ============================================================================
 # COMPTEUR8 — ABSENCES CONSÉCUTIVES
@@ -89,12 +96,6 @@ COMPTEUR9_SS_DEFAULT = 7
 
 COMPTEUR8_THRESHOLD = 5
 COMPTEUR8_DATA_FILE = 'compteur8_data.json'
-
-# ============================================================================
-# COMPTEUR9 — PRÉDICTIONS SILENCIEUSES (persistance)
-# ============================================================================
-
-COMPTEUR9_DATA_FILE = 'compteur9_data.json'
 
 # ============================================================================
 # PARAMÈTRES DE SÉCURITÉ
