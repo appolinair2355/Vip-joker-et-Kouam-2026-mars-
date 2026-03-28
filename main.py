@@ -94,6 +94,10 @@ bilan_interval_hours: int = 4   # Actif par défaut — toutes les 4h pile (00h,
 bilan_task: Optional[asyncio.Task] = None
 bilan_1440_sent: bool = False  # Évite le double envoi au jeu #1440
 
+# Concours par costume — mémoire du cycle précédent
+concours_last_winner: Optional[str] = None   # suit du vainqueur du dernier cycle
+concours_last_pct:    float          = 0.0   # taux de réussite du dernier vainqueur
+
 # Heures favorables automatique vers le canal
 heures_favorables_active: bool = True  # Annonce toutes les 3h pile
 heures_fav_countdown_msg_id: Optional[int] = None       # ID du message compte à rebours en cours
@@ -1111,6 +1115,287 @@ def get_bilan_text() -> str:
         f"💔 Taux de perte   : **{taux_perdu:.1f}%** ({counts['perdu']} perdues)",
     ]
     return "\n".join(lines)
+
+SUIT_NAMES_FR = {'♠': 'Pique', '♥': 'Cœur', '♦': 'Carreau', '♣': 'Trèfle'}
+SUIT_EMOJI    = {'♠': '♠️', '♥': '♥️', '♦': '♦️', '♣': '♣️'}
+
+SUIT_WINNER_PHRASES = {
+    '♠': (
+        "♠️ Pique a dominé ce cycle avec une maîtrise implacable !\n"
+        "Taillant sa route dans chaque partie comme une lame affûtée,\n"
+        "rien ne pouvait l'arrêter — la précision était son arme,\n"
+        "la constance son bouclier. Un champion digne de ce nom !"
+    ),
+    '♥': (
+        "♥️ Cœur a rayonné tout au long de ce cycle avec générosité !\n"
+        "Chaque prédiction portait son empreinte, guidant nos membres\n"
+        "vers la victoire avec passion et régularité.\n"
+        "Un palmarès brillant, une performance digne d'un champion !"
+    ),
+    '♦': (
+        "♦️ Carreau a brillé comme un diamant dans ce cycle !\n"
+        "Des prédictions d'une précision cristalline, une rigueur\n"
+        "et un éclat qui ont illuminé tout le cycle.\n"
+        "Une performance de joaillier — digne du podium suprême !"
+    ),
+    '♣': (
+        "♣️ Trèfle a porté chance à tout le groupe ce cycle !\n"
+        "Incarnant la force tranquille qui renverse tous les obstacles,\n"
+        "solide, fiable et redoutable — le symbole de la persévérance\n"
+        "enfin récompensée. Bravo, la porte-bonheur du groupe !"
+    ),
+}
+
+SUIT_ENCOURAGE = {
+    '♠': {
+        1: "♠️ Pique — Champion incontesté ! Continue sur cette lancée, la couronne est bien méritée. 👑",
+        2: "♠️ Pique — Si proche du sommet ! Un peu plus de régularité et la première place est pour toi. 💪",
+        3: "♠️ Pique — Un cycle en retrait mais le potentiel est là. Reviens plus mordant au prochain tour ! 🔥",
+        4: "♠️ Pique — Dernière place ce cycle, mais chaque cycle est une nouvelle chance. Accroche-toi ! ⚡",
+    },
+    '♥': {
+        1: "♥️ Cœur — Magnifique performance ! Tu as tout donné et ça se voit. Reste au sommet ! 👑",
+        2: "♥️ Cœur — La deuxième marche du podium, c'est déjà beau ! La première place t'attend demain. 💪",
+        3: "♥️ Cœur — Tu peux faire mieux et tu le sais ! Concentre-toi et le prochain cycle sera le tien. 🔥",
+        4: "♥️ Cœur — Pas un grand cycle mais rien n'est perdu. Les grands champions rebondissent toujours ! ⚡",
+    },
+    '♦': {
+        1: "♦️ Carreau — Brillant comme un diamant ! Ce cycle t'appartient, continue à étinceler. 👑",
+        2: "♦️ Carreau — Très bon cycle ! Tu touches presque le sommet — encore un effort ! 💪",
+        3: "♦️ Carreau — Quelques lacunes ce cycle, mais le talent est indéniable. Relève la tête ! 🔥",
+        4: "♦️ Carreau — En bas du classement aujourd'hui, mais les diamants se forment sous pression ! ⚡",
+    },
+    '♣': {
+        1: "♣️ Trèfle — Tu as tout renversé ce cycle ! La chance était avec toi et tu en as profité. 👑",
+        2: "♣️ Trèfle — Excellente performance ! À quelques points du titre — ne lâche pas ! 💪",
+        3: "♣️ Trèfle — Honnête performance mais tu peux viser plus haut. Le suivant sera le bon ! 🔥",
+        4: "♣️ Trèfle — Dernier ce cycle, mais le trèfle porte bonheur — ton heure viendra très bientôt ! ⚡",
+    },
+}
+
+RANK_MEDALS = ['🥇', '🥈', '🥉', '4️⃣']
+RANK_LABELS = ['1er', '2ème', '3ème', '4ème']
+
+_SEP  = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+_DBL  = "══════════════════════════════════"
+_CIRC = {1: '①', 2: '②', 3: '③', 4: '④'}
+
+def _suit_stats_block(suit: str, s: dict, rank: int) -> list:
+    """
+    Génère le bloc statistiques d'un costume au style image :
+    numéro cerclé dans colonne gauche, stats dans colonne droite.
+    """
+    em   = SUIT_EMOJI[suit]
+    name = SUIT_NAMES_FR[suit]
+    r0   = s['r0'];  r1 = s['r1'];  r2 = s['r2'];  r3 = s['r3']
+    lost = s['losses'];  total = s['total']
+    wins = r0 + r1 + r2 + r3
+    pct  = (wins / total * 100) if total > 0 else 0.0
+    num  = _CIRC.get(rank, str(rank))
+    return [
+        f"╔══╦══════════════════════════════╗",
+        f"║{num} ║  {em}  {name.upper():<25}║",
+        f"╠══╬══════════════════════════════╣",
+        f"║  ║  ✅ Gagné Direct  :  {r0:<5}    ║",
+        f"║  ║  🔄 Gagné R1      :  {r1:<5}    ║",
+        f"║  ║  🔄 Gagné R2      :  {r2:<5}    ║",
+        f"║  ║  🔄 Gagné R3      :  {r3:<5}    ║",
+        f"║  ║  ❌ Perdu         :  {lost:<5}    ║",
+        f"║  ╠══════════════════════════════╣",
+        f"║  ║  📦 TOTAL         :  {total:<5}    ║",
+        f"║  ║  🎯 RÉUSSITE      :  {pct:>5.1f}%   ║",
+        f"╚══╩══════════════════════════════╝",
+    ]
+
+
+def get_concours_par_costume_text() -> tuple:
+    """
+    Calcule et formate le palmarès du concours de prédictions par costume
+    pour la fin du cycle #1440.
+    Retourne un tuple (msg1, msg2) car le message total dépasse la limite
+    de 4096 caractères de Telegram.
+      msg1 : En-tête + Statistiques détaillées (≈2250 chars)
+      msg2 : Classement + Félicitations + Comparaison + Encouragements + Signature (≈2000 chars)
+    """
+    global concours_last_winner, concours_last_pct
+
+    # ── 1. Calculer les stats par costume ────────────────────────────────────
+    stats = {
+        s: {'r0': 0, 'r1': 0, 'r2': 0, 'r3': 0,
+            'wins': 0, 'losses': 0, 'total': 0, 'pct': 0.0}
+        for s in ALL_SUITS
+    }
+    for pred in prediction_history:
+        suit = pred.get('suit', '')
+        if suit not in stats:
+            continue
+        st = pred.get('status', '')
+        rl = pred.get('rattrapage_level', 0)
+        if 'gagne' in st:
+            key = f'r{min(rl, 3)}'
+            stats[suit][key]     += 1
+            stats[suit]['wins']  += 1
+            stats[suit]['total'] += 1
+        elif st == 'perdu':
+            stats[suit]['losses'] += 1
+            stats[suit]['total']  += 1
+
+    for suit in stats:
+        t = stats[suit]['total']
+        stats[suit]['pct'] = (stats[suit]['wins'] / t * 100) if t > 0 else 0.0
+
+    ranked = sorted(
+        ALL_SUITS,
+        key=lambda s: (stats[s]['pct'], stats[s]['total']),
+        reverse=True
+    )
+
+    winner      = ranked[0]
+    winner_name = SUIT_NAMES_FR[winner]
+    winner_em   = SUIT_EMOJI[winner]
+    winner_pct  = stats[winner]['pct']
+    winner_wins = stats[winner]['wins']
+    winner_tot  = stats[winner]['total']
+
+    now = datetime.now().strftime('%d/%m/%Y')
+
+    # ── 2. EN-TÊTE PRINCIPAL ──────────────────────────────────────────────────
+    lines = [
+        "",
+        "╔══════════════════════════════════╗",
+        "║  🎴  B A C C A R A T   A I  🎴  ║",
+        "║                                  ║",
+        "║  RÉSULTATS DU CONCOURS DE        ║",
+        "║  PRÉDICTIONS PAR COSTUME         ║",
+        "║  ♠️  ♦️  ♥️  ♣️                   ║",
+        "║                                  ║",
+        f"║  🔢 FIN DE CYCLE — JEU #1440     ║",
+        f"║  📅 {now:<28}  ║",
+        "╚══════════════════════════════════╝",
+        "",
+    ]
+
+    # ── 3. SECTION : Statistiques ─────────────────────────────────────────────
+    lines += [
+        "╔══════════════════════════════════╗",
+        "║  📋 STATISTIQUES DÉTAILLÉES       ║",
+        "║     PAR COSTUME                  ║",
+        "╚══════════════════════════════════╝",
+        "",
+    ]
+    for i, suit in enumerate(ranked):
+        lines += _suit_stats_block(suit, stats[suit], i + 1)
+        lines.append("")
+
+    # ── MESSAGE 2 : Classement + Champion + Comparaison + Encouragements + Signature ──
+    lines2 = []
+
+    # ── 4. SECTION : Classement final ─────────────────────────────────────────
+    lines2 += [
+        "╔══════════════════════════════════╗",
+        "║  🏆  CLASSEMENT FINAL DU CYCLE   ║",
+        "╠══════════════════════════════════╣",
+    ]
+    for i, suit in enumerate(ranked):
+        em   = SUIT_EMOJI[suit]
+        name = SUIT_NAMES_FR[suit]
+        s    = stats[suit]
+        lines2.append(
+            f"║  {RANK_MEDALS[i]} {RANK_LABELS[i]:<5} {em} {name:<8}  {s['pct']:>5.1f}%  ({s['total']} pred.) ║"
+        )
+    lines2 += ["╚══════════════════════════════════╝", ""]
+
+    # ── 5. SECTION : Félicitations vainqueur ──────────────────────────────────
+    lines2 += [
+        "╔══════════════════════════════════╗",
+        f"║  🎉 FÉLICITATIONS AU CHAMPION !  ║",
+        "╠══════════════════════════════════╣",
+        f"║  🏆 🏆 🏆 🏆 🏆                  ║",
+        f"║  {winner_em}  {winner_name.upper():<29}║",
+        "╠══════════════════════════════════╣",
+        f"║  📊 Taux de réussite : {winner_pct:>5.1f}%      ║",
+    ]
+    if winner_tot > 0:
+        lines2.append(f"║  ✅ {winner_wins} gagnées / {winner_tot} prédictions{'':>8}║")
+    lines2 += [
+        "╠══════════════════════════════════╣",
+        "║                                  ║",
+    ]
+    for phrase_line in SUIT_WINNER_PHRASES[winner].split('\n'):
+        lines2.append(f"║  {phrase_line:<32}║")
+    lines2 += [
+        "║                                  ║",
+        "╠══════════════════════════════════╣",
+        "║  💰 4 000 000 FCFA attribués      ║",
+        "║     par Kouamé Sossou !          ║",
+        "╚══════════════════════════════════╝",
+        "",
+    ]
+
+    # ── 6. SECTION : Comparaison cycle précédent ──────────────────────────────
+    lines2 += [
+        "╔══════════════════════════════════╗",
+        "║  📈 COMPARAISON — CYCLE PRÉCÉDENT║",
+        "╚══════════════════════════════════╝",
+        "",
+    ]
+    if concours_last_winner and concours_last_winner in SUIT_NAMES_FR:
+        prev      = concours_last_winner
+        prev_em   = SUIT_EMOJI[prev]
+        prev_name = SUIT_NAMES_FR[prev]
+        prev_pct  = concours_last_pct
+        if prev == winner:
+            lines2 += [
+                f"🔁 {winner_em} {winner_name} CONFIRME SA DOMINATION !",
+                f"Déjà 1er au cycle précédent ({prev_pct:.1f}%),",
+                f"il récidive avec {winner_pct:.1f}% — constance remarquable !",
+                f"Les autres devront redoubler d'efforts pour le détrôner.",
+            ]
+        else:
+            diff  = winner_pct - prev_pct
+            trend = "montée en puissance spectaculaire !" if diff > 10 else \
+                    "belle progression !" if diff > 0 else \
+                    "résultat serré mais suffisant pour s'imposer !"
+            lines2 += [
+                f"Au cycle précédent, {prev_em} {prev_name.upper()} était",
+                f"en tête avec {prev_pct:.1f}%.",
+                "",
+                f"Mais aujourd'hui {winner_em} {winner_name.upper()} a",
+                f"pris le dessus avec {winner_pct:.1f}% — {trend}",
+                "",
+                f"👉 {prev_em} {prev_name} a cédé sa place ce cycle,",
+                f"mais il peut faire encore mieux au prochain !",
+            ]
+    else:
+        lines2 += [
+            "🆕 Premier concours enregistré !",
+            "Les résultats seront comparés dès le prochain cycle.",
+            "Rendez-vous au prochain #1440 !",
+        ]
+    lines2.append("")
+
+    # ── 7. SECTION : Un mot pour chaque costume ───────────────────────────────
+    lines2 += [
+        "╔══════════════════════════════════╗",
+        "║  💬 UN MOT POUR CHAQUE COSTUME   ║",
+        "╚══════════════════════════════════╝",
+        "",
+    ]
+    for i, suit in enumerate(ranked):
+        lines2.append(SUIT_ENCOURAGE[suit][i + 1])
+        lines2.append("")
+
+    # ── 8. SIGNATURE ─────────────────────────────────────────────────────────
+    lines2 += [
+        "╔══════════════════════════════════╗",
+        "║  ✍️  BACCARAT AI                  ║",
+        "║      par Kouamé Sossou           ║",
+        "║  🚀 Nouveau cycle — en avant !   ║",
+        "╚══════════════════════════════════╝",
+    ]
+
+    return "\n".join(lines), "\n".join(lines2)
+
 
 async def bilan_loop():
     """Envoie le bilan toutes les 4h à heure alignée : 00h, 04h, 08h, 12h, 16h, 20h."""
@@ -4196,6 +4481,49 @@ async def send_bilan_and_reset_at_1440():
             logger.info("📊 Bilan #1440 envoyé à l'administrateur (chat privé).")
         except Exception as e:
             logger.error(f"❌ Erreur envoi bilan #1440 admin: {e}")
+
+    # ── ÉTAPE 1.5 : Concours par costume → canal public ─────────────────────
+    global concours_last_winner, concours_last_pct
+    try:
+        concours_txt1, concours_txt2 = get_concours_par_costume_text()
+
+        # Identifier le vainqueur actuel pour le sauvegarder comme "précédent"
+        _stats_tmp = {s: {'wins': 0, 'total': 0} for s in ALL_SUITS}
+        for _p in prediction_history:
+            _s = _p.get('suit', '')
+            if _s in _stats_tmp:
+                _st = _p.get('status', '')
+                if 'gagne' in _st:
+                    _stats_tmp[_s]['wins']  += 1
+                    _stats_tmp[_s]['total'] += 1
+                elif _st == 'perdu':
+                    _stats_tmp[_s]['total'] += 1
+        for _s in _stats_tmp:
+            _t = _stats_tmp[_s]['total']
+            _stats_tmp[_s]['pct'] = (_stats_tmp[_s]['wins'] / _t * 100) if _t > 0 else 0.0
+        _current_winner = max(ALL_SUITS, key=lambda s: (_stats_tmp[s]['pct'], _stats_tmp[s]['total']))
+        _current_pct    = _stats_tmp[_current_winner]['pct']
+
+        # Persister en DB avant le reset (sera chargé au prochain démarrage)
+        await db.db_save_kv('concours_last_winner', {
+            'suit': _current_winner,
+            'pct':  round(_current_pct, 2),
+        })
+        # Mettre à jour les globaux pour la prochaine fois que la fonction est appelée
+        concours_last_winner = _current_winner
+        concours_last_pct    = _current_pct
+        logger.info(f"💾 Vainqueur concours sauvegardé : {_current_winner} ({_current_pct:.1f}%)")
+
+        canal_entity = await resolve_channel(PREDICTION_CHANNEL_ID)
+        if canal_entity:
+            await client.send_message(canal_entity, concours_txt1, parse_mode='markdown')
+            await asyncio.sleep(2)
+            await client.send_message(canal_entity, concours_txt2, parse_mode='markdown')
+            logger.info("🏆 Messages concours par costume envoyés dans le canal (2 messages).")
+        else:
+            logger.warning("⚠️ Canal introuvable — concours non envoyé dans le canal.")
+    except Exception as e:
+        logger.error(f"❌ Erreur envoi concours #1440 canal: {e}")
 
     # ── ÉTAPE 2 : Envoi de tous les PDFs AVANT le reset ─────────────────────
     logger.info("📄 Envoi des PDFs avant reset #1440...")
@@ -7922,6 +8250,16 @@ async def start_bot():
         await load_compteur11()           # Charge les perdus d'hier pour les rejouer aujourd'hui
         await load_pending_predictions()  # Reprend les prédictions en cours après redémarrage
         await load_prediction_history()   # Charge l'historique pour les heures favorables
+
+        # Charger le vainqueur du dernier concours (comparaison inter-cycles)
+        global concours_last_winner, concours_last_pct
+        _last = await db.db_load_kv('concours_last_winner')
+        if isinstance(_last, dict) and _last.get('suit') in SUIT_NAMES_FR:
+            concours_last_winner = _last['suit']
+            concours_last_pct    = float(_last.get('pct', 0.0))
+            logger.info(f"🏆 Dernier vainqueur concours chargé : {concours_last_winner} ({concours_last_pct:.1f}%)")
+        else:
+            logger.info("🏆 Aucun vainqueur concours précédent en DB")
         # Charger le compteur de panneaux depuis la DB
         global countdown_panel_counter
         countdown_panel_counter = await db.db_get_countdown_panel_count()
