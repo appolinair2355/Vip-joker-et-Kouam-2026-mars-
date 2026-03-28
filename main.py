@@ -1505,13 +1505,14 @@ def generate_heures_favorables_canal() -> str:
     """
     Génère le message complet pour le canal :
     - Tous les créneaux favorables identifiés
-    - Le prochain créneau à venir
-    - Signature
+    - Le prochain créneau à venir (seulement si dans les prochaines heures aujourd'hui)
+    - Si aucun créneau ne reste aujourd'hui : message "aucun créneau ce soir"
     Retourne "" si données insuffisantes ou aucun créneau identifié.
     """
     SIGNATURE = "\n\n_En Dieu nous comptons, Sossou Kouamé prediction 🔥_"
     now_ci = datetime.now(timezone.utc).replace(tzinfo=None)
     now_h  = now_ci.hour
+    now_str = now_ci.strftime('%Hh%M')
 
     stat_results = compute_heures_favorables()
     all_heures   = sorted(e['heure'] for e in stat_results)
@@ -1520,12 +1521,24 @@ def generate_heures_favorables_canal() -> str:
     if total_games < 50 or not all_heures:
         return ""
 
-    lines = ["⏰ *Heures favorables* _(heure de Côte d'Ivoire)_\n"]
-
     intervals = group_heures_into_intervals(all_heures)
+
+    # Chercher uniquement les créneaux restants AUJOURD'HUI (après l'heure actuelle)
+    upcoming = [h for h in all_heures if h > now_h]
+
+    if not upcoming:
+        # Aucun créneau favorable ce soir → message spécifique
+        return (
+            f"⏰ *Analyse des heures favorables* _(heure de Côte d'Ivoire)_\n\n"
+            f"🟢 *Créneaux favorables identifiés :* " + " · ".join(intervals) + "\n\n"
+            f"⚠️ *Aucun créneau favorable de {now_str} à 00h00.*\n\n"
+            f"_En attendant d'autres analyses pour vous servir._"
+            + SIGNATURE
+        )
+
+    lines = ["⏰ *Heures favorables* _(heure de Côte d'Ivoire)_\n"]
     lines.append("🟢 *Créneaux favorables :* " + " · ".join(intervals))
 
-    upcoming = [h for h in all_heures if h > now_h] or all_heures
     nxt   = upcoming[0]
     nxt_i = group_heures_into_intervals([nxt])[0]
     dans  = _temps_restant(now_ci, nxt)
@@ -1935,13 +1948,13 @@ async def restore_countdown_panel_if_needed():
 
         # ── Étape 2 : pas de panneau actif → chercher une heure favorable ─────
         _total = sum(hourly_game_count[h] for h in range(24))
+        saved_fav = await db.db_load_kv('last_heures_favorables')
+
         if _total < 50:
-            # Données horaires insuffisantes → essayer de charger la dernière analyse sauvegardée
-            saved_fav = await db.db_load_kv('last_heures_favorables')
+            # Données insuffisantes → utiliser la dernière analyse sauvegardée
             if not saved_fav or not saved_fav.get('favorables'):
                 logger.info("🟦 Restauration panneau ignorée : données insuffisantes et aucune analyse sauvegardée")
                 return
-            # Vérifier que l'analyse n'est pas trop ancienne (max 25h)
             try:
                 computed_at = datetime.fromisoformat(saved_fav['computed_at'])
                 age_h = (datetime.now() - computed_at).total_seconds() / 3600
@@ -1958,7 +1971,22 @@ async def restore_countdown_panel_if_needed():
                 f"calculée le {saved_fav.get('computed_at','?')[:16]})"
             )
         else:
-            favorables = compute_heures_favorables()
+            # Données disponibles → préférer l'analyse sauvegardée par heures_favorables_loop
+            # si elle est récente (≤ 3h) pour rester cohérent avec le message canal
+            use_saved = False
+            if saved_fav and saved_fav.get('favorables'):
+                try:
+                    computed_at = datetime.fromisoformat(saved_fav['computed_at'])
+                    age_h = (datetime.now() - computed_at).total_seconds() / 3600
+                    if age_h <= 3:
+                        favorables = saved_fav['favorables']
+                        use_saved = True
+                        logger.info(f"🟦 Panneau: analyse sauvegardée utilisée ({age_h:.1f}h) — cohérence avec message canal")
+                except Exception:
+                    pass
+            if not use_saved:
+                favorables = compute_heures_favorables()
+
         if not favorables:
             return
 
@@ -2033,7 +2061,20 @@ async def _try_send_new_countdown_panel():
     _total = sum(hourly_game_count[h] for h in range(24))
     if _total < 50:
         return False
-    favorables = compute_heures_favorables()
+
+    # Préférer l'analyse sauvegardée si récente (≤ 3h) pour cohérence avec le message canal
+    favorables = None
+    saved_fav  = await db.db_load_kv('last_heures_favorables')
+    if saved_fav and saved_fav.get('favorables'):
+        try:
+            computed_at = datetime.fromisoformat(saved_fav['computed_at'])
+            age_h = (datetime.now() - computed_at).total_seconds() / 3600
+            if age_h <= 3:
+                favorables = saved_fav['favorables']
+        except Exception:
+            pass
+    if not favorables:
+        favorables = compute_heures_favorables()
     if not favorables:
         return False
 
@@ -4972,7 +5013,7 @@ async def auto_watchdog_task():
     global pending_predictions, suit_block_until, prediction_queue, api_silence_alerted
     from config import PREDICTION_TIMEOUT_MINUTES, FORCE_RESTART_THRESHOLD
 
-    HARD_TIMEOUT = max(PREDICTION_TIMEOUT_MINUTES + 5, 15)  # 15 min minimum
+    HARD_TIMEOUT = max(PREDICTION_TIMEOUT_MINUTES, 8)  # 8 min minimum (API bloquée)
 
     while True:
         await asyncio.sleep(60)
@@ -7325,6 +7366,133 @@ async def cmd_panneaux(event):
 
 
 # ============================================================================
+# COMMANDE /concours — résultats en cours du concours (avant le jeu #1440)
+# ============================================================================
+
+async def cmd_concours(event):
+    """
+    /concours — Admin : affiche les résultats actuels du concours par costume
+    (mêmes statistiques que le message #1440 mais en temps réel).
+    """
+    if event.is_group or event.is_channel:
+        return
+    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+        await event.respond("🔒 Admin uniquement")
+        return
+
+    try:
+        rows = await db.db_load_prediction_history(limit=500)
+    except Exception as e:
+        await event.respond(f"❌ Erreur lecture DB: {e}")
+        return
+
+    if not rows:
+        await event.respond("📭 Aucune prédiction enregistrée pour l'instant.")
+        return
+
+    SUITS_ORDER = ["♠️", "♣️", "♦️", "♥️"]
+    SUIT_NAMES  = {"♠️": "PIQUE", "♣️": "TRÈFLE", "♦️": "CARREAU", "♥️": "CŒUR"}
+    SUIT_EMOJI  = {"♠️": "♠️", "♣️": "♣️", "♦️": "♦️", "♥️": "♥️"}
+
+    stats = {s: {"total": 0, "gagne": 0, "perdu": 0, "r0": 0, "r1": 0} for s in SUITS_ORDER}
+    total_g = 0
+    total_p = 0
+
+    for row in rows:
+        suit   = row.get("predicted_suit", "")
+        status = row.get("status", "")
+        if suit not in stats:
+            continue
+        stats[suit]["total"] += 1
+        if status in ("gagne_r0", "gagne_r1", "gagne"):
+            stats[suit]["gagne"] += 1
+            total_g += 1
+            if status == "gagne_r0":
+                stats[suit]["r0"] += 1
+            elif status == "gagne_r1":
+                stats[suit]["r1"] += 1
+        elif status == "perdu":
+            stats[suit]["perdu"] += 1
+            total_p += 1
+
+    total_pred = total_g + total_p
+    pct_global = round(total_g / total_pred * 100, 1) if total_pred else 0.0
+
+    jeu_actuel = current_game_number
+    GAME_FIN   = 1440
+    restants   = max(0, GAME_FIN - jeu_actuel)
+
+    now_str = datetime.now().strftime("%d/%m/%Y %H:%M")
+
+    # ── Classement par taux de réussite ──
+    classement = sorted(
+        SUITS_ORDER,
+        key=lambda s: (stats[s]["gagne"] / stats[s]["total"] if stats[s]["total"] else 0),
+        reverse=True
+    )
+    champion = classement[0]
+    champ_pct = round(stats[champion]["gagne"] / stats[champion]["total"] * 100, 1) if stats[champion]["total"] else 0.0
+
+    # ─── Message 1 ───
+    lines1 = [
+        f"🏆 **CONCOURS PAR COSTUME — EN COURS**",
+        f"📅 {now_str}  |  🎮 Jeu actuel: **#{jeu_actuel}**",
+        f"⏳ Jeux restants avant #1440: **{restants}**",
+        "",
+        f"📊 **Global:** {total_g}✅ / {total_p}❌  sur {total_pred} prédictions",
+        f"🎯 **Taux global: {pct_global}%**",
+        "",
+    ]
+
+    for suit in SUITS_ORDER:
+        s = stats[suit]
+        t = s["total"]
+        g = s["gagne"]
+        p = s["perdu"]
+        pct = round(g / t * 100, 1) if t else 0.0
+        bar_full  = round(pct / 10)
+        bar_empty = 10 - bar_full
+        bar = "█" * bar_full + "░" * bar_empty
+        nom = SUIT_NAMES[suit]
+        lines1 += [
+            f"{'─'*28}",
+            f"{SUIT_EMOJI[suit]} **{nom}**",
+            f"  ✅ Gagnées : {g}  (R0:{s['r0']}  R1:{s['r1']})",
+            f"  ❌ Perdues : {p}",
+            f"  📈 Taux    : **{pct}%**  [{bar}]",
+        ]
+
+    # ─── Message 2 ───
+    lines2 = [
+        f"🥇 **CLASSEMENT PROVISOIRE**",
+        "",
+    ]
+    medals = ["🥇", "🥈", "🥉", "4️⃣"]
+    for i, suit in enumerate(classement):
+        s = stats[suit]
+        t = s["total"]
+        g = s["gagne"]
+        pct = round(g / t * 100, 1) if t else 0.0
+        lines2.append(f"{medals[i]} {SUIT_EMOJI[suit]} {SUIT_NAMES[suit]} — {pct}%  ({g}/{t})")
+
+    lines2 += [
+        "",
+        f"👑 **CHAMPION PROVISOIRE: {SUIT_EMOJI[champion]} {SUIT_NAMES[champion]}** ({champ_pct}%)",
+        "",
+        f"⚠️ Résultats provisoires — concours se termine au jeu **#1440**",
+        f"🔢 Il reste **{restants} jeux** pour renverser le classement.",
+    ]
+
+    msg1 = "\n".join(lines1)
+    msg2 = "\n".join(lines2)
+
+    await event.respond(msg1, parse_mode='markdown')
+    await asyncio.sleep(1)
+    await event.respond(msg2, parse_mode='markdown')
+    logger.info(f"📊 /concours envoyé : #{jeu_actuel} — {total_pred} prédictions ({pct_global}%)")
+
+
+# ============================================================================
 # COMMANDE /testpred — envoie une prédiction test sur le canal
 # ============================================================================
 
@@ -8201,6 +8369,7 @@ def setup_handlers():
     client.add_event_handler(cmd_comparaison, events.NewMessage(pattern=r'^/comparaison'))
     client.add_event_handler(cmd_favorables,  events.NewMessage(pattern=r'^/favorables'))
     client.add_event_handler(cmd_panneaux,    events.NewMessage(pattern=r'^/panneaux$'))
+    client.add_event_handler(cmd_concours,    events.NewMessage(pattern=r'^/concours$'))
     client.add_event_handler(cmd_testpred,    events.NewMessage(pattern=r'^/testpred'))
     client.add_event_handler(cmd_verifier,    events.NewMessage(pattern=r'^/verifier$'))
     client.add_event_handler(on_reaction_event, events.Raw(UpdateMessageReactions))

@@ -1,6 +1,7 @@
 import requests
 import json
-
+import time
+import random
 
 API_URL = "https://1xbet.com/service-api/LiveFeed/GetSportsShortZip"
 API_PARAMS = {
@@ -12,13 +13,36 @@ API_PARAMS = {
     "virtualSports": "true",
     "groupChamps": "true"
 }
-API_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "application/json",
-    "Referer": "https://1xbet.com/",
-}
+
+# Rotation de User-Agents pour éviter les blocages répétés
+_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15",
+]
 
 SUIT_MAP = {0: "♠️", 1: "♣️", 2: "♦️", 3: "♥️"}
+
+_last_ua_index = 0
+
+
+def _get_headers():
+    """Retourne des headers avec un User-Agent rotatif."""
+    global _last_ua_index
+    ua = _USER_AGENTS[_last_ua_index % len(_USER_AGENTS)]
+    _last_ua_index += 1
+    return {
+        "User-Agent": ua,
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://1xbet.com/",
+        "Origin": "https://1xbet.com",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
 
 
 def _parse_cards(sc_s_list):
@@ -57,66 +81,110 @@ def _parse_winner(sc_s_list):
     return None
 
 
+def _do_request(attempt: int):
+    """
+    Effectue un appel HTTP vers l'API 1xBet.
+    Timeout plus long sur les tentatives suivantes.
+    """
+    connect_t = 5 + attempt * 2   # 5s, 7s, 9s
+    read_t    = 8 + attempt * 3   # 8s, 11s, 14s
+    return requests.get(
+        API_URL,
+        params=API_PARAMS,
+        headers=_get_headers(),
+        timeout=(connect_t, read_t),
+    )
+
+
 def get_latest_results():
     """
     Récupère les derniers résultats de Baccara depuis l'API 1xBet.
+    Retry automatique jusqu'à 3 tentatives avec backoff et rotation User-Agent.
     Structure réelle de l'API :
       data["Value"] → liste de sports
         sport["L"]  → liste de championnats
           champ["G"] → liste de jeux
     """
-    try:
-        response = requests.get(API_URL, params=API_PARAMS, headers=API_HEADERS, timeout=(5, 8))
-        data = response.json()
+    max_attempts = 3
+    last_error = None
 
-        if "Value" not in data or not isinstance(data["Value"], list):
-            return []
+    for attempt in range(max_attempts):
+        try:
+            response = _do_request(attempt)
 
-        baccara_sport = None
-        for sport in data["Value"]:
-            if sport.get("N") == "Baccarat" or sport.get("I") == 236:
-                if "L" in sport:
-                    baccara_sport = sport
-                    break
+            if response.status_code != 200:
+                last_error = f"HTTP {response.status_code}"
+                if attempt < max_attempts - 1:
+                    time.sleep(1 + attempt)
+                continue
 
-        if baccara_sport is None:
-            return []
+            data = response.json()
 
-        results = []
+            if "Value" not in data or not isinstance(data["Value"], list):
+                last_error = "Structure API inattendue (champ Value manquant)"
+                if attempt < max_attempts - 1:
+                    time.sleep(1)
+                continue
 
-        for championship in baccara_sport["L"]:
-            games = championship.get("G", [])
-            for game in games:
-                if "DI" not in game:
-                    continue
+            baccara_sport = None
+            for sport in data["Value"]:
+                if sport.get("N") == "Baccarat" or sport.get("I") == 236:
+                    if "L" in sport:
+                        baccara_sport = sport
+                        break
 
-                game_number = int(game["DI"])
-                sc = game.get("SC", {})
-                sc_s = sc.get("S", [])
+            if baccara_sport is None:
+                last_error = "Sport Baccarat non trouvé dans la réponse"
+                if attempt < max_attempts - 1:
+                    time.sleep(1)
+                continue
 
-                is_finished = game.get("F", False) or sc.get("CPS") == "Match finished"
+            results = []
+            for championship in baccara_sport["L"]:
+                games = championship.get("G", [])
+                for game in games:
+                    if "DI" not in game:
+                        continue
 
-                player_cards, banker_cards = _parse_cards(sc_s)
-                winner = _parse_winner(sc_s)
+                    game_number = int(game["DI"])
+                    sc = game.get("SC", {})
+                    sc_s = sc.get("S", [])
 
-                def fmt_cards(cards):
-                    return [{"S": SUIT_MAP.get(c.get("S"), "?"), "R": c.get("R", "?"), "raw": c.get("S", -1)} for c in cards]
+                    is_finished = game.get("F", False) or sc.get("CPS") == "Match finished"
 
-                result = {
-                    "game_number": game_number,
-                    "player_cards": fmt_cards(player_cards),
-                    "banker_cards": fmt_cards(banker_cards),
-                    "winner": winner,
-                    "is_finished": is_finished,
-                    "score": sc.get("FS", {}),
-                }
-                results.append(result)
+                    player_cards, banker_cards = _parse_cards(sc_s)
+                    winner = _parse_winner(sc_s)
 
-        return results
+                    def fmt_cards(cards):
+                        return [
+                            {"S": SUIT_MAP.get(c.get("S"), "?"), "R": c.get("R", "?"), "raw": c.get("S", -1)}
+                            for c in cards
+                        ]
 
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
+                    result = {
+                        "game_number": game_number,
+                        "player_cards": fmt_cards(player_cards),
+                        "banker_cards": fmt_cards(banker_cards),
+                        "winner": winner,
+                        "is_finished": is_finished,
+                        "score": sc.get("FS", {}),
+                    }
+                    results.append(result)
+
+            return results
+
+        except requests.exceptions.ConnectionError as e:
+            last_error = f"Connexion refusée (tentative {attempt+1}/{max_attempts})"
+            if attempt < max_attempts - 1:
+                time.sleep(2 + attempt)
+        except requests.exceptions.Timeout as e:
+            last_error = f"Timeout (tentative {attempt+1}/{max_attempts})"
+            if attempt < max_attempts - 1:
+                time.sleep(1 + attempt)
+        except Exception as e:
+            last_error = f"Erreur inattendue: {e}"
+            if attempt < max_attempts - 1:
+                time.sleep(1)
 
     return []
 
