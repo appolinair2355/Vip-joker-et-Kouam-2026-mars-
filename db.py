@@ -124,6 +124,18 @@ async def _create_tables():
                 sent_at        TIMESTAMPTZ  DEFAULT NOW()
             )
         """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS game_log (
+                id           SERIAL      PRIMARY KEY,
+                game_number  INT         NOT NULL UNIQUE,
+                suits        TEXT        NOT NULL,
+                recorded_at  TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_game_log_recorded_at
+            ON game_log (recorded_at)
+        """)
     logger.info("📋 Tables PostgreSQL prêtes")
 
 
@@ -461,6 +473,52 @@ async def db_get_countdown_panel_count() -> int:
     except Exception as e:
         logger.error(f"❌ db_get_countdown_panel_count: {e}")
         return 0
+
+
+async def db_save_game_log(game_number: int, suits: list):
+    """Enregistre les costumes apparus lors d'un jeu dans game_log."""
+    if _pool is None:
+        return
+    try:
+        suits_str = ','.join(sorted(set(str(s) for s in suits)))
+        async with _pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO game_log (game_number, suits, recorded_at)
+                VALUES ($1, $2, NOW())
+                ON CONFLICT (game_number) DO NOTHING
+            """, game_number, suits_str)
+    except Exception as e:
+        logger.error(f"❌ db_save_game_log({game_number}): {e}")
+
+
+async def db_search_game_log(date_from: datetime, date_to: datetime) -> List[Dict]:
+    """
+    Charge tous les jeux entre date_from et date_to depuis game_log.
+    Retourne une liste de dicts {game_number, suits (set), recorded_at}.
+    """
+    if _pool is None:
+        return []
+    try:
+        async with _pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT game_number, suits, recorded_at
+                FROM game_log
+                WHERE recorded_at >= $1 AND recorded_at <= $2
+                ORDER BY recorded_at ASC
+            """, date_from, date_to)
+        result = []
+        for row in rows:
+            raw = row['suits'] or ''
+            suits_set = set(s for s in raw.split(',') if s)
+            result.append({
+                'game_number': row['game_number'],
+                'suits':       suits_set,
+                'recorded_at': row['recorded_at'],
+            })
+        return result
+    except Exception as e:
+        logger.error(f"❌ db_search_game_log: {e}")
+        return []
 
 
 async def db_reset_all() -> dict:

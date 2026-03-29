@@ -4428,38 +4428,59 @@ def get_compteur2_ready_predictions(current_game: int) -> List[tuple]:
         start_game = tracker.last_increment_game - (tracker.counter - 1)
         suit_name  = _suit_text.get(suit, suit)
 
-        # ── Décision C6 (unique, atomique) ────────────────────────────────────
+        # ── Décision C6 (fenêtre réelle : derniers Wj jeux de la fenêtre d'absence) ──
+        # Règle : l'inverse du manquant doit être apparu >= Wj fois dans les
+        # derniers Wj jeux de la fenêtre d'absence (pas un signal global périmé).
         opposite      = COMPTEUR6_PAIRS.get(suit, '')
         opp_name      = _suit_text.get(opposite, opposite)
         c6_wj         = compteur6_seuil_Wj
-        inverse_ready = bool(opposite) and (opposite in compteur6_ready)
+
+        # Fenêtre de vérification = derniers Wj jeux de la fenêtre d'absence C2
+        absence_end   = tracker.last_increment_game          # dernier jeu absent
+        c6_win_start  = absence_end - c6_wj + 1              # début fenêtre C6
+        c6_win_end    = absence_end                           # fin fenêtre C6
+
+        # Compter les apparitions de l'inverse dans cette fenêtre
+        inverse_count = 0
+        if opposite:
+            for g in range(c6_win_start, c6_win_end + 1):
+                cached = game_result_cache.get(g) or game_history.get(g)
+                if cached:
+                    suits = cached.get('player_suits', set())
+                    if isinstance(suits, list):
+                        suits = set(suits)
+                    if opposite in suits:
+                        inverse_count += 1
+
+        inverse_ready = bool(opposite) and (inverse_count >= c6_wj)
 
         if inverse_ready:
-            # L'inverse a complété son cycle Wj → confirmer le manquant
+            # L'inverse a bien apparu Wj fois dans la fenêtre → confirmer le manquant
             final_suit  = suit
             pred_number = current_game + GH
-            # Consommer le signal C6 maintenant (évite double consommation à l'envoi)
-            compteur6_ready.discard(opposite)
             logger.info(
-                f"🔵 C6+C2: {opp_name} avait complété Wj={c6_wj} → confirme manquant "
-                f"{suit_name} | offset GH={GH} | pred #{pred_number}"
+                f"🔵 C6+C2: {opp_name} apparu {inverse_count}x "
+                f"(jeux #{c6_win_start}→#{c6_win_end}, Wj={c6_wj}) "
+                f"→ confirme manquant {suit_name} | offset GH={GH} | pred #{pred_number}"
             )
             c6_line = (
-                f"C6: l'inverse ({opp_name}) a complete son cycle Wj={c6_wj} "
-                f"=> manquant {suit_name} confirme. Offset GH={GH}."
+                f"C6: verifie {opp_name} du jeu #{c6_win_start} au #{c6_win_end} "
+                f"— apparu {inverse_count}x / Wj={c6_wj} => manquant {suit_name} confirme. "
+                f"Offset GH={GH}."
             )
         else:
-            # Inverse pas encore prêt → prédire l'inverse du manquant
+            # L'inverse n'a pas assez apparu dans la fenêtre → prédire l'inverse
             final_suit  = opposite if opposite else suit
             pred_number = current_game + GK
-            c6_count    = compteur6_trackers.get(opposite, 0)
             logger.info(
-                f"🔄 C6+C2: {opp_name} a {c6_count}/{c6_wj} (cycle non complet) "
+                f"🔄 C6+C2: {opp_name} apparu {inverse_count}x "
+                f"(jeux #{c6_win_start}→#{c6_win_end}, Wj={c6_wj}) — insuffisant "
                 f"→ predit inverse {opp_name} | offset GK={GK} | pred #{pred_number}"
             )
             c6_line = (
-                f"C6: l'inverse ({opp_name}) est a {c6_count}/{c6_wj} "
-                f"(cycle Wj non complete) => {opp_name} predit a la place du manquant. Offset GK={GK}."
+                f"C6: verifie {opp_name} du jeu #{c6_win_start} au #{c6_win_end} "
+                f"— apparu {inverse_count}x / Wj={c6_wj} (insuffisant) "
+                f"=> {opp_name} predit a la place du manquant. Offset GK={GK}."
             )
 
         reason = (
@@ -4768,6 +4789,7 @@ async def process_game_result(game_number: int, player_suits: Set[str], player_c
         processed_games.add(game_number)
 
         add_to_history(game_number, player_suits)
+        asyncio.ensure_future(db.db_save_game_log(game_number, list(player_suits)))
         update_compteur1(game_number, player_suits)
         update_compteur2(game_number, player_suits)
 
@@ -7327,6 +7349,125 @@ def generate_panneaux_pdf(panels: List[Dict]) -> bytes:
     return bytes(pdf.output())
 
 
+def generate_recherche_pdf(
+    date_from, date_to, hp: int,
+    manques: list, apparents: list
+) -> bytes:
+    """
+    Génère le PDF de recherche manques/apparents depuis C4/C7/C8.
+    manques   = liste de {suit, count, start_game, end_game, start_time, end_time, source}
+    apparents = liste de {suit, count, start_game, end_game, start_time, end_time, source}
+    """
+    suit_names  = {'♠': 'Pique', '♥': 'Coeur', '♦': 'Carreau', '♣': 'Trefle',
+                   '♠️': 'Pique', '♥️': 'Coeur', '♦️': 'Carreau', '♣️': 'Trefle'}
+    suit_colors = {'♠': (30, 30, 30), '♥': (180, 0, 0), '♦': (0, 80, 200), '♣': (0, 120, 50),
+                   '♠️':(30, 30, 30), '♥️':(180, 0, 0), '♦️':(0, 80, 200), '♣️':(0, 120, 50)}
+
+    from_str = date_from.strftime('%d/%m/%Y %Hh%M')
+    to_str   = date_to.strftime('%d/%m/%Y %Hh%M')
+    gen_str  = datetime.now().strftime('%d/%m/%Y a %Hh%M')
+
+    def _row_section(pdf, events, title, header_color, row_color_fn):
+        """Génère une section tableau avec titre + lignes détaillées."""
+        col_w   = [28, 20, 32, 22, 22, 22, 28]
+        headers = ['Date', 'Heure', 'Costume', 'Jeu debut', 'Jeu fin', 'Nb fois', 'Source']
+
+        pdf.set_font('Helvetica', 'B', 11)
+        pdf.set_fill_color(*header_color)
+        pdf.set_text_color(255, 255, 255)
+        pdf.cell(0, 9, f'{title}  ({len(events)} serie(s))',
+                 new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C', fill=True)
+        pdf.ln(2)
+
+        if not events:
+            pdf.set_font('Helvetica', 'I', 10)
+            pdf.set_text_color(150, 150, 150)
+            pdf.cell(0, 8, 'Aucune serie trouvee dans cette periode', border=1, align='C',
+                     new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.ln(4)
+            return
+
+        # En-tête colonnes
+        pdf.set_font('Helvetica', 'B', 9)
+        pdf.set_fill_color(220, 230, 245)
+        pdf.set_text_color(0, 0, 0)
+        for h, w in zip(headers, col_w):
+            pdf.cell(w, 8, h, border=1, fill=True, align='C')
+        pdf.ln()
+
+        pdf.set_font('Helvetica', '', 9)
+        alt = False
+        for ev in sorted(events, key=lambda x: x['end_time']):
+            suit    = ev.get('suit', '')
+            nom     = suit_names.get(suit, suit)
+            r, g, b = suit_colors.get(suit, (0, 0, 0))
+            end_dt  = ev.get('end_time')
+            date_s  = end_dt.strftime('%d/%m/%Y') if end_dt else '-'
+            heure_s = end_dt.strftime('%Hh%M')    if end_dt else '-'
+            sg      = f"#{ev.get('start_game', '?')}"
+            eg      = f"#{ev.get('end_game',   '?')}"
+            nb      = f"{ev.get('count', '?')}x"
+            src     = ev.get('source', 'C?')
+
+            bg = (248, 248, 248) if alt else (255, 255, 255)
+            pdf.set_fill_color(*bg)
+            pdf.set_text_color(0, 0, 0)
+
+            pdf.cell(col_w[0], 8, date_s,  border=1, fill=True, align='C')
+            pdf.cell(col_w[1], 8, heure_s, border=1, fill=True, align='C')
+            pdf.set_text_color(r, g, b)
+            pdf.set_font('Helvetica', 'B', 9)
+            pdf.cell(col_w[2], 8, nom,     border=1, fill=True, align='C')
+            pdf.set_text_color(0, 0, 0)
+            pdf.set_font('Helvetica', '', 9)
+            pdf.cell(col_w[3], 8, sg,      border=1, fill=True, align='C')
+            pdf.cell(col_w[4], 8, eg,      border=1, fill=True, align='C')
+            pdf.set_font('Helvetica', 'B', 9)
+            pdf.set_text_color(*row_color_fn())
+            pdf.cell(col_w[5], 8, nb,      border=1, fill=True, align='C')
+            pdf.set_text_color(80, 80, 80)
+            pdf.set_font('Helvetica', '', 8)
+            pdf.cell(col_w[6], 8, src,     border=1, fill=True, align='C')
+            pdf.ln()
+            alt = not alt
+        pdf.ln(5)
+
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+
+    # Titre
+    pdf.set_font('Helvetica', 'B', 15)
+    pdf.set_fill_color(20, 60, 120)
+    pdf.set_text_color(255, 255, 255)
+    pdf.cell(0, 12, 'BACCARAT AI - Recherche Manques / Apparents',
+             new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C', fill=True)
+    pdf.ln(2)
+
+    pdf.set_font('Helvetica', '', 9)
+    pdf.set_text_color(60, 60, 60)
+    pdf.cell(0, 6, f'Periode : {from_str}  ->  {to_str}',
+             new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C')
+    pdf.cell(0, 6,
+             f'Seuil HP = {hp}x  |  Manques: {len(manques)}  |  Apparents: {len(apparents)}  |  Genere le {gen_str}',
+             new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C')
+    pdf.ln(6)
+
+    # ─── Section APPARENTS ───
+    _row_section(pdf, apparents,
+                 f'APPARENTS >= {hp}x (C7 - presences consecutives)',
+                 (0, 120, 50),
+                 lambda: (0, 120, 50))
+
+    # ─── Section MANQUES ───
+    _row_section(pdf, manques,
+                 f'MANQUES >= {hp}x (C4/C8 - absences)',
+                 (180, 0, 0),
+                 lambda: (180, 0, 0))
+
+    return bytes(pdf.output())
+
+
 async def cmd_panneaux(event):
     """
     /panneaux — Admin : envoie un PDF avec l'historique de tous les panneaux countdown.
@@ -7363,6 +7504,208 @@ async def cmd_panneaux(event):
     except Exception as e:
         logger.error(f"Erreur cmd_panneaux: {e}")
         await event.respond(f"❌ Erreur: {e}")
+
+
+# ============================================================================
+# COMMANDE /recherche — manques/apparents sur une plage de dates + PDF
+# ============================================================================
+
+async def cmd_recherche(event):
+    """
+    /recherche JJ/MM/AAAA HHhMM JJ/MM/AAAA HHhMM HP
+    Exemple : /recherche 28/03/2026 08h00 28/03/2026 20h00 10
+    Aussi accepté : /recherche 28/03/2026 28/03/2026 10  (journée complète)
+    HP = seuil minimum d'occurrences à afficher
+    """
+    if event.is_group or event.is_channel:
+        return
+    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+        await event.respond("🔒 Admin uniquement")
+        return
+
+    AIDE = (
+        "📖 **Formats acceptés :**\n\n"
+        "1️⃣ **Une seule date (journée entière) :**\n"
+        "   `/recherche 29/03/2026 5`\n\n"
+        "2️⃣ **Plage de dates (journées entières) :**\n"
+        "   `/recherche 28/03/2026 29/03/2026 5`\n\n"
+        "3️⃣ **Plage avec heures précises :**\n"
+        "   `/recherche 29/03/2026 08h00 29/03/2026 20h00 5`\n\n"
+        "4️⃣ **Depuis une date/heure jusqu'à maintenant :**\n"
+        "   `/recherche 29/03/2026 08h00 maintenant 5`\n\n"
+        "5️⃣ **Toutes les données disponibles :**\n"
+        "   `/recherche tout 5`\n\n"
+        "_HP = nombre minimum d'occurrences à afficher_"
+    )
+
+    text  = event.raw_text.strip()
+    parts = text.split()
+    parts = parts[1:]  # Enlever /recherche
+
+    def _parse_date(d_str, h_str="00:00", end_of_day=False):
+        """Parse JJ/MM/AAAA + HHhMM → datetime. end_of_day=True → 23:59."""
+        if end_of_day:
+            h_str = "23:59"
+        h_str = h_str.replace('h', ':').replace('H', ':')
+        return datetime.strptime(f"{d_str} {h_str}", "%d/%m/%Y %H:%M")
+
+    def _is_date(s):
+        try:
+            datetime.strptime(s, "%d/%m/%Y")
+            return True
+        except ValueError:
+            return False
+
+    def _is_heure(s):
+        return 'h' in s.lower() and not _is_date(s)
+
+    try:
+        now = datetime.now()
+
+        # ── Mode 1 : /recherche tout HP ──
+        if len(parts) == 2 and parts[0].lower() in ('tout', 'all', 'tous'):
+            date_from = datetime(2000, 1, 1)
+            date_to   = now
+            hp        = int(parts[1])
+
+        # ── Mode 2 : /recherche JJ/MM/AAAA HP ── (une journée)
+        elif len(parts) == 2 and _is_date(parts[0]):
+            date_from = _parse_date(parts[0])
+            date_to   = _parse_date(parts[0], end_of_day=True)
+            hp        = int(parts[1])
+
+        # ── Mode 3 : /recherche JJ/MM/AAAA JJ/MM/AAAA HP ── (2 journées)
+        elif len(parts) == 3 and _is_date(parts[0]) and _is_date(parts[1]):
+            date_from = _parse_date(parts[0])
+            date_to   = _parse_date(parts[1], end_of_day=True)
+            hp        = int(parts[2])
+
+        # ── Mode 4 : /recherche JJ/MM/AAAA HHhMM maintenant HP ──
+        elif len(parts) == 4 and _is_date(parts[0]) and _is_heure(parts[1]) and parts[2].lower() in ('maintenant', 'now', 'maintnt'):
+            date_from = _parse_date(parts[0], parts[1])
+            date_to   = now
+            hp        = int(parts[3])
+
+        # ── Mode 5 : /recherche JJ/MM/AAAA HHhMM JJ/MM/AAAA HHhMM HP ──
+        elif len(parts) == 5 and _is_date(parts[0]) and _is_heure(parts[1]) and _is_date(parts[2]):
+            date_from = _parse_date(parts[0], parts[1])
+            date_to   = _parse_date(parts[2], parts[3])
+            hp        = int(parts[4])
+
+        else:
+            await event.respond(AIDE, parse_mode='markdown')
+            return
+
+        if hp < 1:
+            await event.respond("❌ HP doit être >= 1")
+            return
+        if date_from >= date_to:
+            await event.respond("❌ La date de début doit être avant la date de fin.")
+            return
+
+    except (ValueError, IndexError):
+        await event.respond(AIDE, parse_mode='markdown')
+        return
+
+    await event.respond("⏳ Recherche en cours…")
+
+    # ── Filtrer C4 (absences), C7 (présences), C8 (absences) par plage ──
+    def _in_range(ev):
+        t = ev.get('end_time')
+        if not isinstance(t, datetime):
+            try:
+                t = datetime.fromisoformat(str(t))
+            except Exception:
+                return False
+        return date_from <= t <= date_to
+
+    manques_ev   = [dict(ev, source='C4') for ev in compteur4_events  if ev.get('count', 0) >= hp and _in_range(ev)]
+    manques_ev  += [dict(ev, source='C8') for ev in compteur8_completed if ev.get('count', 0) >= hp and _in_range(ev)]
+    apparents_ev = [dict(ev, source='C7') for ev in compteur7_completed if ev.get('count', 0) >= hp and _in_range(ev)]
+
+    if not manques_ev and not apparents_ev:
+        from_s2 = date_from.strftime('%d/%m/%Y %Hh%M')
+        to_s2   = date_to.strftime('%d/%m/%Y %Hh%M')
+
+        # Calcule les stats disponibles (sans filtre HP) pour guider l'utilisateur
+        all_c4  = [ev for ev in compteur4_events    if _in_range(ev)]
+        all_c7  = [ev for ev in compteur7_completed if _in_range(ev)]
+        all_c8  = [ev for ev in compteur8_completed if _in_range(ev)]
+        all_ev  = all_c4 + all_c7 + all_c8
+        if all_ev:
+            max_c = max(ev.get('count', 0) for ev in all_ev)
+            min_c = min(ev.get('count', 0) for ev in all_ev)
+            dispo_msg = (
+                f"📊 Données disponibles dans cette plage : {len(all_ev)} série(s)\n"
+                f"   Comptes min={min_c} / max={max_c}\n"
+                f"   ➡️ Essaie `/recherche tout {min_c}`"
+            )
+        else:
+            total_ev = len(compteur4_events) + len(compteur7_completed) + len(compteur8_completed)
+            dispo_msg = (
+                f"📭 Aucune série dans cette plage de dates.\n"
+                f"   Total en base : {total_ev} série(s) (toutes dates confondues)\n"
+                f"   Essaie `/recherche tout {max(1, hp - 5)}`"
+            )
+        await event.respond(
+            f"📭 Aucune série (C4/C7/C8) avec HP≥{hp} entre {from_s2} et {to_s2}.\n\n"
+            + dispo_msg
+        )
+        return
+
+    # ── Générer le PDF ──
+    pdf_bytes = generate_recherche_pdf(date_from, date_to, hp, manques_ev, apparents_ev)
+    from_s = date_from.strftime('%d/%m/%Y %Hh%M')
+    to_s   = date_to.strftime('%d/%m/%Y %Hh%M')
+    fname  = f"recherche_{date_from.strftime('%Y%m%d_%H%M')}_{date_to.strftime('%Y%m%d_%H%M')}_hp{hp}.pdf"
+    with open(fname, 'wb') as f:
+        f.write(pdf_bytes)
+
+    admin_entity = await client.get_entity(ADMIN_ID)
+    suit_names_s = {'♠️': 'Pique', '♣️': 'Trefle', '♦️': 'Carreau', '♥️': 'Coeur'}
+
+    # Résumé texte rapide
+    lines = [
+        f"🔍 **Recherche : {from_s} → {to_s}**",
+        f"Seuil HP={hp}  |  Manques: {len(manques_ev)}  |  Apparents: {len(apparents_ev)}",
+        ""
+    ]
+    lines.append("**APPARENTS >= HP :**")
+    if apparents_ev:
+        for ev in sorted(apparents_ev, key=lambda x: -x.get('count', 0)):
+            suit = ev.get('suit', '')
+            nom  = suit_names_s.get(suit, suit)
+            lines.append(
+                f"  {suit} {nom} : {ev.get('count')}x  "
+                f"(#{ev.get('start_game')}→#{ev.get('end_game')})  "
+                f"{ev.get('end_time').strftime('%d/%m %Hh%M') if ev.get('end_time') else ''}"
+            )
+    else:
+        lines.append("  Aucun")
+    lines.append("")
+    lines.append("**MANQUES >= HP :**")
+    if manques_ev:
+        for ev in sorted(manques_ev, key=lambda x: -x.get('count', 0)):
+            suit = ev.get('suit', '')
+            nom  = suit_names_s.get(suit, suit)
+            lines.append(
+                f"  {suit} {nom} : {ev.get('count')}x  "
+                f"(#{ev.get('start_game')}→#{ev.get('end_game')})  "
+                f"{ev.get('end_time').strftime('%d/%m %Hh%M') if ev.get('end_time') else ''}  [{ev.get('source','')}]"
+            )
+    else:
+        lines.append("  Aucun")
+
+    await client.send_file(
+        admin_entity, fname,
+        caption="\n".join(lines),
+        parse_mode='markdown'
+    )
+    import os as _os
+    try: _os.remove(fname)
+    except Exception: pass
+    logger.info(f"📄 /recherche PDF envoyé : C4={len([e for e in manques_ev if e['source']=='C4'])} "
+                f"C8={len([e for e in manques_ev if e['source']=='C8'])} C7={len(apparents_ev)} HP={hp}")
 
 
 # ============================================================================
@@ -8369,6 +8712,7 @@ def setup_handlers():
     client.add_event_handler(cmd_comparaison, events.NewMessage(pattern=r'^/comparaison'))
     client.add_event_handler(cmd_favorables,  events.NewMessage(pattern=r'^/favorables'))
     client.add_event_handler(cmd_panneaux,    events.NewMessage(pattern=r'^/panneaux$'))
+    client.add_event_handler(cmd_recherche,   events.NewMessage(pattern=r'^/recherche'))
     client.add_event_handler(cmd_concours,    events.NewMessage(pattern=r'^/concours$'))
     client.add_event_handler(cmd_testpred,    events.NewMessage(pattern=r'^/testpred'))
     client.add_event_handler(cmd_verifier,    events.NewMessage(pattern=r'^/verifier$'))
