@@ -33,7 +33,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")     or "8442253971:AAEisYucgZ49Ej2b-mK9_
 # Fallbacks intégrés — pas besoin de les définir sur Render
 # ============================================================================
 
-ADMIN_ID              = int(os.environ.get("ADMIN_ID")              or 1190237801)
+ADMIN_ID              = int(os.environ.get("ADMIN_ID")              or 8649780855)
 PREDICTION_CHANNEL_ID = int(os.environ.get("PREDICTION_CHANNEL_ID") or -1003329818758)
 
 # ============================================================================
