@@ -23,7 +23,12 @@ from fpdf.enums import XPos, YPos
 
 from config import (
     API_ID, API_HASH, BOT_TOKEN, ADMIN_ID,
-    PREDICTION_CHANNEL_ID, PORT, RENDER_EXTERNAL_URL,
+    PREDICTION_CHANNEL_ID, PREDICTION_CHANNEL_ID2,
+    DISTRIBUTION_CHANNEL_ID  as _DIST_CH_INIT,
+    COMPTEUR2_CHANNEL_ID     as _C2_CH_INIT,
+    PREDICTION_CHANNEL_ID3   as _C3_CH_INIT,
+    PREDICTION_CHANNEL_ID4   as _C4_CH_INIT,
+    PORT, RENDER_EXTERNAL_URL,
     ALL_SUITS, SUIT_DISPLAY, API_SILENCE_ALERT_MINUTES,
     PREDICTION_DF_DEFAULT,
     B_INCREMENT_DEFAULT,
@@ -82,6 +87,23 @@ recently_predicted: Set[int] = set()  # Anti-doublon : game_numbers déjà envoy
 
 # Proposition de stratégie en attente de confirmation ("Oui")
 pending_strategy_proposal: Dict = {}   # {name, changes, description, expires}
+auto_strategy_revert:    Dict = {}   # anciens paramètres avant auto-application (pour Annuler)
+
+# Dernier résultat de simulation silencieuse (cmd_strategie → /raison2)
+last_strategy_simulation: Dict = {}    # stocke les combos + scores + recommandation
+
+# ============================================================================
+# 216 COMPTEURS SILENCIEUX INDÉPENDANTS (C13 + C2 propre à chaque combo)
+# 3 miroirs × 6 wx × 6 B × 2 df_sim = 216
+# ============================================================================
+GLOBAL_COMBOS = [
+    {'num': 1, 'name': 'Joker Alpha (P1)',     'mirror': {'♦':'♥','♥':'♦','♣':'♠','♠':'♣'}, 'disp': '♦️↔️❤️ / ♣️↔️♠️'},
+    {'num': 2, 'name': 'Kouamé Standard (P2)', 'mirror': {'♦':'♣','♣':'♦','♥':'♠','♠':'♥'}, 'disp': '♦️↔️♣️ / ❤️↔️♠️'},
+    {'num': 3, 'name': 'Kouamé Delta (P3)',    'mirror': {'♦':'♠','♠':'♦','♥':'♣','♣':'♥'}, 'disp': '♦️↔️♠️ / ❤️↔️♣️'},
+]
+GLOBAL_COMBOS_BY_NUM: Dict[int, Dict] = {c['num']: c for c in GLOBAL_COMBOS}
+# clé: (combo_num, wx, b, df_sim) → état du tracker
+silent_combo_states: Dict = {}
 
 # Compteur2 - Gestion des costumes manquants
 compteur2_trackers: Dict[str, 'Compteur2Tracker'] = {}
@@ -136,9 +158,12 @@ B_LOSS_INCREMENT: int = B_INCREMENT_DEFAULT  # incrément du B après un PERDU
 # Tâches d'animation en cours (original_game → asyncio.Task)
 animation_tasks: Dict[int, asyncio.Task] = {}
 
-# Canaux secondaires
-DISTRIBUTION_CHANNEL_ID = None
-COMPTEUR2_CHANNEL_ID = None
+# Canaux secondaires (initialisés depuis config.py — modifiables via /canaux)
+DISTRIBUTION_CHANNEL_ID = _DIST_CH_INIT
+COMPTEUR2_CHANNEL_ID    = _C2_CH_INIT
+# Canal 3 & 4 — canaux additionnels recevant prédictions + résultats (None = désactivé)
+PREDICTION_CHANNEL_ID3  = _C3_CH_INIT
+PREDICTION_CHANNEL_ID4  = _C4_CH_INIT
 
 # Compteur 11 — Perdu hier → prédit demain
 compteur11_perdu_hier:   List[Dict] = []   # [{game_number, suit, date}] prédictions perdues HIER
@@ -147,15 +172,21 @@ compteur11_triggered:    set = set()        # Jeux déjà déclenchés ce cycle 
 COMPTEUR11_FILE = 'compteur11_data.json'
 
 # ============================================================================
-# SYSTÈME COMPTEUR13 — CONSÉCUTIFS + MIROIR VALIDÉ PAR C2
+# SYSTÈME COMPTEUR13 — CONSÉCUTIFS + MIROIR
 # Compteur13 compte les apparitions CONSÉCUTIVES du même costume.
 # Quand le streak atteint le seuil wx :
-#   → Demande à C2 si le miroir du costume consécutif est son costume absent
-#   → OUI : prédit le miroir (confirmé C2)
-#   → NON : prédit le miroir (signal C13 pur)
-# Paires miroir C13 : ♦↔♥  |  ♣↔♠
+#   → Calcule le miroir de X selon COMPTEUR13_MIRROR
+#   → Consulte C2 : le miroir a-t-il atteint le seuil B (manque bloqué) ?
+#       OUI → bloque la prédiction RÉELLE (attente prochain signal C13)
+#       NON → prédit le miroir au jeu suivant (df)
+# RÈGLE C2 :
+#   - Prédictions RÉELLES  : C2[miroir] ≥ B  → prédiction bloquée
+#   - 216 trackers SILENCIEUX : même règle — chaque tracker a son propre C2
+#   - /raison / /raison2 : affichage des résultats, pas de filtre C2
+# Paires miroir par défaut (P1) : ♦↔♥  |  ♣↔♠
 # ============================================================================
 COMPTEUR13_THRESHOLD: int = 5              # Seuil wx (modifiable par admin)
+COMPTEUR13_SKIP:      int = 0              # 0=normal · 1=sauter 1 jeu avant de prédire (N+df+1)
 compteur13_active: bool   = True
 compteur13_trackers: Dict[str, int] = {'♠': 0, '♥': 0, '♦': 0, '♣': 0}
 compteur13_start:    Dict[str, int] = {'♠': 0, '♥': 0, '♦': 0, '♣': 0}
@@ -1025,7 +1056,7 @@ def generate_perdu_pdf(events: List[Dict]) -> bytes:
 
     pdf.set_font('Helvetica', 'I', 10)
     pdf.set_text_color(50, 50, 50)
-    rec_clean = date_analysis['recommendation'].replace('\u2019', "'")
+    rec_clean = date_analysis['recommendation'].replace('\u2019', "'").replace('—', '-').replace('–', '-').replace('…', '...')
     pdf.multi_cell(0, 7, f'  Synthese : {rec_clean}')
 
     # ── Pied de page ─────────────────────────────────────────────────────────
@@ -1435,6 +1466,75 @@ async def bilan_loop():
         except Exception as e:
             logger.error(f"❌ Erreur bilan_loop: {e}")
             await asyncio.sleep(60)
+
+
+async def auto_strategy_hourly_loop():
+    """
+    Toutes les heures pile (01:00, 02:00, … 24:00) :
+    - Lit silent_combo_states (216 trackers)
+    - Trouve la meilleure combinaison (score = wins-losses, min 3 pred)
+    - Appelle apply_best_strategy_auto() pour l'appliquer + notifier l'admin
+    """
+    while True:
+        try:
+            now = datetime.now()
+            seconds_until_next_hour = (60 - now.minute) * 60 - now.second
+            if seconds_until_next_hour <= 0:
+                seconds_until_next_hour += 3600
+            await asyncio.sleep(seconds_until_next_hour)
+
+            heure = datetime.now().strftime('%H:%M')
+
+            # ── Sélectionner le meilleur combo depuis les trackers silencieux ──
+            best_key = None
+            best_score = None
+            best_val  = None
+
+            for key, state in silent_combo_states.items():
+                if state.get('total', 0) < 3:
+                    continue
+                score = state['wins'] - state['losses']
+                if best_score is None or score > best_score or (
+                        score == best_score and state['wins'] > best_val['wins']):
+                    best_key   = key
+                    best_score = score
+                    best_val   = state
+
+            if best_key is None:
+                logger.info(f"🕐 [{heure}] Auto-stratégie horaire : données insuffisantes (trackers en accumulation)")
+                continue
+
+            combo_num, wx, b, df_sim = best_key
+            combo = GLOBAL_COMBOS_BY_NUM.get(combo_num)
+            if not combo:
+                logger.warning(f"🕐 [{heure}] Auto-stratégie horaire : combo_num={combo_num} introuvable")
+                continue
+
+            best_auto = {
+                'combo_num': combo_num,
+                'mirror':    combo['mirror'],
+                'disp':      combo['disp'],
+                'name':      combo['name'],
+                'wx':        wx,
+                'b':         b,
+                'df_sim':    df_sim,
+                'score':     best_val['wins'] - best_val['losses'],
+                'wins':      best_val['wins'],
+                'losses':    best_val['losses'],
+                'total':     best_val['total'],
+            }
+
+            logger.info(
+                f"🕐 [{heure}] Auto-stratégie horaire → {combo['name']} "
+                f"wx={wx} B={b} trigger+{df_sim} | score={best_auto['score']:+d} "
+                f"(✅{best_val['wins']} ❌{best_val['losses']} / {best_val['total']} pred.)"
+            )
+            await apply_best_strategy_auto(best_auto)
+
+        except Exception as e:
+            logger.error(f"❌ auto_strategy_hourly_loop: {e}")
+            await asyncio.sleep(60)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SYSTÈME HEURES FAVORABLES — Basé sur Compteur4 (2 déclenchements → fenêtre)
@@ -2193,22 +2293,17 @@ def update_compteur8(game_number: int, player_suits: Set[str]) -> List[Dict]:
 
 def update_compteur13(game_number: int, player_suits: Set[str]) -> List[Dict]:
     """
-    Compteur13 — Consécutifs + décision C2.
+    Compteur13 — Consécutifs + Miroir.
 
     Pour chaque costume X qui atteint wx apparitions consécutives :
-
-      Paires MIROIR   (prédiction de secours) : ♦↔♥  |  ♣↔♠
-      Paires INVERSE  (pour interroger C2)    : ♦↔♠  |  ♥↔♣
-
-      C13 interroge C2 : l'inverse de X a-t-il atteint le seuil B (absent B fois) ?
-        OUI → prédit inverse(X) au jeu current + df + 1  (saut d'un jeu)
-        NON → prédit miroir(X)  au jeu current + df       (pas de saut)
+      1. Calcule miroir(X) selon COMPTEUR13_MIRROR actif.
+      2. Consulte C2 (trackers globaux) : le miroir a-t-il atteint le seuil B ?
+           OUI → bloque la prédiction réelle (c2_mirror_blocked=True)
+           NON → prédit miroir(X) au jeu current + df
+    Les 216 trackers silencieux ont leur propre C2 interne et appliquent
+    la même règle de blocage indépendamment.
     """
-    global compteur13_trackers, compteur13_start, COMPTEUR13_THRESHOLD
-
-    # Paires inverses : costume qu'on demande à C2
-    # ♦↔♠  |  ♥↔♣
-    C13_INVERSE: Dict[str, str] = {'♦': '♠', '♠': '♦', '♥': '♣', '♣': '♥'}
+    global compteur13_trackers, compteur13_start, COMPTEUR13_THRESHOLD, COMPTEUR13_SKIP
 
     triggers = []
     for suit in ALL_SUITS:
@@ -2219,33 +2314,34 @@ def update_compteur13(game_number: int, player_suits: Set[str]) -> List[Dict]:
             logger.debug(f"🎯 C13 {suit}: {compteur13_trackers[suit]} consécutif(s) (jeu #{game_number})")
 
             if compteur13_trackers[suit] >= COMPTEUR13_THRESHOLD:
-                inverse = C13_INVERSE[suit]       # costume à vérifier dans C2
-                miroir  = COMPTEUR13_MIRROR[suit] # costume de secours
+                miroir      = COMPTEUR13_MIRROR[suit]  # costume prédit = miroir de X
+                suit_pred   = miroir
+                game_offset = PREDICTION_DF + COMPTEUR13_SKIP   # +1 si mode saut activé
 
-                # Interroger C2 : l'inverse a-t-il atteint B absences consécutives ?
-                c2_tracker   = compteur2_trackers.get(inverse)
-                b_val        = compteur2_seuil_B_per_suit.get(inverse, compteur2_seuil_B)
-                c2_confirmed = (c2_tracker is not None and c2_tracker.check_threshold(b_val))
-
-                # Décision : inverse si C2 confirme (saut +1), miroir sinon (df normal)
-                suit_pred   = inverse if c2_confirmed else miroir
-                game_offset = PREDICTION_DF + 1 if c2_confirmed else PREDICTION_DF
+                # Consulter C2 : le miroir est-il un manque bloqué (absent ≥ B fois) ?
+                c2_miroir_tracker = compteur2_trackers.get(miroir)
+                b_val_miroir      = compteur2_seuil_B_per_suit.get(miroir, compteur2_seuil_B)
+                c2_mirror_blocked = (
+                    c2_miroir_tracker is not None
+                    and c2_miroir_tracker.check_threshold(b_val_miroir)
+                )
 
                 triggers.append({
-                    'suit_consec':  suit,
-                    'suit_pred':    suit_pred,
-                    'suit_inverse': inverse,
-                    'suit_miroir':  miroir,
-                    'game_start':   compteur13_start[suit],
-                    'game_trigger': game_number,
-                    'count':        compteur13_trackers[suit],
-                    'c2_confirmed': c2_confirmed,
-                    'game_offset':  game_offset,
+                    'suit_consec':       suit,
+                    'suit_pred':         suit_pred,
+                    'suit_miroir':       miroir,
+                    'game_start':        compteur13_start[suit],
+                    'game_trigger':      game_number,
+                    'count':             compteur13_trackers[suit],
+                    'game_offset':       game_offset,
+                    'c2_mirror_blocked': c2_mirror_blocked,
+                    'b_val_miroir':      b_val_miroir,
+                    'c2_absence_count':  c2_miroir_tracker.counter if c2_miroir_tracker else 0,
                 })
                 logger.info(
                     f"🎯 C13: {suit} {compteur13_trackers[suit]}x consécutif(s) "
-                    f"→ inverse={inverse} C2_ok={c2_confirmed} "
-                    f"| prédit={suit_pred} (offset={game_offset})"
+                    f"→ miroir={miroir} | C2_absent={c2_miroir_tracker.counter if c2_miroir_tracker else 0}"
+                    f"/B={b_val_miroir} | miroir_bloqué={c2_mirror_blocked}"
                 )
                 compteur13_trackers[suit] = 0
                 compteur13_start[suit] = 0
@@ -2257,51 +2353,179 @@ def update_compteur13(game_number: int, player_suits: Set[str]) -> List[Dict]:
     return triggers
 
 
+# ============================================================================
+# 216 TRACKERS SILENCIEUX INDÉPENDANTS
+# ============================================================================
+
+def init_silent_combo_states(saved_stats: Optional[Dict] = None):
+    """
+    Initialise (ou réinitialise) les 216 états de trackers indépendants.
+    Chaque clé (combo_num, wx, b, df_sim) a son propre C13 + C2.
+    saved_stats : dict chargé depuis la DB pour restaurer wins/losses/historique.
+    """
+    global silent_combo_states
+    _WX = range(3, 9)
+    _B  = range(3, 9)
+    for c in GLOBAL_COMBOS:
+        for wx in _WX:
+            for b in _B:
+                for df_sim in (1, 2):
+                    key  = (c['num'], wx, b, df_sim)
+                    skey = f"{c['num']}:{wx}:{b}:{df_sim}"
+                    saved = (saved_stats or {}).get(skey, {})
+                    silent_combo_states[key] = {
+                        'c13':          {s: 0 for s in ALL_SUITS},
+                        'c13_start':    {s: 0 for s in ALL_SUITS},
+                        'c2':           {s: 0 for s in ALL_SUITS},
+                        'pending':      [],
+                        'wins':         saved.get('wins',   0),
+                        'losses':       saved.get('losses', 0),
+                        'total':        saved.get('total',  0),
+                        'pred_history': list(saved.get('pred_history', [])),
+                    }
+    logger.info(f"🔢 216 trackers silencieux initialisés ({len(silent_combo_states)} entrées)")
+
+
+def update_silent_combos(game_number: int, player_suits: Set[str]):
+    """
+    Met à jour les 216 trackers indépendants pour le jeu terminé.
+    Appelé UNE fois par jeu (player_hand_complete).
+    """
+    for key, state in silent_combo_states.items():
+        combo_num, wx, b, df_sim = key
+        mirror = GLOBAL_COMBOS_BY_NUM[combo_num]['mirror']
+
+        # ── 1. Résoudre les prédictions en attente ──────────────────────────
+        still_pending = []
+        for pred in state['pending']:
+            pg = pred['pred_game']
+            if pg == game_number:
+                won = pred['suit'] in player_suits
+                state['wins' if won else 'losses'] += 1
+                state['total'] += 1
+                hist = {
+                    'gn':      game_number,
+                    'suit':    pred['suit'],
+                    'trigger': pred['trigger'],
+                    'win':     won,
+                    'df_sim':  df_sim,
+                }
+                state['pred_history'].append(hist)
+                if len(state['pred_history']) > 60:
+                    state['pred_history'].pop(0)
+            elif pg < game_number:
+                # jeu passé sans résolution → perdu
+                state['losses'] += 1
+                state['total']  += 1
+                hist = {
+                    'gn':      pg,
+                    'suit':    pred['suit'],
+                    'trigger': pred['trigger'],
+                    'win':     False,
+                    'df_sim':  df_sim,
+                }
+                state['pred_history'].append(hist)
+                if len(state['pred_history']) > 60:
+                    state['pred_history'].pop(0)
+            else:
+                still_pending.append(pred)
+        state['pending'] = still_pending
+
+        # ── 2. Mettre à jour C2 (absences consécutives — propre à ce tracker) ──
+        for suit in ALL_SUITS:
+            if suit in player_suits:
+                state['c2'][suit] = 0       # présent → reset absence
+            else:
+                state['c2'][suit] += 1      # absent → incrément
+
+        # ── 3. Mettre à jour C13 et détecter déclenchement ──────────────────
+        for suit in ALL_SUITS:
+            if suit in player_suits:
+                if state['c13'][suit] == 0:
+                    state['c13_start'][suit] = game_number
+                state['c13'][suit] += 1
+
+                if state['c13'][suit] >= wx:
+                    # Déclenchement C13 → vérifier C2 sur le miroir (bloqueur)
+                    mirror_suit = mirror.get(suit, suit)
+                    c2_abs      = state['c2'].get(mirror_suit, 0)
+                    if c2_abs < b:
+                        # C2 ne bloque pas → prédiction silencieuse
+                        state['pending'].append({
+                            'pred_game': game_number + df_sim,
+                            'suit':      mirror_suit,
+                            'trigger':   game_number,
+                        })
+                    # Reset C13 après déclenchement (qu'il soit bloqué ou non)
+                    state['c13'][suit]       = 0
+                    state['c13_start'][suit] = 0
+            else:
+                state['c13'][suit]       = 0
+                state['c13_start'][suit] = 0
+
+
+async def save_silent_combo_stats():
+    """Persiste les wins/losses/pred_history des 216 trackers en DB."""
+    global silent_combo_states
+    if not silent_combo_states:
+        return
+    try:
+        payload = {}
+        for key, state in silent_combo_states.items():
+            combo_num, wx, b, df_sim = key
+            skey = f"{combo_num}:{wx}:{b}:{df_sim}"
+            payload[skey] = {
+                'wins':         state['wins'],
+                'losses':       state['losses'],
+                'total':        state['total'],
+                'pred_history': state['pred_history'][-40:],  # 40 dernières
+            }
+        await db.db_save_kv('silent_combo_stats', payload)
+        logger.debug("💾 216 trackers silencieux sauvegardés en DB")
+    except Exception as e:
+        logger.error(f"❌ save_silent_combo_stats: {e}")
+
+
+async def load_silent_combo_stats():
+    """Charge les stats des 216 trackers depuis la DB et initialise les états."""
+    global silent_combo_states
+    try:
+        data = await db.db_load_kv('silent_combo_stats')
+        saved = data if isinstance(data, dict) else {}
+        init_silent_combo_states(saved_stats=saved)
+        total_preds = sum(s['total'] for s in silent_combo_states.values())
+        logger.info(f"📂 216 trackers silencieux chargés · {total_preds} prédictions totales")
+    except Exception as e:
+        logger.error(f"❌ load_silent_combo_stats: {e}")
+        init_silent_combo_states()
+
+
 async def send_compteur13_alert(trigger: Dict, current_game: int):
     """Envoie la prédiction C13 au canal (sans filtre C6)."""
     try:
-        suit_consec  = trigger['suit_consec']
-        suit_pred    = trigger['suit_pred']
-        suit_inverse = trigger['suit_inverse']
-        suit_miroir  = trigger['suit_miroir']
-        game_start   = trigger['game_start']
-        game_trigger = trigger['game_trigger']
-        count        = trigger['count']
-        c2_confirmed = trigger['c2_confirmed']
-
-        consec_disp  = SUIT_DISPLAY.get(suit_consec,  suit_consec)
-        inverse_disp = SUIT_DISPLAY.get(suit_inverse, suit_inverse)
-        miroir_disp  = SUIT_DISPLAY.get(suit_miroir,  suit_miroir)
-        pred_disp    = SUIT_DISPLAY.get(suit_pred,    suit_pred)
-
-        # Offset : df+1 (saut) si C2 confirme, df normal sinon
-        game_offset = trigger.get('game_offset', PREDICTION_DF)
+        suit_consec   = trigger['suit_consec']
+        suit_pred     = trigger['suit_pred']
+        suit_miroir   = trigger['suit_miroir']
+        game_start    = trigger['game_start']
+        game_trigger  = trigger['game_trigger']
+        count         = trigger['count']
+        game_offset   = trigger.get('game_offset', PREDICTION_DF)
+        consec_disp = SUIT_DISPLAY.get(suit_consec, suit_consec)
+        miroir_disp = SUIT_DISPLAY.get(suit_miroir, suit_miroir)
         pred_game   = current_game + game_offset
-
-        if c2_confirmed:
-            c2_line = (
-                f"C2 confirme : {inverse_disp} a atteint le seuil B "
-                f"→ C13 prédit {inverse_disp} au #{pred_game} (saut d'un jeu)."
-            )
-        else:
-            c2_line = (
-                f"C2 : {inverse_disp} n'a pas atteint le seuil B "
-                f"→ C13 prédit le miroir {miroir_disp} au #{pred_game}."
-            )
 
         reason = (
             f"C13 : {consec_disp} apparu {count} fois de suite "
             f"(jeux #{game_start}→#{game_trigger}, seuil wx={COMPTEUR13_THRESHOLD}). "
-            f"Costume prédit : {pred_disp} au jeu #{pred_game}. "
-            f"{c2_line}"
+            f"Miroir prédit : {miroir_disp} au jeu #{pred_game}. "
+            f"C2 vérifié (miroir non bloqué) → prédiction lancée."
         )
 
         c13_meta = {
-            'suit_consec':   suit_consec,
-            'suit_inverse':  suit_inverse,
-            'suit_miroir':   suit_miroir,
-            'c2_confirmed':  c2_confirmed,
-            'game_offset':   game_offset,
+            'suit_consec':  suit_consec,
+            'suit_miroir':  suit_miroir,
+            'game_offset':  game_offset,
+            'count':        count,
         }
         added = add_to_prediction_queue(
             pred_game, suit_pred, 'compteur13', reason,
@@ -2470,7 +2694,7 @@ def generate_compteur8_pdf() -> bytes:
         f'Genere le {datetime.now().strftime("%d/%m/%Y %H:%M")}', new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C'
     )
 
-    return pdf.output(dest='S').encode('latin-1')
+    return bytes(pdf.output())
 
 
 async def send_compteur8_series_alert(series: Dict):
@@ -2636,7 +2860,7 @@ def generate_compteur8_only_pdf() -> bytes:
         pdf.set_font('Helvetica', 'I', 10)
         pdf.cell(0, 10, f'Aucune serie d absence >= {COMPTEUR8_THRESHOLD} enregistree.', new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C')
 
-    return pdf.output(dest='S').encode('latin-1')
+    return bytes(pdf.output())
 
 
 async def send_compteur8_only_pdf():
@@ -2756,7 +2980,7 @@ def generate_comparaison_c8_pdf(nb_jours: int) -> bytes:
                 pdf.cell(0, 5, f"  {suit_names_map.get(suit, suit)}: {len(ss)} serie(s) | max={maxi} | moy={moy}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         pdf.ln(4)
 
-    return pdf.output(dest='S').encode('latin-1')
+    return bytes(pdf.output())
 
 
 def generate_comparaison_c7_pdf(nb_jours: int) -> bytes:
@@ -2842,7 +3066,7 @@ def generate_comparaison_c7_pdf(nb_jours: int) -> bytes:
                 pdf.cell(0, 5, f"  {suit_names_map.get(suit, suit)}: {len(ss)} serie(s) | max={maxi} | moy={moy}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         pdf.ln(4)
 
-    return pdf.output(dest='S').encode('latin-1')
+    return bytes(pdf.output())
 
 
 def update_hourly_data(player_suits: Set[str]):
@@ -3210,6 +3434,254 @@ async def load_prediction_history():
         logger.error(f"❌ load_prediction_history: {e}")
         prediction_history = []
 
+
+# ============================================================================
+# SIMULATION SILENCIEUSE — PERSISTANCE EN BASE (kv_store)
+# ============================================================================
+
+def _sim_to_json(sim: dict) -> dict:
+    """Convertit last_strategy_simulation en dict JSON-sérialisable."""
+    sm = sim.get('sim_matrix', {})
+    # clés tuples (combo, wx, b, skip) → "combo:wx:b:skip"
+    sm_str = {f"{k[0]}:{k[1]}:{k[2]}:{k[3]}": v for k, v in sm.items()}
+
+    # pred_lists : clés (combo, wx, df_sim) → "combo:wx:df_sim"
+    pl = sim.get('pred_lists', {})
+    pl_str = {f"{k[0]}:{k[1]}:{k[2]}": v for k, v in pl.items()}
+
+    # combo_scores — df1_best/df2_best sont des (tuple_key, dict) → sérialiser
+    cs_raw = sim.get('combo_scores', {})
+    cs_ser = {}
+    for cnum, sc in cs_raw.items():
+        if sc is None:
+            cs_ser[str(cnum)] = None
+        else:
+            sc_copy = dict(sc)
+            for field in ('df1_best', 'df2_best'):
+                pair = sc_copy.get(field)
+                if pair and pair[0] is not None:
+                    sc_copy[field] = {'key': list(pair[0]), 'val': pair[1]}
+                else:
+                    sc_copy[field] = None
+            cs_ser[str(cnum)] = sc_copy
+
+    ts = sim.get('timestamp', datetime.now())
+    return {
+        'timestamp':          ts.isoformat() if hasattr(ts, 'isoformat') else str(ts),
+        'sim_matrix_str':     sm_str,
+        'pred_lists_str':     pl_str,
+        'combo_scores_ser':   cs_ser,
+        'best_combo_key':     list(sim['best_combo_key']) if sim.get('best_combo_key') else None,
+        'best_combo_val':     sim.get('best_combo_val'),
+        'recommended_num':    sim.get('recommended_num'),
+        'recommended_reason': sim.get('recommended_reason', ''),
+        'total_c13':          sim.get('total_c13', 0),
+        'total_analysed':     sim.get('total_analysed', 0),
+        'verdict':            sim.get('verdict', ''),
+        'vd':                 sim.get('vd', ''),
+        'r0c': sim.get('r0c', 0), 'r1c': sim.get('r1c', 0),
+        'r2c': sim.get('r2c', 0), 'r3c': sim.get('r3c', 0),
+        'pdc': sim.get('pdc', 0),
+    }
+
+
+def _json_to_sim(data: dict) -> dict:
+    """Reconstruit last_strategy_simulation depuis un dict JSON chargé."""
+    # sim_matrix : clés "combo:wx:b:skip" → tuples (int, int, int, int)
+    sm_str = data.get('sim_matrix_str', {})
+    sm = {}
+    for k_str, v in sm_str.items():
+        parts = k_str.split(':')
+        k = (int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3]))
+        sm[k] = v
+
+    # pred_lists : clés "combo:wx:df_sim" → (combo, wx, df_sim)
+    pl_str = data.get('pred_lists_str', {})
+    pl = {}
+    for k_str, v in pl_str.items():
+        parts = k_str.split(':')
+        k = (int(parts[0]), int(parts[1]), int(parts[2]))
+        pl[k] = v
+
+    # combo_scores : clés str → int, df1_best/df2_best reconvertis
+    cs_ser = data.get('combo_scores_ser', {})
+    cs = {}
+    for cnum_str, sc in cs_ser.items():
+        cnum = int(cnum_str)
+        if sc is None:
+            cs[cnum] = None
+        else:
+            sc_copy = dict(sc)
+            for field in ('df1_best', 'df2_best'):
+                pair_data = sc_copy.get(field)
+                if pair_data and pair_data.get('key') is not None:
+                    sc_copy[field] = (tuple(pair_data['key']), pair_data['val'])
+                else:
+                    sc_copy[field] = (None, None)
+            cs[cnum] = sc_copy
+
+    bck_raw = data.get('best_combo_key')
+    return {
+        'timestamp':          datetime.fromisoformat(data.get('timestamp', datetime.now().isoformat())),
+        'combos':             GLOBAL_COMBOS,
+        'combo_scores':       cs,
+        'sim_matrix':         sm,
+        'pred_lists':         pl,
+        'best_combo_key':     tuple(bck_raw) if bck_raw else None,
+        'best_combo_val':     data.get('best_combo_val'),
+        'param_proposals':    data.get('param_proposals', []),
+        'recommended_num':    data.get('recommended_num'),
+        'recommended_reason': data.get('recommended_reason', ''),
+        'total_c13':          data.get('total_c13', 0),
+        'total_analysed':     data.get('total_analysed', 0),
+        'verdict':            data.get('verdict', ''),
+        'vd':                 data.get('vd', ''),
+        'r0c': data.get('r0c', 0), 'r1c': data.get('r1c', 0),
+        'r2c': data.get('r2c', 0), 'r3c': data.get('r3c', 0),
+        'pdc': data.get('pdc', 0),
+    }
+
+
+async def save_strategy_simulation():
+    """Persiste last_strategy_simulation en base (kv_store)."""
+    global last_strategy_simulation
+    if not last_strategy_simulation:
+        return
+    try:
+        payload = _sim_to_json(last_strategy_simulation)
+        await db.db_save_kv('strategy_simulation', payload)
+        logger.info("💾 Simulation silencieuse sauvegardée en DB")
+    except Exception as e:
+        logger.error(f"❌ save_strategy_simulation: {e}")
+
+
+async def load_strategy_simulation():
+    """Charge la dernière simulation silencieuse depuis la DB."""
+    global last_strategy_simulation
+    try:
+        data = await db.db_load_kv('strategy_simulation')
+        if not data:
+            logger.info("📂 Simulation silencieuse : aucune donnée en DB")
+            return
+        last_strategy_simulation = _json_to_sim(data)
+        ts = last_strategy_simulation.get('timestamp', '')
+        total_c13 = last_strategy_simulation.get('total_c13', 0)
+        logger.info(
+            f"📂 Simulation silencieuse chargée depuis DB "
+            f"({total_c13} prédictions C13 · {ts})"
+        )
+    except Exception as e:
+        logger.error(f"❌ load_strategy_simulation: {e}")
+        last_strategy_simulation = {}
+
+
+# ============================================================================
+# AUTO-STRATÉGIE — Application automatique + bouton Annuler
+# ============================================================================
+
+async def apply_best_strategy_auto(best_auto: dict):
+    """
+    Applique immédiatement la meilleure configuration trouvée par la simulation.
+    Envoie une notification à l'admin avec un bouton [❌ Annuler].
+    Si l'admin n'annule pas, la configuration reste active indéfiniment.
+    """
+    global COMPTEUR13_MIRROR, COMPTEUR13_THRESHOLD, COMPTEUR13_SKIP, PREDICTION_DF
+    global compteur2_seuil_B, compteur2_seuil_B_per_suit, auto_strategy_revert
+
+    if not best_auto or not ADMIN_ID:
+        return
+
+    new_df_sim = best_auto.get('df_sim', 1)
+    # SKIP = df_sim - PREDICTION_DF  (ex: df_sim=1, PREDICTION_DF=1 → SKIP=0 = normal)
+    #                                  (ex: df_sim=2, PREDICTION_DF=1 → SKIP=1)
+    new_skip   = max(0, new_df_sim - PREDICTION_DF)
+
+    # ── Vérifier si un changement réel est nécessaire ───────────────────────
+    same_mirror = (best_auto['mirror'] == dict(COMPTEUR13_MIRROR))
+    same_wx     = (best_auto['wx']  == COMPTEUR13_THRESHOLD)
+    same_b      = (best_auto['b']   == compteur2_seuil_B)
+    same_df     = (new_skip          == COMPTEUR13_SKIP)
+    if same_mirror and same_wx and same_b and same_df:
+        logger.info("ℹ️ Auto-stratégie : paramètres déjà optimaux, aucun changement.")
+        return
+
+    # ── Sauvegarder les paramètres actuels pour permettre l'annulation ───────
+    prev_mirror_name = next(
+        (c['name'] for c in GLOBAL_COMBOS if c['mirror'] == dict(COMPTEUR13_MIRROR)),
+        "inconnu"
+    )
+    auto_strategy_revert = {
+        'mirror':       dict(COMPTEUR13_MIRROR),
+        'wx':           COMPTEUR13_THRESHOLD,
+        'b':            compteur2_seuil_B,
+        'df_sim':       COMPTEUR13_SKIP,   # save current SKIP as df_sim
+        'b_per_suit':   dict(compteur2_seuil_B_per_suit),
+        'name_prev':    prev_mirror_name,
+        'msg_id':       None,
+    }
+
+    # ── Appliquer les nouveaux paramètres ────────────────────────────────────
+    old_mirror_disp = next(
+        (c['disp'] for c in GLOBAL_COMBOS if c['mirror'] == dict(COMPTEUR13_MIRROR)),
+        str(dict(COMPTEUR13_MIRROR))
+    )
+    old_wx   = COMPTEUR13_THRESHOLD
+    old_b    = compteur2_seuil_B
+    old_df   = COMPTEUR13_SKIP
+
+    COMPTEUR13_MIRROR.clear()
+    COMPTEUR13_MIRROR.update(best_auto['mirror'])
+    COMPTEUR13_THRESHOLD = best_auto['wx']
+    COMPTEUR13_SKIP      = new_skip
+    compteur2_seuil_B    = best_auto['b']
+    for s in ALL_SUITS:
+        compteur2_seuil_B_per_suit[s] = best_auto['b']
+
+    logger.info(
+        f"🤖 Auto-stratégie appliquée : {best_auto['name']} | "
+        f"miroir={dict(COMPTEUR13_MIRROR)} | wx={COMPTEUR13_THRESHOLD} | "
+        f"B={compteur2_seuil_B} | df+{new_df_sim}"
+    )
+
+    # ── Construire et envoyer la notification admin ───────────────────────────
+    changes  = []
+    if not same_mirror:
+        changes.append(f"  🔄 Miroir : {old_mirror_disp} → **{best_auto['disp']}**")
+    if not same_wx:
+        changes.append(f"  📏 wx C13 : {old_wx} → **{best_auto['wx']}** consécutives")
+    if not same_b:
+        changes.append(f"  🎚 B  C2  : {old_b} → **{best_auto['b']}** absences")
+    if not same_df:
+        changes.append(f"  📐 df     : df+{old_df} → **df+{new_df_sim}**")
+
+    lines = [
+        "╔══════════════════════════════╗",
+        "║  🤖 STRATÉGIE AUTO-APPLIQUÉE ║",
+        "╚══════════════════════════════╝",
+        f"**{best_auto['name']}** · trigger+{new_df_sim}",
+        "",
+    ] + changes + [
+        "",
+        f"📊 Score sim. : **{best_auto['score']:+d}** pts "
+        f"(✅{best_auto['wins']} | ❌{best_auto['losses']} sur {best_auto['total']} pred. C13)",
+        "",
+        "Active immédiatement — **aucune action requise**.",
+        "_Appuie sur Annuler pour revenir aux paramètres précédents._",
+    ]
+
+    try:
+        msg = await client.send_message(
+            ADMIN_ID,
+            "\n".join(lines),
+            buttons=[[Button.inline("❌ Annuler", b"cancel_auto_strat")]],
+            parse_mode='markdown',
+        )
+        auto_strategy_revert['msg_id'] = msg.id
+        logger.info(f"📨 Notification auto-stratégie envoyée à l'admin (msg_id={msg.id})")
+    except Exception as e:
+        logger.error(f"❌ Notification auto-stratégie : {e}")
+
+
 # ============================================================================
 # COMPTEUR 11 — PERDU HIER → PRÉDIT DEMAIN
 # ============================================================================
@@ -3452,7 +3924,10 @@ async def _run_animation(original_game: int, check_game: int, start_frame: int =
     global pending_predictions, animation_tasks
 
     try:
-        prediction_entity = await resolve_channel(PREDICTION_CHANNEL_ID)
+        prediction_entity  = await resolve_channel(PREDICTION_CHANNEL_ID)
+        prediction_entity2 = await resolve_channel(PREDICTION_CHANNEL_ID2) if PREDICTION_CHANNEL_ID2 else None
+        prediction_entity3 = await resolve_channel(PREDICTION_CHANNEL_ID3) if PREDICTION_CHANNEL_ID3 else None
+        prediction_entity4 = await resolve_channel(PREDICTION_CHANNEL_ID4) if PREDICTION_CHANNEL_ID4 else None
         if not prediction_entity:
             return
 
@@ -3462,7 +3937,10 @@ async def _run_animation(original_game: int, check_game: int, start_frame: int =
             if not pred or pred.get('status') != 'en_cours':
                 break
 
-            msg_id = pred.get('message_id')
+            msg_id  = pred.get('message_id')
+            msg_id2 = pred.get('channel2_message_id')
+            msg_id3 = pred.get('channel3_message_id')
+            msg_id4 = pred.get('channel4_message_id')
             if not msg_id:
                 break
 
@@ -3472,11 +3950,8 @@ async def _run_animation(original_game: int, check_game: int, start_frame: int =
 
             bar = build_anim_bar(rattrapage, frame)
 
-            # Légende du niveau actuel
             level_labels = ['🟦 R0', '🟩 R1', '🟨 R2', '🟥 R3']
             level_label  = level_labels[min(rattrapage, 3)]
-
-            # Petits points animés
             dots = '.' * ((frame % 3) + 1)
 
             msg = (
@@ -3492,6 +3967,24 @@ async def _run_animation(original_game: int, check_game: int, start_frame: int =
                 label=f"anim #{original_game}",
                 max_retries=2
             )
+            if prediction_entity2 and msg_id2:
+                await safe_edit_message(
+                    prediction_entity2, msg_id2, msg,
+                    label=f"anim2 #{original_game}",
+                    max_retries=2
+                )
+            if prediction_entity3 and msg_id3:
+                await safe_edit_message(
+                    prediction_entity3, msg_id3, msg,
+                    label=f"anim3 #{original_game}",
+                    max_retries=2
+                )
+            if prediction_entity4 and msg_id4:
+                await safe_edit_message(
+                    prediction_entity4, msg_id4, msg,
+                    label=f"anim4 #{original_game}",
+                    max_retries=2
+                )
 
             frame += 1
             await asyncio.sleep(ANIM_INTERVAL)
@@ -3655,41 +4148,68 @@ async def send_prediction_multi_channel(game_number: int, suit: str, prediction_
             'reason': queued_reason
         }
 
-        msg_id = await send_prediction_to_channel(
-            PREDICTION_CHANNEL_ID, game_number, suit, prediction_type, is_secondary=False
-        )
+        # ── Envoi simultané Canal1 + Canal2 + Canal3 (asyncio.gather) ───────────
+        secondary_channel_id = None
+        if prediction_type == 'distribution' and DISTRIBUTION_CHANNEL_ID:
+            secondary_channel_id = DISTRIBUTION_CHANNEL_ID
+        elif prediction_type == 'compteur2' and COMPTEUR2_CHANNEL_ID:
+            secondary_channel_id = COMPTEUR2_CHANNEL_ID
+
+        async def _noop(): return None
+
+        tasks = [
+            send_prediction_to_channel(PREDICTION_CHANNEL_ID,  game_number, suit, prediction_type, is_secondary=False),
+            send_prediction_to_channel(PREDICTION_CHANNEL_ID2, game_number, suit, prediction_type, is_secondary=True) if PREDICTION_CHANNEL_ID2 else _noop(),
+            send_prediction_to_channel(PREDICTION_CHANNEL_ID3, game_number, suit, prediction_type, is_secondary=True) if PREDICTION_CHANNEL_ID3 else _noop(),
+            send_prediction_to_channel(PREDICTION_CHANNEL_ID4, game_number, suit, prediction_type, is_secondary=True) if PREDICTION_CHANNEL_ID4 else _noop(),
+            send_prediction_to_channel(secondary_channel_id,   game_number, suit, prediction_type, is_secondary=True) if secondary_channel_id else _noop(),
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        msg_id     = results[0] if not isinstance(results[0], Exception) else None
+        ch2_msg_id = results[1] if not isinstance(results[1], Exception) else None
+        ch3_msg_id = results[2] if not isinstance(results[2], Exception) else None
+        ch4_msg_id = results[3] if not isinstance(results[3], Exception) else None
+        sec_msg_id = results[4] if not isinstance(results[4], Exception) else None
+
+        if ch2_msg_id:
+            logger.info(f"✅ Canal2 #{game_number} {suit} envoyé")
+        elif PREDICTION_CHANNEL_ID2:
+            logger.warning(f"⚠️ Canal2 #{game_number} {suit} — ÉCHEC (bot admin? droits d'écriture?)")
+
+        if ch3_msg_id:
+            logger.info(f"✅ Canal3 #{game_number} {suit} envoyé")
+        elif PREDICTION_CHANNEL_ID3:
+            logger.warning(f"⚠️ Canal3 #{game_number} {suit} — ÉCHEC (bot admin? droits d'écriture?)")
+
+        if ch4_msg_id:
+            logger.info(f"✅ Canal4 #{game_number} {suit} envoyé")
+        elif PREDICTION_CHANNEL_ID4:
+            logger.warning(f"⚠️ Canal4 #{game_number} {suit} — ÉCHEC (bot admin? droits d'écriture?)")
 
         if msg_id:
             last_prediction_time = datetime.now()
             pending_predictions[game_number]['message_id'] = msg_id
             pending_predictions[game_number]['status'] = 'en_cours'
+            if ch2_msg_id:
+                pending_predictions[game_number]['channel2_message_id'] = ch2_msg_id
+            if ch3_msg_id:
+                pending_predictions[game_number]['channel3_message_id'] = ch3_msg_id
+            if ch4_msg_id:
+                pending_predictions[game_number]['channel4_message_id'] = ch4_msg_id
+            if sec_msg_id:
+                pending_predictions[game_number]['secondary_message_id'] = sec_msg_id
+                pending_predictions[game_number]['secondary_channel_id'] = secondary_channel_id
             canal_pred_msg_ids[msg_id] = game_number
             add_prediction_to_history(game_number, suit, [game_number, game_number + 1, game_number + 2], prediction_type, queued_reason, meta=queued_meta)
             db.db_schedule(db.db_set_prediction_message_id(game_number, suit, msg_id))
             success = True
             recently_predicted.add(game_number)
-            # Nettoyage : garder seulement les 30 derniers game_numbers (évite croissance infinie)
             if len(recently_predicted) > 30:
                 oldest = min(recently_predicted)
                 recently_predicted.discard(oldest)
             logger.info(f"✅ Prédiction #{game_number} {suit} envoyée ({prediction_type})")
-            # Démarrer l'animation dès l'envoi
             start_animation(game_number, game_number)
-            save_pending_predictions()  # Persistance : survit aux redémarrages
-
-            secondary_channel_id = None
-            if prediction_type == 'distribution' and DISTRIBUTION_CHANNEL_ID:
-                secondary_channel_id = DISTRIBUTION_CHANNEL_ID
-            elif prediction_type == 'compteur2' and COMPTEUR2_CHANNEL_ID:
-                secondary_channel_id = COMPTEUR2_CHANNEL_ID
-
-            if secondary_channel_id:
-                sec_msg_id = await send_prediction_to_channel(
-                    secondary_channel_id, game_number, suit, prediction_type, is_secondary=True
-                )
-                if sec_msg_id:
-                    pending_predictions[game_number]['secondary_message_id'] = sec_msg_id
-                    pending_predictions[game_number]['secondary_channel_id'] = secondary_channel_id
+            save_pending_predictions()
         else:
             if game_number in pending_predictions and pending_predictions[game_number]['status'] == 'sending':
                 del pending_predictions[game_number]
@@ -3716,20 +4236,23 @@ async def notify_b_augmente(suit: str, old_b: int, new_b: int, game_number: int,
         logger.error(f"❌ Notif B augmenté: {e}")
 
 async def send_parole_auto_delete(statut_key: str, game_number: int):
-    """Envoie une parole biblique sur le canal et la supprime automatiquement après 30s."""
-    try:
-        entity = await resolve_channel(PREDICTION_CHANNEL_ID)
-        if not entity:
-            return
-        texte = get_parole(statut_key, game_number, count=1)
-        msg = await client.send_message(entity, texte, parse_mode='markdown')
-        await asyncio.sleep(30)
+    """Envoie une parole biblique sur tous les canaux et la supprime automatiquement après 30s."""
+    texte = get_parole(statut_key, game_number, count=1)
+    for ch_id in [PREDICTION_CHANNEL_ID, PREDICTION_CHANNEL_ID2, PREDICTION_CHANNEL_ID3, PREDICTION_CHANNEL_ID4]:
+        if not ch_id:
+            continue
         try:
-            await client.delete_messages(entity, [msg.id])
+            entity = await resolve_channel(ch_id)
+            if not entity:
+                continue
+            msg = await client.send_message(entity, texte, parse_mode='markdown')
+            await asyncio.sleep(30)
+            try:
+                await client.delete_messages(entity, [msg.id])
+            except Exception as e:
+                logger.debug(f"Suppression parole #{game_number} canal {ch_id} ignorée: {e}")
         except Exception as e:
-            logger.debug(f"Suppression parole #{game_number} ignorée: {e}")
-    except Exception as e:
-        logger.debug(f"send_parole_auto_delete #{game_number}: {e}")
+            logger.debug(f"send_parole_auto_delete #{game_number} canal {ch_id}: {e}")
 
 
 async def auto_delete_canal_message(msg_id: int, delay_seconds: int = 1800):
@@ -3793,7 +4316,6 @@ async def update_prediction_message(game_number: int, status: str, rattrapage: i
             edited = await safe_edit_message(prediction_entity, msg_id, new_msg,
                                              label=f"finale #{game_number}")
             if not edited:
-                # Édition échouée → tenter de supprimer l'ancien message et envoyer le résultat
                 logger.warning(
                     f"⚠️ Édition finale #{game_number} échouée "
                     f"(msg_id={msg_id}) → envoi du résultat en nouveau message"
@@ -3815,6 +4337,75 @@ async def update_prediction_message(game_number: int, status: str, rattrapage: i
                 await client.send_message(prediction_entity, new_msg, parse_mode='markdown')
             except Exception as _se:
                 logger.error(f"❌ Fallback send #{game_number} (msg_id None): {_se}")
+
+    # ── Canal 2 — mise à jour résultat ───────────────────────────────────────
+    ch2_msg_id = pred.get('channel2_message_id')
+    if PREDICTION_CHANNEL_ID2:
+        prediction_entity2 = await resolve_channel(PREDICTION_CHANNEL_ID2)
+        if prediction_entity2:
+            if ch2_msg_id:
+                edited2 = await safe_edit_message(prediction_entity2, ch2_msg_id, new_msg,
+                                                  label=f"finale2 #{game_number}")
+                if not edited2:
+                    try:
+                        await client.delete_messages(prediction_entity2, [ch2_msg_id])
+                    except Exception:
+                        pass
+                    try:
+                        await client.send_message(prediction_entity2, new_msg, parse_mode='markdown')
+                    except Exception as _se2:
+                        logger.error(f"❌ Fallback send canal2 #{game_number}: {_se2}")
+            else:
+                try:
+                    await client.send_message(prediction_entity2, new_msg, parse_mode='markdown')
+                except Exception as _se2:
+                    logger.error(f"❌ Fallback send canal2 #{game_number} (msg_id None): {_se2}")
+
+    # ── Canal 3 — mise à jour résultat ───────────────────────────────────────
+    ch3_msg_id = pred.get('channel3_message_id')
+    if PREDICTION_CHANNEL_ID3:
+        prediction_entity3 = await resolve_channel(PREDICTION_CHANNEL_ID3)
+        if prediction_entity3:
+            if ch3_msg_id:
+                edited3 = await safe_edit_message(prediction_entity3, ch3_msg_id, new_msg,
+                                                  label=f"finale3 #{game_number}")
+                if not edited3:
+                    try:
+                        await client.delete_messages(prediction_entity3, [ch3_msg_id])
+                    except Exception:
+                        pass
+                    try:
+                        await client.send_message(prediction_entity3, new_msg, parse_mode='markdown')
+                    except Exception as _se3:
+                        logger.error(f"❌ Fallback send canal3 #{game_number}: {_se3}")
+            else:
+                try:
+                    await client.send_message(prediction_entity3, new_msg, parse_mode='markdown')
+                except Exception as _se3:
+                    logger.error(f"❌ Fallback send canal3 #{game_number} (msg_id None): {_se3}")
+
+    # ── Canal 4 — mise à jour résultat ───────────────────────────────────────
+    ch4_msg_id = pred.get('channel4_message_id')
+    if PREDICTION_CHANNEL_ID4:
+        prediction_entity4 = await resolve_channel(PREDICTION_CHANNEL_ID4)
+        if prediction_entity4:
+            if ch4_msg_id:
+                edited4 = await safe_edit_message(prediction_entity4, ch4_msg_id, new_msg,
+                                                  label=f"finale4 #{game_number}")
+                if not edited4:
+                    try:
+                        await client.delete_messages(prediction_entity4, [ch4_msg_id])
+                    except Exception:
+                        pass
+                    try:
+                        await client.send_message(prediction_entity4, new_msg, parse_mode='markdown')
+                    except Exception as _se4:
+                        logger.error(f"❌ Fallback send canal4 #{game_number}: {_se4}")
+            else:
+                try:
+                    await client.send_message(prediction_entity4, new_msg, parse_mode='markdown')
+                except Exception as _se4:
+                    logger.error(f"❌ Fallback send canal4 #{game_number} (msg_id None): {_se4}")
 
     sec_msg_id = pred.get('secondary_message_id')
     sec_channel_id = pred.get('secondary_channel_id')
@@ -3846,6 +4437,30 @@ async def update_prediction_progress(game_number: int, current_check: int):
     if prediction_entity:
         await safe_edit_message(prediction_entity, msg_id, msg,
                                 label=f"progress #{game_number}")
+
+    # ── Canal 2 — mise à jour progression ────────────────────────────────────
+    ch2_msg_id = pred.get('channel2_message_id')
+    if PREDICTION_CHANNEL_ID2 and ch2_msg_id:
+        prediction_entity2 = await resolve_channel(PREDICTION_CHANNEL_ID2)
+        if prediction_entity2:
+            await safe_edit_message(prediction_entity2, ch2_msg_id, msg,
+                                    label=f"progress2 #{game_number}")
+
+    # ── Canal 3 — mise à jour progression ────────────────────────────────────
+    ch3_msg_id = pred.get('channel3_message_id')
+    if PREDICTION_CHANNEL_ID3 and ch3_msg_id:
+        prediction_entity3 = await resolve_channel(PREDICTION_CHANNEL_ID3)
+        if prediction_entity3:
+            await safe_edit_message(prediction_entity3, ch3_msg_id, msg,
+                                    label=f"progress3 #{game_number}")
+
+    # ── Canal 4 — mise à jour progression ────────────────────────────────────
+    ch4_msg_id = pred.get('channel4_message_id')
+    if PREDICTION_CHANNEL_ID4 and ch4_msg_id:
+        prediction_entity4 = await resolve_channel(PREDICTION_CHANNEL_ID4)
+        if prediction_entity4:
+            await safe_edit_message(prediction_entity4, ch4_msg_id, msg,
+                                    label=f"progress4 #{game_number}")
 
     sec_msg_id = pred.get('secondary_message_id')
     sec_channel_id = pred.get('secondary_channel_id')
@@ -3917,14 +4532,18 @@ async def check_prediction_result(game_number: int, player_suits: Set[str], is_f
                 f"sans résolution → suppression du canal"
             )
             stop_animation(original_game)
-            msg_id = pred.get('message_id')
-            if msg_id and PREDICTION_CHANNEL_ID:
-                try:
-                    prediction_entity = await resolve_channel(PREDICTION_CHANNEL_ID)
-                    if prediction_entity:
-                        await client.delete_messages(prediction_entity, [msg_id])
-                except Exception as _e:
-                    logger.debug(f"Suppression message timeout #{original_game}: {_e}")
+            msg_id  = pred.get('message_id')
+            msg_id2 = pred.get('channel2_message_id')
+            msg_id3 = pred.get('channel3_message_id')
+            msg_id4 = pred.get('channel4_message_id')
+            for _ch_id, _mid in [(PREDICTION_CHANNEL_ID, msg_id), (PREDICTION_CHANNEL_ID2, msg_id2), (PREDICTION_CHANNEL_ID3, msg_id3), (PREDICTION_CHANNEL_ID4, msg_id4)]:
+                if _ch_id and _mid:
+                    try:
+                        _ent = await resolve_channel(_ch_id)
+                        if _ent:
+                            await client.delete_messages(_ent, [_mid])
+                    except Exception as _e:
+                        logger.debug(f"Suppression message timeout #{original_game} canal {_ch_id}: {_e}")
             del pending_predictions[original_game]
             save_pending_predictions()
             update_prediction_in_history(original_game, target_suit, game_number, rattrapage, 'perdu')
@@ -4244,14 +4863,17 @@ async def send_bilan_and_reset_at_1440():
         concours_last_pct    = _current_pct
         logger.info(f"💾 Vainqueur concours sauvegardé : {_current_winner} ({_current_pct:.1f}%)")
 
-        canal_entity = await resolve_channel(PREDICTION_CHANNEL_ID)
-        if canal_entity:
-            await client.send_message(canal_entity, concours_txt1, parse_mode='markdown')
-            await asyncio.sleep(2)
-            await client.send_message(canal_entity, concours_txt2, parse_mode='markdown')
-            logger.info("🏆 Messages concours par costume envoyés dans le canal (2 messages).")
-        else:
-            logger.warning("⚠️ Canal introuvable — concours non envoyé dans le canal.")
+        for _ch_id in [PREDICTION_CHANNEL_ID, PREDICTION_CHANNEL_ID2, PREDICTION_CHANNEL_ID3, PREDICTION_CHANNEL_ID4]:
+            if not _ch_id:
+                continue
+            canal_entity = await resolve_channel(_ch_id)
+            if canal_entity:
+                await client.send_message(canal_entity, concours_txt1, parse_mode='markdown')
+                await asyncio.sleep(2)
+                await client.send_message(canal_entity, concours_txt2, parse_mode='markdown')
+                logger.info(f"🏆 Messages concours envoyés dans le canal {_ch_id}.")
+            else:
+                logger.warning(f"⚠️ Canal {_ch_id} introuvable — concours non envoyé.")
     except Exception as e:
         logger.error(f"❌ Erreur envoi concours #1440 canal: {e}")
 
@@ -4426,13 +5048,11 @@ async def process_game_result(game_number: int, player_suits: Set[str], player_c
         current_game_number = game_number
 
     # ─────────────────────────────────────────────────────────────────────────
-    # player_hand_complete : la main du JOUEUR est définitive dès que :
-    #   • le jeu est entièrement terminé (is_finished=True), OU
-    #   • le joueur a déjà pris ses 3 cartes (max en Baccarat).
-    # On n'attend PAS que le banquier tire sa 3ᵉ carte pour lancer les
-    # compteurs et la prédiction du jeu suivant.
+    # player_hand_complete : on attend que le jeu soit ENTIÈREMENT terminé
+    # (banquier ET joueur ont fini) avant de lancer les compteurs et de
+    # prédire le jeu suivant. Cela évite de compter des cartes partielles.
     # ─────────────────────────────────────────────────────────────────────────
-    player_hand_complete = is_finished or len(player_cards_raw) >= 3
+    player_hand_complete = is_finished
 
     # Vérification dynamique des prédictions (TOUJOURS — même partie en cours)
     # Victoire immédiate si costume trouvé, échec seulement si partie entièrement terminée
@@ -4452,6 +5072,12 @@ async def process_game_result(game_number: int, player_suits: Set[str], player_c
         asyncio.ensure_future(db.db_save_game_log(game_number, list(player_suits)))
         update_compteur1(game_number, player_suits)
         update_compteur2(game_number, player_suits)
+
+        # ── 216 trackers silencieux indépendants (C13 + C2 par combo) ──────
+        update_silent_combos(game_number, player_suits)
+        # Sauvegarde périodique : toutes les 20 parties
+        if game_number % 20 == 0:
+            asyncio.ensure_future(save_silent_combo_stats())
 
         # Compteur4: séries d'absences (seuil + série complète, persistant)
         threshold4, completed4 = update_compteur4(game_number, player_suits, player_cards_raw)
@@ -4530,6 +5156,15 @@ async def process_game_result(game_number: int, player_suits: Set[str], player_c
                     logger.info(
                         f"⛔ C13 #{game_number} {_sp13} refusée : "
                         f"présent {_pres_count}x consécutif (seuil {PRES_BLOCK_SEUIL})"
+                    )
+                elif trig13.get('c2_mirror_blocked'):
+                    # Filtre miroir bloqué : le costume que C13 veut prédire est déjà
+                    # un manque bloqué dans C2 (absent ≥ B fois) → prédiction annulée
+                    _b_pred = compteur2_seuil_B_per_suit.get(_sp13, compteur2_seuil_B)
+                    logger.info(
+                        f"⛔ C13 #{game_number} {_sp13} bloquée : "
+                        f"miroir prédit est manque bloqué C2 "
+                        f"(absent {compteur2_trackers[_sp13].counter}x ≥ B={_b_pred})"
                     )
                 else:
                     asyncio.create_task(send_compteur13_alert(trig13, game_number))
@@ -4692,12 +5327,19 @@ async def cleanup_stale_predictions():
             suit = pred.get('suit', '?')
             logger.warning(f"🧹 #{game_number} ({suit}) expiré (timeout)")
             stop_animation(game_number)
-            prediction_entity = await resolve_channel(PREDICTION_CHANNEL_ID)
-            if prediction_entity and pred.get('message_id'):
-                suit_display = SUIT_DISPLAY.get(suit, suit)
-                expired_msg = f"⏰ **PRÉDICTION #{game_number}**\n🎯 {suit_display}\n⌛ **EXPIRÉE**"
-                await safe_edit_message(prediction_entity, pred['message_id'], expired_msg,
-                                        label=f"expirée #{game_number}", max_retries=2)
+            suit_display = SUIT_DISPLAY.get(suit, suit)
+            expired_msg = f"⏰ **PRÉDICTION #{game_number}**\n🎯 {suit_display}\n⌛ **EXPIRÉE**"
+            for _ch_id, _mid in [
+                (PREDICTION_CHANNEL_ID,  pred.get('message_id')),
+                (PREDICTION_CHANNEL_ID2, pred.get('channel2_message_id')),
+                (PREDICTION_CHANNEL_ID3, pred.get('channel3_message_id')),
+                (PREDICTION_CHANNEL_ID4, pred.get('channel4_message_id')),
+            ]:
+                if _ch_id and _mid:
+                    _ent = await resolve_channel(_ch_id)
+                    if _ent:
+                        await safe_edit_message(_ent, _mid, expired_msg,
+                                                label=f"expirée #{game_number}", max_retries=2)
             del pending_predictions[game_number]
             save_pending_predictions()
 
@@ -4765,13 +5407,19 @@ async def auto_watchdog_task():
                         stop_animation(gn)
                         suit = pred.get('suit', '?')
                         actions.append(f"🧹 Prédiction #{gn} ({suit}) forcée hors mémoire")
-                        entity = await resolve_channel(PREDICTION_CHANNEL_ID)
-                        if entity and pred.get('message_id'):
-                            sd = SUIT_DISPLAY.get(suit, suit)
-                            await safe_edit_message(
-                                entity, pred['message_id'],
-                                f"⏰ **PRÉDICTION #{gn}**\n🎯 {sd}\n⌛ **EXPIRÉE (watchdog)**",
-                                label=f"watchdog #{gn}", max_retries=2)
+                        sd = SUIT_DISPLAY.get(suit, suit)
+                        wd_msg = f"⏰ **PRÉDICTION #{gn}**\n🎯 {sd}\n⌛ **EXPIRÉE (watchdog)**"
+                        for _ch_id, _mid in [
+                            (PREDICTION_CHANNEL_ID,  pred.get('message_id')),
+                            (PREDICTION_CHANNEL_ID2, pred.get('channel2_message_id')),
+                            (PREDICTION_CHANNEL_ID3, pred.get('channel3_message_id')),
+                            (PREDICTION_CHANNEL_ID4, pred.get('channel4_message_id')),
+                        ]:
+                            if _ch_id and _mid:
+                                _ent = await resolve_channel(_ch_id)
+                                if _ent:
+                                    await safe_edit_message(_ent, _mid, wd_msg,
+                                                            label=f"watchdog #{gn}", max_retries=2)
 
             # ── 2. Tous les costumes simultanément bloqués ──────────────────
             blocked_suits = [s for s in ALL_SUITS if s in suit_block_until and now < suit_block_until[s]]
@@ -5891,7 +6539,7 @@ async def cmd_compteur14(event):
 
 
 async def cmd_canaux(event):
-    global DISTRIBUTION_CHANNEL_ID, COMPTEUR2_CHANNEL_ID, PREDICTION_CHANNEL_ID
+    global DISTRIBUTION_CHANNEL_ID, COMPTEUR2_CHANNEL_ID, PREDICTION_CHANNEL_ID, PREDICTION_CHANNEL_ID3, PREDICTION_CHANNEL_ID4
     if event.is_group or event.is_channel:
         return
     if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
@@ -5935,13 +6583,72 @@ async def cmd_canaux(event):
                 await event.respond(f"✅ **Canal compteur2: {old} → {new_id}**")
             return
 
+        if sub == 'canal3':
+            if len(parts) < 3:
+                st = f"✅ `{PREDICTION_CHANNEL_ID3}`" if PREDICTION_CHANNEL_ID3 else "❌ Inactif"
+                await event.respond(
+                    f"📡 **Canal 3 (prédictions + résultats):** {st}\n\n"
+                    f"Usage: `/canaux canal3 [ID|off]`\n"
+                    f"Le bot doit être **admin** dans ce canal.\n"
+                    f"Reçoit : prédictions initiales + résultats (gagné/perdu/expiré)."
+                )
+                return
+            arg = parts[2].lower()
+            if arg == 'off':
+                old = PREDICTION_CHANNEL_ID3; PREDICTION_CHANNEL_ID3 = None
+                await event.respond(f"❌ **Canal 3 désactivé** (était: `{old}`)")
+            else:
+                new_id = int(arg)
+                entity = await resolve_channel(new_id)
+                if not entity:
+                    await event.respond(f"❌ Canal `{new_id}` inaccessible — le bot est-il admin?"); return
+                old = PREDICTION_CHANNEL_ID3; PREDICTION_CHANNEL_ID3 = new_id
+                await event.respond(
+                    f"✅ **Canal 3 activé : {old or 'inactif'} → `{new_id}`**\n"
+                    f"Toutes les prédictions + résultats seront redirigés vers ce canal."
+                )
+            return
+
+        if sub == 'canal4':
+            if len(parts) < 3:
+                st = f"✅ `{PREDICTION_CHANNEL_ID4}`" if PREDICTION_CHANNEL_ID4 else "❌ Inactif"
+                await event.respond(
+                    f"📡 **Canal 4 (prédictions + résultats):** {st}\n\n"
+                    f"Usage: `/canaux canal4 [ID|off]`\n"
+                    f"Le bot doit être **admin** dans ce canal.\n"
+                    f"Reçoit : prédictions initiales + résultats (gagné/perdu/expiré)."
+                )
+                return
+            arg = parts[2].lower()
+            if arg == 'off':
+                old = PREDICTION_CHANNEL_ID4; PREDICTION_CHANNEL_ID4 = None
+                await event.respond(f"❌ **Canal 4 désactivé** (était: `{old}`)")
+            else:
+                new_id = int(arg)
+                entity = await resolve_channel(new_id)
+                if not entity:
+                    await event.respond(f"❌ Canal `{new_id}` inaccessible — le bot est-il admin?"); return
+                old = PREDICTION_CHANNEL_ID4; PREDICTION_CHANNEL_ID4 = new_id
+                await event.respond(
+                    f"✅ **Canal 4 activé : {old or 'inactif'} → `{new_id}`**\n"
+                    f"Toutes les prédictions + résultats seront redirigés vers ce canal."
+                )
+            return
+
+        c3_st = f"`{PREDICTION_CHANNEL_ID3}`" if PREDICTION_CHANNEL_ID3 else "❌ inactif"
+        c4_st = f"`{PREDICTION_CHANNEL_ID4}`" if PREDICTION_CHANNEL_ID4 else "❌ inactif"
         lines = [
             "📡 **CONFIGURATION DES CANAUX**", "",
-            f"📤 **Principal:** `{PREDICTION_CHANNEL_ID}`",
+            f"📤 **Canal 1 (principal):** `{PREDICTION_CHANNEL_ID}`",
+            f"📤 **Canal 2 (principal):** `{PREDICTION_CHANNEL_ID2}`",
+            f"📡 **Canal 3 (redirect):** {c3_st}",
+            f"📡 **Canal 4 (redirect):** {c4_st}",
             f"🎯 **Distribution:** {f'`{DISTRIBUTION_CHANNEL_ID}`' if DISTRIBUTION_CHANNEL_ID else '❌'}",
             f"📊 **Compteur2:** {f'`{COMPTEUR2_CHANNEL_ID}`' if COMPTEUR2_CHANNEL_ID else '❌'}",
             "",
             "**Modifier:**",
+            "`/canaux canal3 [ID|off]` — Canal prédictions+résultats",
+            "`/canaux canal4 [ID|off]` — Canal prédictions+résultats",
             "`/canaux distribution [ID|off]`",
             "`/canaux compteur2 [ID|off]`",
         ]
@@ -6099,12 +6806,18 @@ async def cmd_help(event):
         f"`/compteur13 [wx N/on/off/reset]` — Consécutifs + miroir C2 (seuil: {COMPTEUR13_THRESHOLD})\n\n"
         f"**📡 Canaux:**\n"
         f"`/canaux` — Voir config des canaux\n"
+        f"`/canaux canal3 [ID|off]` — Canal redirect (prédictions + résultats)\n"
+        f"`/canaux canal4 [ID|off]` — Canal redirect (prédictions + résultats)\n"
         f"`/canaux distribution [ID|off]` — Canal secondaire\n"
         f"`/canaux compteur2 [ID|off]` — Canal Compteur2\n\n"
         f"**📋 Gestion prédictions:**\n"
         f"`/raison` — 15 dernières prédictions + raison détaillée\n"
         f"`/raison N` — Raison pour le jeu #N\n"
         f"`/raison pdf` — PDF complet de toutes les prédictions\n"
+        f"`/raison2` — Top 10 meilleures combinaisons (miroir × wx × B)\n"
+        f"`/raison2 pdf` — PDF complet de la simulation (216 combinaisons)\n"
+        f"`/raison2 P1` `/raison2 P2` `/raison2 P3` — Tableau détaillé par miroir\n"
+        f"`/raison2 tout` — Toutes les 216 combinaisons triées\n"
         f"`/pending` — Prédictions en vérification\n"
         f"`/queue` — File d'attente\n"
         f"`/status` — Statut complet\n"
@@ -6132,7 +6845,7 @@ async def cmd_strategie(event):
     combinaisons miroir/inverse possibles, recommande la meilleure et demande
     confirmation ('Oui N') pour l'appliquer immédiatement.
     """
-    global pending_strategy_proposal
+    global pending_strategy_proposal, last_strategy_simulation
 
     if event.is_group or event.is_channel:
         return
@@ -6233,41 +6946,31 @@ async def cmd_strategie(event):
         by_type[t][r['class']] += 1
         by_type[t]['total']    += 1
 
-    # ── Toutes les combinaisons miroir + inverse possibles ──────────────────
-    # Il existe exactement 3 façons de former des paires parfaites avec 4 costumes :
-    #   P1 : ♦↔♥ / ♣↔♠
+    # ── 3 combinaisons miroir possibles entre les 4 costumes ────────────────
+    # Il existe exactement 3 façons de former des paires miroir parfaites :
+    #   P1 : ♦↔♥ / ♣↔♠  (miroir par défaut)
     #   P2 : ♦↔♣ / ♥↔♠
     #   P3 : ♦↔♠ / ♥↔♣
-    # Chaque combo = miroir=Px + inverse=Py (x≠y) → 3×2 = 6 combos
-    _PAIRINGS = [
-        {'id':'P1','dict':{'♦':'♥','♥':'♦','♣':'♠','♠':'♣'},'disp':'♦️↔️❤️ / ♣️↔️♠️'},
-        {'id':'P2','dict':{'♦':'♣','♣':'♦','♥':'♠','♠':'♥'},'disp':'♦️↔️♣️ / ❤️↔️♠️'},
-        {'id':'P3','dict':{'♦':'♠','♠':'♦','♥':'♣','♣':'♥'},'disp':'♦️↔️♠️ / ❤️↔️♣️'},
+    COMBOS = [
+        {
+            'num':    1,
+            'name':   'Joker Alpha (P1)',
+            'mirror': {'♦':'♥','♥':'♦','♣':'♠','♠':'♣'},
+            'disp':   '♦️↔️❤️ / ♣️↔️♠️',
+        },
+        {
+            'num':    2,
+            'name':   'Kouamé Standard (P2)',
+            'mirror': {'♦':'♣','♣':'♦','♥':'♠','♠':'♥'},
+            'disp':   '♦️↔️♣️ / ❤️↔️♠️',
+        },
+        {
+            'num':    3,
+            'name':   'Kouamé Delta (P3)',
+            'mirror': {'♦':'♠','♠':'♦','♥':'♣','♣':'♥'},
+            'disp':   '♦️↔️♠️ / ❤️↔️♣️',
+        },
     ]
-    _COMBO_NAMES = {
-        ('P1','P2'): 'Joker Alpha',
-        ('P1','P3'): 'Joker Bêta',
-        ('P2','P1'): 'Kouamé Standard',
-        ('P2','P3'): 'Kouamé Alpha',
-        ('P3','P1'): 'Kouamé Delta',
-        ('P3','P2'): 'Kouamé Sigma',
-    }
-    COMBOS = []
-    n = 1
-    for _mir in _PAIRINGS:
-        for _inv in _PAIRINGS:
-            if _mir['id'] == _inv['id']:
-                continue
-            _key  = (_mir['id'], _inv['id'])
-            COMBOS.append({
-                'num':      n,
-                'name':     _COMBO_NAMES.get(_key, f"Combo {n}"),
-                'mirror':   _mir['dict'],
-                'inverse':  _inv['dict'],
-                'disp_mir': _mir['disp'],
-                'disp_inv': _inv['disp'],
-            })
-            n += 1
 
     # ── Propositions supplémentaires (paramètres wx / df) ──────────────────
     PARAM_PROPOSALS = []
@@ -6292,7 +6995,7 @@ async def cmd_strategie(event):
 
     # ── Choisir la recommandation principale ───────────────────────────────
     def _combo_num_by_name(name):
-        for c in COMBOS:
+        for c in GLOBAL_COMBOS:
             if c['name'] == name:
                 return c['num']
         return None
@@ -6305,14 +7008,14 @@ async def cmd_strategie(event):
         if losing_suits:
             ls_disp = '/'.join(SUIT_DISPLAY.get(s, s) for s in losing_suits)
             if has_sp and not has_dc:
-                recommended_num    = _combo_num_by_name('Kouamé Alpha')
-                recommended_reason = f"{ls_disp} perdent → miroirs ♦↔♣/❤↔♠ suggérés"
+                recommended_num    = _combo_num_by_name('Kouamé Standard (P2)')
+                recommended_reason = f"{ls_disp} perdent → essayer ♦↔♣/❤↔♠"
             elif has_dc and not has_sp:
-                recommended_num    = _combo_num_by_name('Kouamé Standard')
-                recommended_reason = f"{ls_disp} perdent → renforcer wx C13"
+                recommended_num    = _combo_num_by_name('Kouamé Delta (P3)')
+                recommended_reason = f"{ls_disp} perdent → essayer ♦↔♠/❤↔♣"
             else:
-                recommended_num    = _combo_num_by_name('Kouamé Delta')
-                recommended_reason = f"{ls_disp} perdent → paires croisées"
+                recommended_num    = _combo_num_by_name('Joker Alpha (P1)')
+                recommended_reason = f"{ls_disp} perdent → revenir au miroir par défaut ♦↔♥/♣↔♠"
         elif PARAM_PROPOSALS:
             recommended_num    = PARAM_PROPOSALS[0]['num']
             recommended_reason = PARAM_PROPOSALS[0]['name']
@@ -6379,56 +7082,106 @@ async def cmd_strategie(event):
                          f"{v['gagnes']} gagnées / {v['perdus']} perdues{flag}")
         lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
-    # ── Test silencieux : simuler chaque combo sur l'historique C13 ─────────
-    cur_mirror  = dict(COMPTEUR13_MIRROR)
-    c13_sim_items = [
-        p for p in prediction_history
-        if p.get('type') == 'compteur13'
-        and p.get('meta', {}).get('suit_consec')
-        and p.get('status') not in ('en_cours', 'sending', None)
-    ]
+    # ── 216 trackers indépendants : lecture des stats temps réel ────────────
+    # Chaque (combo, wx, B, df_sim) a ses propres C13 + C2 qui ont tourné en
+    # parallèle sur TOUS les jeux depuis le démarrage du bot.
+    _WX_RANGE = range(3, 9)
+    _B_RANGE  = range(3, 9)
+    cur_mirror = dict(COMPTEUR13_MIRROR)
 
-    # Score par combo : compter prédictions identiques/différentes vs historique
+    # Construire sim_matrix depuis les trackers (lecture directe)
+    sim_matrix = {}
+    pred_lists  = {}
+    for c in GLOBAL_COMBOS:
+        for wx in _WX_RANGE:
+            for df_sim in (1, 2):
+                ref_b = min(max(compteur2_seuil_B, 3), 8)
+                preds_wx = []
+                for b in _B_RANGE:
+                    key   = (c['num'], wx, b, df_sim)
+                    state = silent_combo_states.get(key, {})
+                    w     = state.get('wins',   0)
+                    l     = state.get('losses', 0)
+                    tot   = state.get('total',  0)
+                    sim_matrix[(c['num'], wx, b, df_sim)] = {
+                        'wins':   w,
+                        'losses': l,
+                        'total':  tot,
+                        'score':  (w - l) if tot > 0 else -99,
+                        'df_sim': df_sim,
+                    }
+                    if b == ref_b:
+                        for h in state.get('pred_history', []):
+                            preds_wx.append({
+                                'gn':   h.get('gn', 0),
+                                'suit': h.get('suit', '?'),
+                                'win':  h.get('win', False),
+                                'r':    0 if h.get('win') else None,
+                                'c2a':  b,
+                                'st':   'gagne_r0' if h.get('win') else 'perdu',
+                            })
+                pred_lists[(c['num'], wx, df_sim)] = preds_wx
+
+    # ── Trouver la meilleure combinaison globale ─────────────────────────────
+    valid_entries = {k: v for k, v in sim_matrix.items() if v['total'] >= 3}
+    best_combo_key = None
+    best_combo_val = None
+    if valid_entries:
+        best_combo_key, best_combo_val = max(valid_entries.items(), key=lambda x: x[1]['score'])
+
+    if best_combo_key and not recommended_num:
+        bck_mirror, bck_wx, bck_b, bck_df = best_combo_key
+        bck_name  = next((c['name'] for c in GLOBAL_COMBOS if c['num'] == bck_mirror), f"P{bck_mirror}")
+        recommended_num    = bck_mirror
+        recommended_reason = (
+            f"Meilleur score ({best_combo_val['score']:+d} pts) avec {bck_name} "
+            f"wx={bck_wx} B={bck_b} trigger+{bck_df} sur {best_combo_val['total']} prédictions"
+        )
+
+    # ── Pour chaque combo miroir : meilleur (wx, B, df_sim) ─────────────────
     combo_scores = {}
-    for c in COMBOS:
-        same_win = same_loss = diff_from_loss = diff_from_win = 0
-        for p in c13_sim_items:
-            sc  = p['meta']['suit_consec']
-            c2c = p['meta'].get('c2_confirmed', False)
-            actual_pred = p['suit']
-            st  = p.get('status', '')
-            sim_suit = c['inverse'].get(sc, '?') if c2c else c['mirror'].get(sc, '?')
-            if sim_suit == actual_pred:
-                if 'gagne' in st:
-                    same_win  += 1
-                else:
-                    same_loss += 1
-            else:
-                if 'perdu' in st:
-                    diff_from_loss += 1   # était perdu → diff combo aurait pu récupérer
-                else:
-                    diff_from_win  += 1   # était gagné → diff combo aurait pu rater
-        total_sim = len(c13_sim_items)
-        # Score = wins confirmés + bonus récupérations potentielles - malus pertes potentielles
-        # (score pondéré pour classer les combos)
-        score_val = same_win + 0.5 * diff_from_loss - 0.5 * diff_from_win if total_sim > 0 else -1
-        combo_scores[c['num']] = {
-            'same_win': same_win, 'same_loss': same_loss,
-            'diff_from_loss': diff_from_loss, 'diff_from_win': diff_from_win,
-            'total': total_sim, 'score': score_val,
+    for c in GLOBAL_COMBOS:
+        entries_for_c = {
+            (wx, b, df_s): sim_matrix[(c['num'], wx, b, df_s)]
+            for wx in _WX_RANGE for b in _B_RANGE for df_s in (1, 2)
         }
+        valid_c = {k: v for k, v in entries_for_c.items() if v['total'] >= 3}
+        if valid_c:
+            best_wbs, best_v = max(valid_c.items(), key=lambda x: x[1]['score'])
+            combo_scores[c['num']] = {
+                'best_wx':    best_wbs[0],
+                'best_b':     best_wbs[1],
+                'best_df':    best_wbs[2],
+                'best_score': best_v['score'],
+                'best_wins':  best_v['wins'],
+                'best_losses':best_v['losses'],
+                'best_total': best_v['total'],
+                'df1_best': max(
+                    {(wx, b): sim_matrix[(c['num'], wx, b, 1)]
+                     for wx in _WX_RANGE for b in _B_RANGE}.items(),
+                    key=lambda x: x[1]['score'], default=(None, None)
+                ),
+                'df2_best': max(
+                    {(wx, b): sim_matrix[(c['num'], wx, b, 2)]
+                     for wx in _WX_RANGE for b in _B_RANGE}.items(),
+                    key=lambda x: x[1]['score'], default=(None, None)
+                ),
+            }
+        else:
+            combo_scores[c['num']] = None
 
-    # Recommandation basée sur le score silencieux (si assez de données)
-    if len(c13_sim_items) >= 3 and not recommended_num:
-        best = max(combo_scores.items(), key=lambda x: x[1]['score'])
-        recommended_num = best[0]
-        recommended_reason = f"Meilleur score test silencieux ({best[1]['score']:.1f} pts sur {best[1]['total']} prédictions C13)"
-
-    # ── Tableau de toutes les combinaisons ──────────────────────────────────
-    lines.append("🔄 **COMBINAISONS MIROIR / INVERSE — TEST SILENCIEUX**")
-    lines.append(f"_(6 combinaisons possibles · {len(c13_sim_items)} prédictions C13 analysées)_")
+    # ── Tableau des 3 combinaisons miroir ───────────────────────────────────
+    total_tracker_preds = sum(
+        silent_combo_states.get((c['num'], 5, compteur2_seuil_B, 1), {}).get('total', 0)
+        for c in GLOBAL_COMBOS
+    )
+    lines.append("🔄 **COMBINAISONS MIROIR — TRACKERS INDÉPENDANTS**")
+    lines.append(
+        f"_(3 miroirs × wx3-8 × B3-8 × trigger+1/+2 = 216 compteurs C13+C2 propres · "
+        f"B_actif={compteur2_seuil_B})_"
+    )
     lines.append("")
-    for c in COMBOS:
+    for c in GLOBAL_COMBOS:
         is_active = (c['mirror'] == cur_mirror)
         is_reco   = (c['num'] == recommended_num)
         tag = ""
@@ -6437,19 +7190,24 @@ async def cmd_strategie(event):
         if is_reco:
             tag += " ⭐ RECOMMANDÉ"
         lines.append(f"**{c['num']}. {c['name']}**{tag}")
-        lines.append(f"   Miroir  : {c['disp_mir']}")
-        lines.append(f"   Inverse : {c['disp_inv']}")
-        sc = combo_scores.get(c['num'])
-        if sc and sc['total'] > 0:
+        lines.append(f"   Paires : {c['disp']}")
+        sc_data = combo_scores.get(c['num'])
+        if sc_data:
             lines.append(
-                f"   🔬 Simulation : ✅{sc['same_win']} confirmés | "
-                f"❌{sc['same_loss']} perdus | "
-                f"⬆️{sc['diff_from_loss']} récup. potentielles | "
-                f"⬇️{sc['diff_from_win']} gains potentiels perdus | "
-                f"Score: {sc['score']:.1f}"
+                f"   🔬 Meilleur : wx={sc_data['best_wx']} B={sc_data['best_b']} "
+                f"trigger+{sc_data['best_df']} → "
+                f"✅{sc_data['best_wins']} / ❌{sc_data['best_losses']} | "
+                f"Score: {sc_data['best_score']:+d} sur {sc_data['best_total']} pred."
             )
+            d1k, d1v = sc_data['df1_best']
+            d2k, d2v = sc_data['df2_best']
+            if d1v and d1v['total'] >= 1 and d2v and d2v['total'] >= 1:
+                lines.append(
+                    f"   📊 trigger+1 score={d1v['score']:+d} ({d1v['total']} pred) | "
+                    f"trigger+2 score={d2v['score']:+d} ({d2v['total']} pred)"
+                )
         else:
-            lines.append("   🔬 Simulation : données insuffisantes (accumulation en cours)")
+            lines.append("   🔬 Données insuffisantes — trackers en accumulation")
         lines.append("")
 
     if PARAM_PROPOSALS:
@@ -6464,24 +7222,92 @@ async def cmd_strategie(event):
 
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
+    # ── Construire best_auto : la meilleure configuration complète ──────────
+    # Priorité : meilleur (combo, wx, B) trouvé dans la simulation 216 combos
+    best_auto = None
+    if best_combo_key:
+        bck_combo_n, bck_wx, bck_b, bck_df = best_combo_key
+        bck_combo = next((c for c in GLOBAL_COMBOS if c['num'] == bck_combo_n), None)
+        if bck_combo:
+            best_auto = {
+                'combo_num': bck_combo_n,
+                'mirror':    bck_combo['mirror'],
+                'disp':      bck_combo['disp'],
+                'name':      bck_combo['name'],
+                'wx':        bck_wx,
+                'b':         bck_b,
+                'df_sim':    bck_df,
+                'score':     best_combo_val['score'],
+                'wins':      best_combo_val['wins'],
+                'losses':    best_combo_val['losses'],
+                'total':     best_combo_val['total'],
+            }
+
     # ── Recommandation finale ───────────────────────────────────────────────
-    all_proposals = list(range(1, len(COMBOS) + len(PARAM_PROPOSALS) + 1))
-    if recommended_num:
-        lines.append(f"💡 **Je te recommande, Kouamé : Oui {recommended_num}**")
-        lines.append(f"   Raison : {recommended_reason}")
+    lines.append("")
+    if best_auto:
+        lines.append("╔══════════════════════════════╗")
+        lines.append("║  🤖 STRATÉGIE AUTO-APPLIQUÉE ║")
+        lines.append("╚══════════════════════════════╝")
+        lines.append(f"**{best_auto['name']}**")
+        lines.append(f"  Miroir  : {best_auto['disp']}")
+        lines.append(f"  wx C13 : **{best_auto['wx']}** fois consécutives")
+        lines.append(f"  B  C2  : **{best_auto['b']}** absences")
+        lines.append(f"  df     : **trigger+{best_auto['df_sim']}** (costume attendu au jeu trigger+{best_auto['df_sim']})")
+        lines.append(
+            f"  Score  : **{best_auto['score']:+d}** pts "
+            f"(✅{best_auto['wins']} gagnées | ❌{best_auto['losses']} perdues "
+            f"sur {best_auto['total']} prédictions)"
+        )
         lines.append("")
-    lines.append("👉 Réponds **Oui N** (ex: `Oui 2`) pour appliquer la combinaison choisie.")
-    lines.append("   Options disponibles : " +
-                 ", ".join(f"Oui {n}" for n in all_proposals))
+        lines.append("✅ **Appliquée immédiatement** — notification avec bouton Annuler envoyée.")
+    elif recommended_num:
+        lines.append(f"💡 **Recommandation : Oui {recommended_num}**")
+        lines.append(f"   {recommended_reason}")
+        lines.append("")
+        lines.append("👉 Tape **`Oui`** pour appliquer, ou `Oui N` pour un choix manuel.")
+    else:
+        lines.append("📊 _Données insuffisantes pour une recommandation automatique._")
+        lines.append("   Accumulation en cours — relance `/strategie` dans quelques jeux.")
+
+    all_proposals = list(range(1, len(COMBOS) + len(PARAM_PROPOSALS) + 1))
+    lines.append("")
+    lines.append(f"_Choix manuel : `Oui N` (ex: `Oui 2`) — options: {', '.join(str(n) for n in all_proposals)}_")
     lines.append("")
     lines.append("🤖 _Baccarat AI — Analyse automatique_")
 
     # ── Stocker toutes les propositions en attente ──────────────────────────
     pending_strategy_proposal = {
-        'combos':        COMBOS,
-        'param_props':   PARAM_PROPOSALS,
-        'expires':       datetime.now().timestamp() + 300,  # 5 min
+        'combos':      GLOBAL_COMBOS,
+        'param_props': PARAM_PROPOSALS,
+        'expires':     datetime.now().timestamp() + 300,  # 5 min
+        'best_auto':   best_auto,   # configuration complète recommandée (ou None)
     }
+
+    # ── Sauvegarder la simulation silencieuse pour /raison2 ─────────────────
+    last_strategy_simulation = {
+        'timestamp':          datetime.now(),
+        'combos':             GLOBAL_COMBOS,
+        'combo_scores':       combo_scores,
+        'sim_matrix':         sim_matrix,
+        'pred_lists':         pred_lists,
+        'best_combo_key':     best_combo_key,
+        'best_combo_val':     best_combo_val,
+        'param_proposals':    PARAM_PROPOSALS,
+        'recommended_num':    recommended_num,
+        'recommended_reason': recommended_reason,
+        'total_c13':          sum(s.get('total', 0) for s in silent_combo_states.values()),
+        'total_analysed':     total,
+        'verdict':            verdict,
+        'vd':                 vd,
+        'r0c': r0c, 'r1c': r1c, 'r2c': r2c, 'r3c': r3c, 'pdc': pdc,
+    }
+    # Persister en base de données pour survivre aux redémarrages
+    asyncio.ensure_future(save_strategy_simulation())
+
+    # ── Auto-appliquer la meilleure stratégie + notifier admin ──────────────
+    if best_auto:
+        asyncio.ensure_future(apply_best_strategy_auto(best_auto))
 
     await event.respond("\n".join(lines))
 
@@ -6490,7 +7316,8 @@ async def cmd_oui(event):
     """
     Applique la stratégie proposée par /strategie quand l'admin répond 'Oui N'.
     """
-    global pending_strategy_proposal, COMPTEUR13_MIRROR, COMPTEUR13_THRESHOLD, PREDICTION_DF
+    global pending_strategy_proposal, COMPTEUR13_MIRROR, COMPTEUR13_THRESHOLD, COMPTEUR13_SKIP
+    global PREDICTION_DF, compteur2_seuil_B, compteur2_seuil_B_per_suit
 
     if event.is_group or event.is_channel:
         return
@@ -6510,17 +7337,89 @@ async def cmd_oui(event):
         await event.respond("⏰ La proposition a expiré (5 min). Tape `/strategie` pour relancer.")
         return
 
-    parts = msg.split()
-    if len(parts) < 2 or not parts[1].isdigit():
+    parts         = msg.split()
+    combos        = pending_strategy_proposal.get('combos', [])
+    param_props   = pending_strategy_proposal.get('param_props', [])
+    best_auto     = pending_strategy_proposal.get('best_auto')
+    changes_applied = []
+
+    # ── Détecter le mode : "Oui" seul, "Oui N", ou message invalide ─────────
+    is_auto   = (len(parts) == 1)                           # "Oui" → auto
+    is_manual = (len(parts) >= 2 and parts[1].isdigit())   # "Oui 2" → manuel
+    if not is_auto and not is_manual:
+        max_n = len(combos) + len(param_props)
         await event.respond(
-            "❌ Précise le numéro. Exemple : `Oui 2` pour appliquer la combinaison 2."
+            f"❌ Usage : **`Oui`** (applique auto) ou **`Oui N`** (choix 1 à {max_n})."
         )
         return
 
-    num = int(parts[1])
-    combos      = pending_strategy_proposal.get('combos', [])
-    param_props = pending_strategy_proposal.get('param_props', [])
+    # ── Mode automatique : "Oui" seul → applique la meilleure config complète
+    if is_auto:
+        if not best_auto:
+            await event.respond(
+                "❌ Aucune configuration automatique disponible.\n"
+                "Utilise `Oui N` (ex: `Oui 2`) pour un choix manuel, "
+                "ou relance `/strategie`."
+            )
+            return
 
+        # Appliquer miroir
+        old_mirror = dict(COMPTEUR13_MIRROR)
+        COMPTEUR13_MIRROR.clear()
+        COMPTEUR13_MIRROR.update(best_auto['mirror'])
+        changes_applied.append(
+            f"✅ Miroir C13 : **{best_auto['disp']}**"
+        )
+
+        # Appliquer wx
+        old_wx = COMPTEUR13_THRESHOLD
+        COMPTEUR13_THRESHOLD = best_auto['wx']
+        changes_applied.append(
+            f"✅ Seuil wx C13 : {old_wx} → **{COMPTEUR13_THRESHOLD}** fois consécutives"
+        )
+
+        # Appliquer B (pour tous les costumes + global)
+        old_b = compteur2_seuil_B
+        compteur2_seuil_B = best_auto['b']
+        for s in ALL_SUITS:
+            compteur2_seuil_B_per_suit[s] = best_auto['b']
+        changes_applied.append(
+            f"✅ Seuil B  C2  : {old_b} → **{compteur2_seuil_B}** absences (tous costumes)"
+        )
+
+        # Appliquer df_sim → COMPTEUR13_SKIP
+        old_df = COMPTEUR13_SKIP
+        new_df_sim = best_auto.get('df_sim', 1)
+        COMPTEUR13_SKIP = max(0, new_df_sim - PREDICTION_DF)
+        if COMPTEUR13_SKIP != old_df:
+            changes_applied.append(f"✅ df C13 : trigger+{old_df + PREDICTION_DF} → **trigger+{new_df_sim}**")
+
+        pending_strategy_proposal = {}
+
+        logger.info(
+            f"🏆 Meilleure stratégie appliquée : {best_auto['name']} "
+            f"miroir={dict(COMPTEUR13_MIRROR)} wx={COMPTEUR13_THRESHOLD} "
+            f"B={compteur2_seuil_B} df+{new_df_sim}"
+        )
+
+        lines = [
+            f"🏆 **Meilleure stratégie appliquée avec succès !**",
+            f"**{best_auto['name']}** · trigger+{new_df_sim}",
+            "",
+        ] + changes_applied + [
+            "",
+            f"Score simulation : **{best_auto['score']:+d}** pts "
+            f"(✅{best_auto['wins']} gagnées | ❌{best_auto['losses']} perdues "
+            f"sur {best_auto['total']} prédictions C13)",
+            "",
+            "Les nouveaux paramètres sont actifs immédiatement.",
+            "Tape `/strategie` pour une nouvelle analyse après accumulation.",
+        ]
+        await event.respond("\n".join(lines))
+        return
+
+    # ── Mode manuel : "Oui N" → choix spécifique ────────────────────────────
+    num = int(parts[1])
     combo_match = next((c for c in combos      if c['num'] == num), None)
     param_match = next((p for p in param_props if p['num'] == num), None)
 
@@ -6529,17 +7428,12 @@ async def cmd_oui(event):
         await event.respond(f"❌ Numéro invalide. Choix disponibles : 1 à {max_n}.")
         return
 
-    changes_applied = []
-
     if combo_match:
         old_mirror = dict(COMPTEUR13_MIRROR)
         COMPTEUR13_MIRROR.clear()
         COMPTEUR13_MIRROR.update(combo_match['mirror'])
         changes_applied.append(
-            f"✅ Miroir C13 → **{combo_match['disp_mir']}**"
-        )
-        changes_applied.append(
-            f"✅ Inverse C13 → **{combo_match['disp_inv']}**"
+            f"✅ Combinaison miroir C13 → **{combo_match['disp']}**"
         )
         logger.info(
             f"🔄 Stratégie '{combo_match['name']}' appliquée : "
@@ -6556,12 +7450,18 @@ async def cmd_oui(event):
             old_wx = COMPTEUR13_THRESHOLD
             COMPTEUR13_THRESHOLD = ch['wx']
             changes_applied.append(f"✅ Seuil wx C13 : {old_wx} → **{COMPTEUR13_THRESHOLD}**")
+        if 'b' in ch:
+            old_b = compteur2_seuil_B
+            compteur2_seuil_B = ch['b']
+            for s in ALL_SUITS:
+                compteur2_seuil_B_per_suit[s] = ch['b']
+            changes_applied.append(f"✅ Seuil B C2 : {old_b} → **{compteur2_seuil_B}**")
 
     pending_strategy_proposal = {}
 
     name = combo_match['name'] if combo_match else param_match['name']
     lines = [
-        f"🎯 **Stratégie « {name} » appliquée avec succès !**",
+        f"🎯 **Stratégie « {name} » appliquée !**",
         "",
     ] + changes_applied + [
         "",
@@ -6707,6 +7607,275 @@ def pdf_safe(text: str) -> str:
     for old, new in subs:
         text = text.replace(old, new)
     return text
+
+
+def generate_raison2_pdf(sim: dict) -> bytes:
+    """Génère un PDF rapport complet de la simulation C13 (216 combinaisons miroir × wx × B × skip)."""
+    combos     = sim.get('combos', [])
+    sim_matrix = sim.get('sim_matrix', {})
+    ts         = sim['timestamp'].strftime('%d/%m/%Y %H:%M:%S')
+    total_c13  = sim.get('total_c13', 0)
+    total_an   = sim.get('total_analysed', 0)
+    verdict    = sim.get('verdict', '')
+    best_key   = sim.get('best_combo_key')
+    best_val   = sim.get('best_combo_val')
+    rec_num    = sim.get('recommended_num')
+    rec_reason = sim.get('recommended_reason', '')
+
+    _COMBO_NAMES = {c['num']: c['name'] for c in combos}
+    _COMBO_DISP  = {c['num']: c.get('disp', '?') for c in combos}
+
+    VIOLET  = (90, 0, 160)
+    PURPLE2 = (130, 50, 200)
+    WHITE   = (255, 255, 255)
+    DARK    = (30, 30, 30)
+    GREY    = (100, 100, 100)
+    GREEN   = (0, 130, 0)
+    RED     = (190, 0, 0)
+    GOLD    = (180, 130, 0)
+    BG_ALT  = (245, 240, 255)
+    BG_P1   = (230, 245, 255)
+    BG_P2   = (230, 255, 230)
+    BG_P3   = (255, 245, 225)
+    BG_BEST = (255, 248, 200)
+
+    COMBO_COLORS = {1: BG_P1, 2: BG_P2, 3: BG_P3}
+
+    pdf = FPDF(orientation='L', format='A4')
+    pdf.set_auto_page_break(auto=True, margin=12)
+    pdf.set_margins(8, 8, 8)
+    pdf.add_page()
+
+    # ── Titre ─────────────────────────────────────────────────────────────────
+    pdf.set_font('Helvetica', 'B', 17)
+    pdf.set_fill_color(*VIOLET)
+    pdf.set_text_color(*WHITE)
+    pdf.cell(0, 13, 'BACCARAT AI  -  SIMULATION C13  (108 COMBINAISONS)', new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C', fill=True)
+    pdf.ln(2)
+
+    pdf.set_font('Helvetica', '', 9)
+    pdf.set_text_color(*GREY)
+    pdf.cell(0, 6,
+        f"Genere le {datetime.now().strftime('%d/%m/%Y %H:%M')}  |  "
+        f"Derniere simulation : {ts}  |  "
+        f"{total_c13} predictions C13 simulees  |  "
+        f"{total_an} predictions totales analysees",
+        new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C')
+    pdf.ln(3)
+
+    # ── Verdict global ─────────────────────────────────────────────────────────
+    pdf.set_font('Helvetica', 'B', 10)
+    pdf.set_text_color(*DARK)
+    pdf.cell(0, 7, pdf_safe(verdict), new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C')
+    pdf.ln(2)
+
+    # ── Meilleure configuration ────────────────────────────────────────────────
+    if best_key and best_val and len(best_key) == 4:
+        bm, bwx, bb, bdf = best_key
+        pdf.set_fill_color(*BG_BEST)
+        pdf.set_draw_color(*GOLD)
+        pdf.set_font('Helvetica', 'B', 10)
+        pdf.set_text_color(*GOLD)
+        txt = (f"MEILLEURE CONFIGURATION GLOBALE :  {_COMBO_NAMES.get(bm,'?')}  |  "
+               f"wx={bwx}  |  B={bb}  |  df+{bdf}  |  Paires : {pdf_safe(_COMBO_DISP.get(bm,'?'))}")
+        pdf.cell(0, 8, txt, border=1, new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C', fill=True)
+        pdf.set_font('Helvetica', '', 9)
+        pdf.set_text_color(*DARK)
+        stats = (f"Gagnes : {best_val['wins']}   |   Perdus : {best_val['losses']}   |   "
+                 f"Score : {best_val['score']:+d}   |   Predictions qualifiees : {best_val['total']}")
+        pdf.cell(0, 6, stats, new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C', fill=True)
+        pdf.ln(4)
+
+    if rec_num:
+        pdf.set_font('Helvetica', 'B', 9)
+        pdf.set_text_color(*PURPLE2)
+        pdf.cell(0, 6, f"Recommandation : Oui {rec_num}  -  {pdf_safe(rec_reason)}",
+                 new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C')
+        pdf.ln(3)
+
+    # ── TABLE PRINCIPALE — toutes les 216 combinaisons ─────────────────────────
+    # Trier par score décroissant
+    sorted_entries = sorted(
+        [(k, v) for k, v in sim_matrix.items() if v['total'] >= 1],
+        key=lambda x: x[1]['score'],
+        reverse=True
+    )
+
+    # Colonnes (paysage A4 = 277mm, marges 16 → 261 mm utiles)
+    cw = [8, 36, 34, 14, 14, 14, 20, 20, 22, 18, 20, 20]
+    headers = ['#', 'Miroir', 'Paires', 'wx', 'B', 'df', 'Gagnes', 'Perdus',
+               'Score', 'C2 wins', 'Total pred.', 'Score/Total']
+
+    pdf.set_font('Helvetica', 'B', 8)
+    pdf.set_fill_color(*VIOLET)
+    pdf.set_text_color(*WHITE)
+    for h, w in zip(headers, cw):
+        pdf.cell(w, 8, h, border=1, fill=True, align='C')
+    pdf.ln()
+
+    pdf.set_font('Helvetica', '', 8)
+    for rank, (key, val) in enumerate(sorted_entries, 1):
+        combo_n, wx, b, df_s = key
+        is_best = (key == best_key)
+        bg = BG_BEST if is_best else COMBO_COLORS.get(combo_n, (255, 255, 255))
+        wins      = val['wins']
+        losses    = val['losses']
+        score     = val['score']
+        total     = val['total']
+        c2w       = val.get('c2_conf_wins', 0)
+        score_pct = f"{score/total*100:+.0f}%" if total else '--'
+
+        pdf.set_fill_color(*bg)
+        pdf.set_text_color(*DARK)
+        row = [
+            str(rank),
+            _COMBO_NAMES.get(combo_n, f'P{combo_n}'),
+            pdf_safe(_COMBO_DISP.get(combo_n, '?')),
+            str(wx),
+            str(b),
+            f"df+{df_s}",
+            str(wins),
+            str(losses),
+            f"{score:+d}",
+            str(c2w),
+            str(total),
+            score_pct,
+        ]
+        aligns = ['C', 'L', 'L', 'C', 'C', 'C', 'C', 'C', 'C', 'C', 'C', 'C']
+        for val_txt, w, align in zip(row, cw, aligns):
+            # Colore le score
+            if val_txt.startswith('+') and val_txt != '+0':
+                pdf.set_text_color(*GREEN)
+            elif val_txt.startswith('-'):
+                pdf.set_text_color(*RED)
+            else:
+                pdf.set_text_color(*DARK)
+            pdf.cell(w, 7, val_txt, border=1, fill=True, align=align)
+        pdf.ln()
+
+    # ── TABLEAUX DÉTAILLÉS PAR MIROIR (une section par miroir) ─────────────────
+    for cnum in [1, 2, 3]:
+        cname = _COMBO_NAMES.get(cnum, f'P{cnum}')
+        cdisp = pdf_safe(_COMBO_DISP.get(cnum, '?'))
+        bg_hdr = COMBO_COLORS.get(cnum, (240, 240, 240))
+
+        pdf.add_page()
+        pdf.set_font('Helvetica', 'B', 12)
+        pdf.set_fill_color(*VIOLET)
+        pdf.set_text_color(*WHITE)
+        pdf.cell(0, 10, f"DETAIL — {cname}  |  Paires : {cdisp}",
+                 new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C', fill=True)
+        pdf.ln(4)
+
+        # Tableau croisé wx (lignes) × B (colonnes)
+        cell_w = 36
+        cell_h = 9
+        b_vals  = list(range(3, 9))
+        wx_vals = list(range(3, 9))
+
+        # En-tête colonnes B
+        pdf.set_font('Helvetica', 'B', 9)
+        pdf.set_fill_color(*VIOLET)
+        pdf.set_text_color(*WHITE)
+        pdf.cell(14, cell_h, 'wx \\ B', border=1, fill=True, align='C')
+        for b in b_vals:
+            pdf.cell(cell_w, cell_h, f"B = {b}", border=1, fill=True, align='C')
+        pdf.ln()
+
+        for wx in wx_vals:
+            # Numéro de ligne
+            pdf.set_fill_color(*bg_hdr)
+            pdf.set_font('Helvetica', 'B', 9)
+            pdf.set_text_color(*DARK)
+            pdf.cell(14, cell_h, f"wx={wx}", border=1, fill=True, align='C')
+
+            for b in b_vals:
+                v = sim_matrix.get((cnum, wx, b, 0))
+                if v and v['total'] >= 1:
+                    sc = v['score']
+                    tot = v['total']
+                    label = f"Score:{sc:+d}  ({tot} pred.)"
+                    txt2  = f"V:{v['wins']} / D:{v['losses']}"
+                    is_b  = ((cnum, wx, b, 0) == best_key)
+                    cell_bg = BG_BEST if is_b else (
+                        (220, 255, 220) if sc > 0 else
+                        (255, 220, 220) if sc < 0 else
+                        (245, 245, 245)
+                    )
+                    pdf.set_fill_color(*cell_bg)
+                    pdf.set_font('Helvetica', 'B', 8)
+                    sc_color = GREEN if sc > 0 else (RED if sc < 0 else GREY)
+                    pdf.set_text_color(*sc_color)
+                    # Cellule multi-ligne (simulée avec 2 cellules empilées)
+                    x0 = pdf.get_x()
+                    y0 = pdf.get_y()
+                    pdf.cell(cell_w, cell_h // 2 + 1, label, border='LTR', fill=True, align='C')
+                    pdf.ln()
+                    pdf.set_x(x0)
+                    pdf.set_font('Helvetica', '', 7)
+                    pdf.set_text_color(*DARK)
+                    pdf.cell(cell_w, cell_h // 2, txt2, border='LBR', fill=True, align='C')
+                    pdf.set_xy(x0 + cell_w, y0)
+                else:
+                    pdf.set_fill_color(250, 250, 250)
+                    pdf.set_font('Helvetica', '', 8)
+                    pdf.set_text_color(*GREY)
+                    pdf.cell(cell_w, cell_h, '--', border=1, fill=True, align='C')
+            pdf.ln()
+
+        pdf.ln(4)
+        pdf.set_font('Helvetica', 'I', 8)
+        pdf.set_text_color(*GREY)
+        pdf.cell(0, 5,
+            'Score = Victoires - Defaites  |  pred. = predictions qualifiees (count >= wx)  |  '
+            'Jaune = meilleure configuration globale',
+            new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C')
+
+    # ── Pied de page final ────────────────────────────────────────────────────
+    pdf.add_page()
+    pdf.set_font('Helvetica', 'B', 13)
+    pdf.set_fill_color(*VIOLET)
+    pdf.set_text_color(*WHITE)
+    pdf.cell(0, 10, 'RESUME GLOBAL', new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C', fill=True)
+    pdf.ln(5)
+
+    # Résumé par miroir
+    for cnum in [1, 2, 3]:
+        cname = _COMBO_NAMES.get(cnum, f'P{cnum}')
+        cdisp = pdf_safe(_COMBO_DISP.get(cnum, '?'))
+        # Trouver le meilleur (wx, B) pour ce miroir
+        best_sub = None
+        best_sub_val = None
+        for wx in range(3, 9):
+            for b in range(3, 9):
+                v = sim_matrix.get((cnum, wx, b, 0))
+                if v and v['total'] >= 1:
+                    if best_sub_val is None or v['score'] > best_sub_val['score']:
+                        best_sub = (wx, b)
+                        best_sub_val = v
+        pdf.set_fill_color(*COMBO_COLORS.get(cnum, (240, 240, 240)))
+        pdf.set_font('Helvetica', 'B', 10)
+        pdf.set_text_color(*DARK)
+        pdf.cell(0, 8, f"{cname}  |  {cdisp}",
+                 new_x=XPos.LMARGIN, new_y=YPos.NEXT, border=1, fill=True)
+        if best_sub and best_sub_val:
+            wx_b, b_b = best_sub
+            pdf.set_font('Helvetica', '', 9)
+            pdf.cell(0, 7,
+                f"  Meilleur wx={wx_b}  B={b_b}  |  "
+                f"Gagnes:{best_sub_val['wins']}  Perdus:{best_sub_val['losses']}  "
+                f"Score:{best_sub_val['score']:+d}  sur {best_sub_val['total']} predictions",
+                new_x=XPos.LMARGIN, new_y=YPos.NEXT, border=1)
+        pdf.ln(3)
+
+    pdf.ln(6)
+    pdf.set_font('Helvetica', 'I', 8)
+    pdf.set_text_color(*GREY)
+    pdf.cell(0, 5,
+        f"Rapport genere le {datetime.now().strftime('%d/%m/%Y  %H:%M')}  -  BACCARAT AI",
+        new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C')
+
+    return pdf.output()
 
 
 def generate_raison_pdf() -> bytes:
@@ -7023,6 +8192,381 @@ async def cmd_raison(event):
         lines.append(format_pred_block(pred, index=i))
         lines.append("")
     lines.append("📄 `/raison pdf` — PDF complet | 🔎 `/raison N` — Jeu #N")
+    await event.respond("\n".join(lines), parse_mode='markdown')
+
+
+async def cmd_raison2(event):
+    """
+    /raison2        — Top 10 des meilleures combinaisons (miroir × wx × B)
+    /raison2 pdf    — PDF complet de la simulation (216 combinaisons + tableaux détaillés)
+    /raison2 tout   — Toutes les 216 combinaisons triées par score
+    /raison2 P1     — Détail complet de la combinaison miroir P1 (toutes ses wx/B)
+    /raison2 P2     — Idem pour P2
+    /raison2 P3     — Idem pour P3
+    """
+    if event.is_group or event.is_channel:
+        return
+    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+        await event.respond("🔒 Admin uniquement")
+        return
+
+    # ── Données depuis last_strategy_simulation (optionnel — pour rétrocompat) ──
+    sim        = last_strategy_simulation or {}
+    ts         = sim['timestamp'].strftime('%d/%m/%Y %H:%M:%S') if sim.get('timestamp') else datetime.now().strftime('%d/%m/%Y %H:%M:%S')
+    combos     = sim.get('combos', GLOBAL_COMBOS)
+    sim_matrix = sim.get('sim_matrix', {})
+    pred_lists = sim.get('pred_lists', {})
+    total_c13  = sim.get('total_c13', 0)
+    total_an   = sim.get('total_analysed', 0)
+    rec_num    = sim.get('recommended_num')
+    rec_reason = sim.get('recommended_reason', '')
+    cur_mirror = dict(COMPTEUR13_MIRROR)
+
+    # ── Toujours lire best_key / best_val depuis silent_combo_states ──────────
+    _valid = {k: v for k, v in silent_combo_states.items() if v.get('total', 0) >= 3}
+    if _valid:
+        best_key, _bv = max(_valid.items(), key=lambda x: (x[1]['wins'] - x[1]['losses'], x[1]['wins']))
+        best_val = {**_bv, 'score': _bv['wins'] - _bv['losses']}
+    else:
+        best_key = sim.get('best_combo_key')
+        best_val = sim.get('best_combo_val')
+
+    verdict = sim.get('verdict', '')
+    vd      = sim.get('vd', '')
+
+    _R_EMOJI = {0: '0️⃣', 1: '1️⃣', 2: '2️⃣', 3: '3️⃣', 4: '4️⃣'}
+
+    _COMBO_NAMES = {c['num']: c['name'] for c in combos}
+    _COMBO_DISP  = {c['num']: c.get('disp', '?') for c in combos}
+    _COMBO_MIR   = {c['num']: c['mirror'] for c in combos}
+
+    parts = event.message.message.strip().split()
+    sub   = parts[1].upper() if len(parts) > 1 else ''
+
+    # ── En-tête commun ───────────────────────────────────────────────────────
+    _tracker_total_preds = sum(s.get('total', 0) for s in silent_combo_states.values())
+    _tracker_active = sum(1 for s in silent_combo_states.values() if s.get('total', 0) > 0)
+    lines = [
+        "╔══════════════════════════════╗",
+        "║  🔬 RAISON2 — TRACKERS LIVE   ║",
+        "╚══════════════════════════════╝",
+        f"🕒 {ts}  |  216 trackers indépendants (C13+C2 propre à chaque combo)",
+        f"📊 {_tracker_total_preds} prédictions cumulées · {_tracker_active}/216 combos actifs",
+    ]
+    if verdict:
+        lines.append(f"**{verdict}** — _{vd}_")
+    lines.append("")
+
+    if best_key and len(best_key) == 4:
+        bm, bwx, bb, bdf = best_key
+        lines.append(
+            f"🏆 **MEILLEURE CONFIGURATION GLOBALE :**"
+        )
+        lines.append(
+            f"   {_COMBO_NAMES.get(bm,'?')} | wx={bwx} | B={bb} | df+{bdf}"
+        )
+        lines.append(
+            f"   Paires : {_COMBO_DISP.get(bm,'?')}"
+        )
+        if best_val:
+            lines.append(
+                f"   ✅{best_val['wins']} gagnés | ❌{best_val['losses']} perdus | "
+                f"Score: {best_val['score']:+d} sur {best_val['total']} prédictions"
+            )
+        lines.append("")
+        lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        lines.append("")
+
+    # ── Mode PDF ─────────────────────────────────────────────────────────────
+    if sub == 'PDF':
+        tracker_total = sum(v.get('total', 0) for v in silent_combo_states.values())
+        if tracker_total == 0:
+            await event.respond("⏳ Aucune prédiction encore — trackers en accumulation, réessaie dans quelques minutes.")
+            return
+        await event.respond("⏳ Génération du PDF en cours…")
+        try:
+            # Construire la sim_matrix depuis les trackers live
+            tracker_sim_matrix = {}
+            for (cnum, wx, b, df_s), state in silent_combo_states.items():
+                if state.get('total', 0) >= 1:
+                    tracker_sim_matrix[(cnum, wx, b, df_s)] = {
+                        'wins':   state['wins'],
+                        'losses': state['losses'],
+                        'total':  state['total'],
+                        'score':  state['wins'] - state['losses'],
+                    }
+            # Best key depuis trackers
+            _valid_pdf = {k: v for k, v in tracker_sim_matrix.items() if v['total'] >= 3}
+            pdf_best_key, pdf_best_val = (None, None)
+            if _valid_pdf:
+                pdf_best_key, pdf_best_val = max(_valid_pdf.items(), key=lambda x: (x[1]['score'], x[1]['wins']))
+            tracker_sim = {
+                'timestamp':         datetime.now(),
+                'combos':            GLOBAL_COMBOS,
+                'sim_matrix':        tracker_sim_matrix,
+                'pred_lists':        {},
+                'total_c13':         tracker_total,
+                'total_analysed':    tracker_total,
+                'verdict':           '🔬 TRACKERS LIVE — 216 combinaisons',
+                'vd':                '',
+                'recommended_num':   pdf_best_key[0] if pdf_best_key else None,
+                'recommended_reason': '',
+                'best_combo_key':    pdf_best_key,
+                'best_combo_val':    pdf_best_val,
+            }
+            pdf_bytes = generate_raison2_pdf(tracker_sim)
+            buf = io.BytesIO(pdf_bytes)
+            buf.name = f"trackers_c13_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+            await event.respond(
+                file=buf,
+                message=(
+                    f"📄 **Rapport Trackers C13 Live — {datetime.now().strftime('%d/%m/%Y %H:%M')}**\n"
+                    f"216 combinaisons (miroir × wx × B × df+1/df+2) — {tracker_total} prédictions cumulées"
+                )
+            )
+        except Exception as e:
+            await event.respond(f"❌ Erreur génération PDF : {e}")
+        return
+
+    # ── Mode détail par combinaison miroir (P1 / P2 / P3) ──────────────────
+    if sub in ('P1', 'P2', 'P3'):
+        pnum = {'P1': 1, 'P2': 2, 'P3': 3}[sub]
+        cname = _COMBO_NAMES.get(pnum, sub)
+        cdisp = _COMBO_DISP.get(pnum, '?')
+        c_active = (_COMBO_MIR.get(pnum) == cur_mirror)
+        act_tag  = " ◀ ACTIF" if c_active else ""
+        lines.append(f"**📋 DÉTAIL — {cname}{act_tag}**")
+        lines.append(f"Paires : {cdisp}")
+        lines.append("")
+
+        # ── Tableau matriciel depuis silent_combo_states (trackers live) ────
+        for df_mat, df_mat_label in ((1, "trigger+1"), (2, "trigger+2")):
+            lines.append(f"📐 **df={df_mat}** _({df_mat_label})_")
+            lines.append(f"{'wx\\B':>5}  " + "  ".join(f"B={b}" for b in range(3, 9)))
+            lines.append("─" * 50)
+            for wx in range(3, 9):
+                row_parts = []
+                for b in range(3, 9):
+                    st = silent_combo_states.get((pnum, wx, b, df_mat), {})
+                    tot = st.get('total', 0)
+                    if tot >= 1:
+                        sc = st['wins'] - st['losses']
+                        row_parts.append(f"{sc:+3d}({tot})")
+                    else:
+                        row_parts.append("  --  ")
+                lines.append(f"wx={wx}:  " + "  ".join(row_parts))
+            lines.append("")
+        lines.append("_Format : Score(nb prédictions)  |  Score = victoires − défaites_")
+        lines.append("")
+
+        # ── Prédictions individuelles par (wx, B) — lecture directe des trackers ─
+        # Miroir du combo affiché
+        c_obj    = GLOBAL_COMBOS_BY_NUM.get(pnum, {})
+        c_mirror = c_obj.get('mirror', {})
+        mir_disp = c_obj.get('disp', '?')
+        mir_pairs = "  ".join(
+            f"{SUIT_EMOJI.get(k,'?')}↔{SUIT_EMOJI.get(v,'?')}"
+            for k, v in c_mirror.items() if k < v or k not in (x for x in c_mirror if c_mirror[x] == k)
+        )
+
+        for df_sim_show, df_label in ((1, "trigger+1"), (2, "trigger+2")):
+            lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            lines.append(
+                f"**🔍 PRÉDICTIONS INDIVIDUELLES · {cname} · {df_label}**"
+            )
+            lines.append(f"_Miroir : {mir_disp}_")
+            lines.append("")
+
+            # Collecter tous les (wx, B) qui ont des prédictions pour ce df_sim
+            active_combos = []
+            for wx in range(3, 9):
+                for b in range(3, 9):
+                    key   = (pnum, wx, b, df_sim_show)
+                    state = silent_combo_states.get(key, {})
+                    hist  = state.get('pred_history', [])
+                    if hist:
+                        w = state.get('wins', 0)
+                        l = state.get('losses', 0)
+                        active_combos.append((wx, b, w, l, hist))
+
+            if not active_combos:
+                lines.append("_Aucune prédiction encore — trackers en accumulation…_")
+                lines.append("")
+                continue
+
+            # Trier par score décroissant, afficher les 12 meilleurs
+            active_combos.sort(key=lambda x: (x[2] - x[3]), reverse=True)
+            shown = 0
+            for wx, b, wins_c, losses_c, hist in active_combos:
+                if shown >= 12:
+                    rest = len(active_combos) - shown
+                    lines.append(f"_… +{rest} combo(s) non affichés — voir la matrice ci-dessus_")
+                    break
+                score_c = wins_c - losses_c
+                lines.append(
+                    f"**wx={wx} | B={b}** — {wins_c + losses_c} pred · "
+                    f"✅{wins_c} / ❌{losses_c} · Score: {score_c:+d}"
+                )
+                # Afficher les 5 dernières prédictions de ce tracker
+                for h in hist[-5:]:
+                    suit_em  = SUIT_EMOJI.get(h.get('suit', '?'), h.get('suit', '?'))
+                    res_icon = "✅" if h.get('win') else "❌"
+                    trigger  = h.get('trigger', '?')
+                    gn       = h.get('gn', '?')
+                    lines.append(
+                        f"  #{gn} {suit_em} {res_icon}  _(trigger #{trigger})_"
+                    )
+                if len(hist) > 5:
+                    lines.append(f"  _… +{len(hist)-5} prédictions antérieures_")
+                lines.append("")
+                shown += 1
+
+        await event.respond("\n".join(lines), parse_mode='markdown')
+        return
+
+    # ── Mode TOUT : 3 messages (un par miroir), toutes les 216 combinaisons ──
+    if sub == 'TOUT':
+        # En-tête global déjà dans lines
+        lines.append(f"📤 **TOUTES LES 216 COMBINAISONS** — envoi en 3 messages (P1 / P2 / P3)")
+        lines.append("_Chaque message = 1 miroir × 6 wx × 6 B × 2 df = 72 combos_")
+        lines.append("")
+        if rec_num:
+            lines.append(f"🏆 **Meilleur global :** {_COMBO_NAMES.get(rec_num,'?')} — {rec_reason}")
+            lines.append("")
+        lines.append("_Messages envoyés ci-dessous…_")
+        await event.respond("\n".join(lines), parse_mode='markdown')
+
+        # ── Un message par miroir ──────────────────────────────────────────
+        for c in GLOBAL_COMBOS:
+            pnum_t   = c['num']
+            cname_t  = c['name']
+            cdisp_t  = c.get('disp', '?')
+            c_act    = (c['mirror'] == cur_mirror)
+            act_tag  = " ◀ ACTIF" if c_act else ""
+            is_reco  = (pnum_t == rec_num)
+            reco_tag = " ⭐ RECOMMANDÉ" if is_reco else ""
+
+            msg_lines = [
+                f"╔══════════════════════════════╗",
+                f"║  🔬 {cname_t}{act_tag}{reco_tag}",
+                f"╚══════════════════════════════╝",
+                f"Miroir : {cdisp_t}",
+                f"─────────── trigger+1 ───────────",
+            ]
+
+            for wx in range(3, 9):
+                for b in range(3, 9):
+                    key_t  = (pnum_t, wx, b, 1)
+                    st_t   = silent_combo_states.get(key_t, {})
+                    w_t    = st_t.get('wins',   0)
+                    l_t    = st_t.get('losses', 0)
+                    tot_t  = st_t.get('total',  0)
+                    hist_t = st_t.get('pred_history', [])
+                    is_best_t = (key_t == best_key)
+                    best_m  = "🏆" if is_best_t else ""
+                    is_act  = (c_act and wx == COMPTEUR13_THRESHOLD and b == compteur2_seuil_B)
+                    act_m   = "◀" if is_act else ""
+                    if tot_t == 0:
+                        msg_lines.append(f"wx={wx} B={b} {best_m}{act_m}: — (0 pred)")
+                    else:
+                        sc_t = w_t - l_t
+                        preds_disp = []
+                        for h in hist_t[-3:]:
+                            se = SUIT_EMOJI.get(h.get('suit','?'), h.get('suit','?'))
+                            re = "✅" if h.get('win') else "❌"
+                            preds_disp.append(f"#{h.get('gn','?')}{se}{re}")
+                        msg_lines.append(
+                            f"wx={wx} B={b} {best_m}{act_m}: ✅{w_t}/❌{l_t} {sc_t:+d} → "
+                            + " ".join(preds_disp)
+                        )
+
+            msg_lines.append(f"─────────── trigger+2 ───────────")
+
+            for wx in range(3, 9):
+                for b in range(3, 9):
+                    key_t  = (pnum_t, wx, b, 2)
+                    st_t   = silent_combo_states.get(key_t, {})
+                    w_t    = st_t.get('wins',   0)
+                    l_t    = st_t.get('losses', 0)
+                    tot_t  = st_t.get('total',  0)
+                    hist_t = st_t.get('pred_history', [])
+                    is_best_t = (key_t == best_key)
+                    best_m  = "🏆" if is_best_t else ""
+                    is_act  = (c_act and wx == COMPTEUR13_THRESHOLD and b == compteur2_seuil_B)
+                    act_m   = "◀" if is_act else ""
+                    if tot_t == 0:
+                        msg_lines.append(f"wx={wx} B={b} {best_m}{act_m}: — (0 pred)")
+                    else:
+                        sc_t = w_t - l_t
+                        preds_disp = []
+                        for h in hist_t[-3:]:
+                            se = SUIT_EMOJI.get(h.get('suit','?'), h.get('suit','?'))
+                            re = "✅" if h.get('win') else "❌"
+                            preds_disp.append(f"#{h.get('gn','?')}{se}{re}")
+                        msg_lines.append(
+                            f"wx={wx} B={b} {best_m}{act_m}: ✅{w_t}/❌{l_t} {sc_t:+d} → "
+                            + " ".join(preds_disp)
+                        )
+
+            # Découper en chunks de 4000 chars si nécessaire (limite Telegram)
+            full_text = "\n".join(msg_lines)
+            chunk_size = 3800
+            for i in range(0, len(full_text), chunk_size):
+                await event.respond(full_text[i:i + chunk_size], parse_mode='markdown')
+
+        return
+
+    # ── Mode par défaut : Top 10 depuis silent_combo_states (trackers live) ───
+    tracker_entries = [
+        (k, {**v, 'score': v['wins'] - v['losses']})
+        for k, v in silent_combo_states.items()
+        if v.get('total', 0) >= 1
+    ]
+    sorted_entries = sorted(tracker_entries, key=lambda x: (x[1]['score'], x[1]['wins']), reverse=True)
+
+    _tracker_total_preds2 = sum(v.get('total', 0) for v in silent_combo_states.values())
+    _tracker_active2      = sum(1 for v in silent_combo_states.values() if v.get('total', 0) > 0)
+
+    lines.append(f"🏅 **TOP 10 — TRACKERS SILENCIEUX** _(sur {_tracker_active2}/216 combos actifs · {_tracker_total_preds2} prédictions cumulées)_")
+    lines.append(f"_Tape `/raison2 tout` pour les 216 | `/raison2 P1` `/raison2 P2` `/raison2 P3` pour le détail_")
+    lines.append("")
+
+    if not sorted_entries:
+        lines.append("⏳ _Aucune prédiction encore — trackers en accumulation (quelques minutes)…_")
+    else:
+        for rank, (key, val) in enumerate(sorted_entries[:10], 1):
+            combo_n, wx, b, df_s = key
+            cname2   = next((c['name'] for c in GLOBAL_COMBOS if c['num'] == combo_n), f"P{combo_n}")
+            cdisp2   = next((c['disp'] for c in GLOBAL_COMBOS if c['num'] == combo_n), '?')
+            c_mirror = next((c['mirror'] for c in GLOBAL_COMBOS if c['num'] == combo_n), {})
+            c_active = (c_mirror == cur_mirror and wx == COMPTEUR13_THRESHOLD and b == compteur2_seuil_B)
+            act_tag  = " ◀ ACTIF" if c_active else ""
+            is_best  = (key == best_key)
+            best_tag = " 🏆" if is_best else ""
+            hist_r   = val.get('pred_history', [])
+            preds_r  = []
+            for h in hist_r[-3:]:
+                se = SUIT_EMOJI.get(h.get('suit','?'), h.get('suit','?'))
+                re = "✅" if h.get('win') else "❌"
+                preds_r.append(f"#{h.get('gn','?')}{se}{re}")
+            preds_str = "  ".join(preds_r) if preds_r else "_aucune_"
+            lines.append(f"**#{rank}{best_tag}{act_tag}** {cname2} | wx={wx} B={b} trigger+{df_s}")
+            lines.append(f"   {cdisp2}")
+            lines.append(f"   ✅{val['wins']} / ❌{val['losses']} | Score: **{val['score']:+d}** | {val['total']} pred")
+            lines.append(f"   Dernières : {preds_str}")
+            lines.append("")
+
+        if len(sorted_entries) > 10:
+            lines.append(f"_… et {len(sorted_entries) - 10} autres. `/raison2 tout` pour tout voir._")
+
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    if best_key and best_val:
+        bm, bwx, bb, bdf = best_key
+        bname = next((c['name'] for c in GLOBAL_COMBOS if c['num'] == bm), f"P{bm}")
+        lines.append(f"🤖 **Auto-sélection horaire :** {bname} | wx={bwx} B={bb} trigger+{bdf} | Score: **{best_val.get('score', best_val['wins']-best_val['losses']):+d}**")
+    lines.append("")
+    lines.append("_Détail : `/raison2 P1` `/raison2 P2` `/raison2 P3` `/raison2 tout`_")
+
     await event.respond("\n".join(lines), parse_mode='markdown')
 
 
@@ -8319,8 +9863,14 @@ def _btns_prd():
 def _btns_cnx():
     dist = f"✅ {DISTRIBUTION_CHANNEL_ID}" if DISTRIBUTION_CHANNEL_ID else "❌ inactif"
     c2ch = f"✅ {COMPTEUR2_CHANNEL_ID}"    if COMPTEUR2_CHANNEL_ID    else "❌ inactif"
+    c3ch = f"✅ {PREDICTION_CHANNEL_ID3}"  if PREDICTION_CHANNEL_ID3  else "❌ inactif"
+    c4ch = f"✅ {PREDICTION_CHANNEL_ID4}"  if PREDICTION_CHANNEL_ID4  else "❌ inactif"
     return [
         [Button.inline("📡  Voir config canaux",                    b"cn_v")],
+        [Button.inline(f"📡  Canal 3 (redirect) : {c3ch}",         b"cn_3m")],
+        [Button.inline("   ✏️  Modifier ID", b"cn_3s"), Button.inline("   ❌  Désactiver", b"cn_3o")],
+        [Button.inline(f"📡  Canal 4 (redirect) : {c4ch}",         b"cn_4m")],
+        [Button.inline("   ✏️  Modifier ID", b"cn_4s"), Button.inline("   ❌  Désactiver", b"cn_4o")],
         [Button.inline(f"🎯  Distribution : {dist}",                b"cn_dm")],
         [Button.inline("   ✏️  Modifier ID", b"cn_ds"), Button.inline("   ❌  Désactiver", b"cn_do")],
         [Button.inline(f"📊  Compteur2 : {c2ch}",                   b"cn_cm")],
@@ -8332,11 +9882,13 @@ def _btns_cnx():
 def _btns_anl():
     fav_state = "✅ ON" if heures_favorables_active else "❌ OFF"
     return [
-        [Button.inline("📉  PDF Perdus",       b"pd_v"), Button.inline("📊  Comparaison", b"cmp_v")],
+        [Button.inline("🤖  Stratégie auto",   b"strat_v"), Button.inline("🔬  Raison2",       b"r2_v")],
+        [Button.inline("🔬  Raison2 P1",        b"r2_p1"),   Button.inline("🔬  P2",            b"r2_p2"),  Button.inline("🔬  P3", b"r2_p3")],
+        [Button.inline("📉  PDF Perdus",        b"pd_v"),    Button.inline("📊  Comparaison",   b"cmp_v")],
         [Button.inline(f"⭐  Heures favorables  ({fav_state})", b"fv_v")],
         [Button.inline("✅  Fav ON", b"fv_on"), Button.inline("❌  Fav OFF", b"fv_off"),
          Button.inline("📤  → Canal", b"fv_c")],
-        [Button.inline("📈  Bilan actuel",     b"bl_v"), Button.inline("📈  Bilan maintenant", b"bl_n")],
+        [Button.inline("📈  Bilan actuel",      b"bl_v"),    Button.inline("📈  Maintenant",    b"bl_n")],
         [Button.inline("⬅️  Retour", b"mn")],
     ]
 
@@ -8414,6 +9966,41 @@ async def handle_callback(event):
         elif data == 'ool':
             await event.edit("🛠️ **OUTILS**", buttons=_btns_ool())
             await event.answer()
+
+        # ── Annulation de l'auto-stratégie ────────────────────────────────────
+        elif data == 'cancel_auto_strat':
+            global auto_strategy_revert
+            if not auto_strategy_revert:
+                await event.answer("Aucune stratégie auto à annuler.", alert=True)
+                return
+
+            # Restaurer les paramètres précédents
+            global COMPTEUR13_MIRROR, COMPTEUR13_THRESHOLD, COMPTEUR13_SKIP
+            global compteur2_seuil_B, compteur2_seuil_B_per_suit
+            COMPTEUR13_MIRROR.clear()
+            COMPTEUR13_MIRROR.update(auto_strategy_revert['mirror'])
+            COMPTEUR13_THRESHOLD = auto_strategy_revert['wx']
+            COMPTEUR13_SKIP      = auto_strategy_revert.get('df_sim', 1)
+            compteur2_seuil_B    = auto_strategy_revert['b']
+            for _s in ALL_SUITS:
+                compteur2_seuil_B_per_suit[_s] = auto_strategy_revert['b_per_suit'].get(_s, auto_strategy_revert['b'])
+
+            logger.info(
+                f"🔙 Auto-stratégie annulée — restauré : miroir={dict(COMPTEUR13_MIRROR)} "
+                f"wx={COMPTEUR13_THRESHOLD} B={compteur2_seuil_B} df+{COMPTEUR13_SKIP}"
+            )
+
+            prev_name   = auto_strategy_revert.get('name_prev', '?')
+            prev_df_sim = auto_strategy_revert.get('df_sim', 1)
+            auto_strategy_revert = {}
+
+            await event.edit(
+                f"🔙 **Stratégie annulée** — paramètres précédents restaurés.\n"
+                f"  Miroir : **{prev_name}** · df+{prev_df_sim}\n"
+                f"  wx C13 : **{COMPTEUR13_THRESHOLD}** | B C2 : **{compteur2_seuil_B}**",
+                buttons=None,
+            )
+            await event.answer("✅ Paramètres précédents restaurés.")
 
         # ── Configuration ─────────────────────────────────────────────────────
         elif data == 'df_s':
@@ -8588,15 +10175,53 @@ async def handle_callback(event):
         elif data == 'cn_v':
             dist = f"`{DISTRIBUTION_CHANNEL_ID}`" if DISTRIBUTION_CHANNEL_ID else "❌ inactif"
             c2ch = f"`{COMPTEUR2_CHANNEL_ID}`"    if COMPTEUR2_CHANNEL_ID    else "❌ inactif"
+            c3ch = f"`{PREDICTION_CHANNEL_ID3}`"  if PREDICTION_CHANNEL_ID3  else "❌ inactif"
+            c4ch = f"`{PREDICTION_CHANNEL_ID4}`"  if PREDICTION_CHANNEL_ID4  else "❌ inactif"
             txt  = (f"📡 **CONFIGURATION DES CANAUX**\n\n"
-                    f"📤 Principal   : `{PREDICTION_CHANNEL_ID}`\n"
-                    f"🎯 Distribution : {dist}\n"
-                    f"📊 Compteur2   : {c2ch}")
+                    f"📤 Canal 1 (principal) : `{PREDICTION_CHANNEL_ID}`\n"
+                    f"📤 Canal 2 (principal) : `{PREDICTION_CHANNEL_ID2}`\n"
+                    f"📡 Canal 3 (redirect)  : {c3ch}\n"
+                    f"📡 Canal 4 (redirect)  : {c4ch}\n"
+                    f"🎯 Distribution        : {dist}\n"
+                    f"📊 Compteur2           : {c2ch}\n\n"
+                    f"Canaux 3 et 4 reçoivent toutes les prédictions + résultats.")
             await event.answer()
             await client.send_message(cid, txt)
 
-        elif data in ('cn_dm', 'cn_cm'):
+        elif data in ('cn_dm', 'cn_cm', 'cn_3m', 'cn_4m'):
             await event.answer()
+
+        elif data == 'cn_3s':
+            pending_input[event.sender_id] = {'action': 'set_cn_3', 'cid': cid}
+            await event.answer()
+            cur = f"`{PREDICTION_CHANNEL_ID3}`" if PREDICTION_CHANNEL_ID3 else "inactif"
+            await client.send_message(cid,
+                f"📡 **Canal 3 — Redirect prédictions + résultats**\n"
+                f"Actuel : {cur}\n\n"
+                f"Envoyez le nouvel ID de canal (nombre négatif, ex: `-1001234567890`).\n"
+                f"⚠️ Le bot doit être **admin** dans ce canal."
+            )
+
+        elif data == 'cn_3o':
+            old = PREDICTION_CHANNEL_ID3
+            PREDICTION_CHANNEL_ID3 = None
+            await event.answer(f"❌ Canal 3 désactivé (était : {old})", alert=True)
+
+        elif data == 'cn_4s':
+            pending_input[event.sender_id] = {'action': 'set_cn_4', 'cid': cid}
+            await event.answer()
+            cur = f"`{PREDICTION_CHANNEL_ID4}`" if PREDICTION_CHANNEL_ID4 else "inactif"
+            await client.send_message(cid,
+                f"📡 **Canal 4 — Redirect prédictions + résultats**\n"
+                f"Actuel : {cur}\n\n"
+                f"Envoyez le nouvel ID de canal (nombre négatif, ex: `-1001234567890`).\n"
+                f"⚠️ Le bot doit être **admin** dans ce canal."
+            )
+
+        elif data == 'cn_4o':
+            old = PREDICTION_CHANNEL_ID4
+            PREDICTION_CHANNEL_ID4 = None
+            await event.answer(f"❌ Canal 4 désactivé (était : {old})", alert=True)
 
         elif data == 'cn_ds':
             pending_input[event.sender_id] = {'action': 'set_cn_dist', 'cid': cid}
@@ -8621,6 +10246,26 @@ async def handle_callback(event):
             await event.answer(f"❌ Canal compteur2 désactivé (était : {old})", alert=True)
 
         # ── Analyse ───────────────────────────────────────────────────────────
+        elif data == 'strat_v':
+            await event.answer("🤖 Stratégie en cours…")
+            await cmd_strategie(_fake_ev(cid, '/strategie'))
+
+        elif data == 'r2_v':
+            await event.answer("🔬 Raison2…")
+            await cmd_raison2(_fake_ev(cid, '/raison2'))
+
+        elif data == 'r2_p1':
+            await event.answer("🔬 Raison2 P1…")
+            await cmd_raison2(_fake_ev(cid, '/raison2 P1'))
+
+        elif data == 'r2_p2':
+            await event.answer("🔬 Raison2 P2…")
+            await cmd_raison2(_fake_ev(cid, '/raison2 P2'))
+
+        elif data == 'r2_p3':
+            await event.answer("🔬 Raison2 P3…")
+            await cmd_raison2(_fake_ev(cid, '/raison2 P3'))
+
         elif data == 'pd_v':
             await event.answer("📄 Génération PDF perdus…")
             await cmd_perdus(_fake_ev(cid, '/perdus'))
@@ -8783,6 +10428,42 @@ async def handle_admin_input(event):
             COMPTEUR7_THRESHOLD = val
             await event.respond(f"✅ **Seuil Compteur7 : {old} → {val}**")
 
+        elif action == 'set_cn_3':
+            global PREDICTION_CHANNEL_ID3
+            try:
+                new_id = int(text)
+            except ValueError:
+                await event.respond("❌ ID invalide — entrez un nombre négatif, ex: `-1001234567890`")
+                return
+            entity = await resolve_channel(new_id)
+            if not entity:
+                await event.respond(f"❌ Canal `{new_id}` inaccessible — le bot est-il **admin** dans ce canal?")
+                return
+            old = PREDICTION_CHANNEL_ID3
+            PREDICTION_CHANNEL_ID3 = new_id
+            await event.respond(
+                f"✅ **Canal 3 activé : {old or 'inactif'} → `{new_id}`**\n"
+                f"Toutes les prédictions + résultats seront redirigés vers ce canal."
+            )
+
+        elif action == 'set_cn_4':
+            global PREDICTION_CHANNEL_ID4
+            try:
+                new_id = int(text)
+            except ValueError:
+                await event.respond("❌ ID invalide — entrez un nombre négatif, ex: `-1001234567890`")
+                return
+            entity = await resolve_channel(new_id)
+            if not entity:
+                await event.respond(f"❌ Canal `{new_id}` inaccessible — le bot est-il **admin** dans ce canal?")
+                return
+            old = PREDICTION_CHANNEL_ID4
+            PREDICTION_CHANNEL_ID4 = new_id
+            await event.respond(
+                f"✅ **Canal 4 activé : {old or 'inactif'} → `{new_id}`**\n"
+                f"Toutes les prédictions + résultats seront redirigés vers ce canal."
+            )
+
         elif action == 'set_cn_dist':
             new_id = int(text)
             if not await resolve_channel(new_id):
@@ -8840,7 +10521,8 @@ def setup_handlers():
     client.add_event_handler(cmd_resetdb,   events.NewMessage(pattern=r'^/resetdb'))
     client.add_event_handler(cmd_debloquer, events.NewMessage(pattern=r'^/debloquer$'))
     client.add_event_handler(cmd_help,      events.NewMessage(pattern=r'^/help$'))
-    client.add_event_handler(cmd_raison,    events.NewMessage(pattern=r'^/raison'))
+    client.add_event_handler(cmd_raison,    events.NewMessage(pattern=r'^/raison(?!2)'))
+    client.add_event_handler(cmd_raison2,   events.NewMessage(pattern=r'^/raison2'))
     client.add_event_handler(cmd_perdus,    events.NewMessage(pattern=r'^/perdus$'))
     client.add_event_handler(cmd_bilan,     events.NewMessage(pattern=r'^/bilan'))
     client.add_event_handler(cmd_b,         events.NewMessage(pattern=r'^/b($|\s)'))
@@ -8908,6 +10590,8 @@ async def start_bot():
         await load_compteur11()           # Charge les perdus d'hier pour les rejouer aujourd'hui
         await load_pending_predictions()  # Reprend les prédictions en cours après redémarrage
         await load_prediction_history()   # Charge l'historique pour les heures favorables
+        await load_strategy_simulation()  # Restaure la simulation silencieuse C13 (pour /raison2)
+        await load_silent_combo_stats()   # Charge les 216 trackers indépendants (C13+C2 par combo)
 
         # Charger le vainqueur du dernier concours (comparaison inter-cycles)
         global concours_last_winner, concours_last_pct
@@ -8928,9 +10612,72 @@ async def start_bot():
                 pred_entity = await resolve_channel(PREDICTION_CHANNEL_ID)
                 if pred_entity:
                     prediction_channel_ok = True
-                    logger.info(f"✅ Canal prédiction OK")
+                    logger.info(f"✅ Canal 1 OK ({PREDICTION_CHANNEL_ID})")
+                else:
+                    logger.error(f"❌ Canal 1 inaccessible ({PREDICTION_CHANNEL_ID})")
             except Exception as e:
-                logger.error(f"❌ Erreur canal prédiction: {e}")
+                logger.error(f"❌ Erreur canal 1: {e}")
+
+        if PREDICTION_CHANNEL_ID2:
+            try:
+                pred_entity2 = await resolve_channel(PREDICTION_CHANNEL_ID2)
+                if pred_entity2:
+                    logger.info(f"✅ Canal 2 OK ({PREDICTION_CHANNEL_ID2})")
+                else:
+                    logger.error(f"❌ Canal 2 inaccessible ({PREDICTION_CHANNEL_ID2}) — le bot n'est pas admin ou n'a pas accès")
+                    try:
+                        await client.send_message(ADMIN_ID,
+                            f"⚠️ **CANAL 2 INACCESSIBLE**\n"
+                            f"ID : `{PREDICTION_CHANNEL_ID2}`\n"
+                            f"Le bot ne peut pas envoyer dans ce canal.\n"
+                            f"→ Vérifie que le bot est **admin** du canal."
+                        )
+                    except Exception:
+                        pass
+            except Exception as e:
+                logger.error(f"❌ Erreur canal 2: {e}")
+
+        if PREDICTION_CHANNEL_ID3:
+            try:
+                pred_entity3 = await resolve_channel(PREDICTION_CHANNEL_ID3)
+                if pred_entity3:
+                    logger.info(f"✅ Canal 3 OK ({PREDICTION_CHANNEL_ID3})")
+                else:
+                    logger.error(f"❌ Canal 3 inaccessible ({PREDICTION_CHANNEL_ID3})")
+                    try:
+                        await client.send_message(ADMIN_ID,
+                            f"⚠️ **CANAL 3 INACCESSIBLE**\n"
+                            f"ID : `{PREDICTION_CHANNEL_ID3}`\n"
+                            f"Le bot ne peut pas envoyer dans ce canal.\n"
+                            f"→ Vérifie que le bot est **admin** du canal."
+                        )
+                    except Exception:
+                        pass
+            except Exception as e:
+                logger.error(f"❌ Erreur canal 3: {e}")
+        else:
+            logger.info("📡 Canal 3 : désactivé (configurable via /canaux canal3 [ID])")
+
+        if PREDICTION_CHANNEL_ID4:
+            try:
+                pred_entity4 = await resolve_channel(PREDICTION_CHANNEL_ID4)
+                if pred_entity4:
+                    logger.info(f"✅ Canal 4 OK ({PREDICTION_CHANNEL_ID4})")
+                else:
+                    logger.error(f"❌ Canal 4 inaccessible ({PREDICTION_CHANNEL_ID4})")
+                    try:
+                        await client.send_message(ADMIN_ID,
+                            f"⚠️ **CANAL 4 INACCESSIBLE**\n"
+                            f"ID : `{PREDICTION_CHANNEL_ID4}`\n"
+                            f"Le bot ne peut pas envoyer dans ce canal.\n"
+                            f"→ Vérifie que le bot est **admin** du canal."
+                        )
+                    except Exception:
+                        pass
+            except Exception as e:
+                logger.error(f"❌ Erreur canal 4: {e}")
+        else:
+            logger.info("📡 Canal 4 : désactivé (configurable via /canaux canal4 [ID])")
 
         logger.info("🤖 Bot démarré")
         return True
@@ -8972,6 +10719,7 @@ async def main():
                 asyncio.create_task(auto_watchdog_task())      # watchdog déblocage automatique
                 asyncio.create_task(keep_alive_task())         # anti spin-down Render.com
                 asyncio.create_task(bilan_loop())
+                asyncio.create_task(auto_strategy_hourly_loop())
                 asyncio.create_task(restore_countdown_panel_if_needed())
                 background_started = True
 
