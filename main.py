@@ -3750,6 +3750,98 @@ def compteur11_add_perdu(game_number: int, suit: str):
     logger.info(f"📋 C11 enregistré: #{game_number} {suit} perdu aujourd'hui")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# RUNTIME CONFIG — persistance complète en DB (survit aux redémarrages Render)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def save_runtime_config():
+    """
+    Sauvegarde TOUS les paramètres modifiables dynamiquement dans la DB.
+    Appelé automatiquement toutes les 60s depuis keep_alive_task,
+    et immédiatement après chaque commande admin qui modifie un paramètre clé.
+    """
+    cfg = {
+        'PREDICTION_CHANNEL_ID3':      PREDICTION_CHANNEL_ID3,
+        'PREDICTION_CHANNEL_ID4':      PREDICTION_CHANNEL_ID4,
+        'DISTRIBUTION_CHANNEL_ID':     DISTRIBUTION_CHANNEL_ID,
+        'COMPTEUR2_CHANNEL_ID':        COMPTEUR2_CHANNEL_ID,
+        'MIN_GAP_BETWEEN_PREDICTIONS': MIN_GAP_BETWEEN_PREDICTIONS,
+        'COMPTEUR4_THRESHOLD':         COMPTEUR4_THRESHOLD,
+        'COMPTEUR7_THRESHOLD':         COMPTEUR7_THRESHOLD,
+        'COMPTEUR8_THRESHOLD':         COMPTEUR8_THRESHOLD,
+        'COMPTEUR13_THRESHOLD':        COMPTEUR13_THRESHOLD,
+        'PREDICTION_HOURS':            PREDICTION_HOURS,
+        'compteur2_seuil_B':           compteur2_seuil_B,
+        'compteur2_seuil_B_per_suit':  compteur2_seuil_B_per_suit,
+        'B_LOSS_INCREMENT':            B_LOSS_INCREMENT,
+        'compteur2_active':            compteur2_active,
+        'compteur13_active':           compteur13_active,
+        'heures_favorables_active':    heures_favorables_active,
+    }
+    try:
+        await db.db_save_kv('runtime_config', cfg)
+        logger.debug("💾 Config runtime sauvegardée en DB")
+    except Exception as e:
+        logger.error(f"❌ Erreur save_runtime_config: {e}")
+
+
+async def load_runtime_config():
+    """
+    Charge tous les paramètres runtime depuis la DB au démarrage.
+    Les valeurs en DB écrasent les valeurs par défaut de config.py.
+    Si aucune sauvegarde n'existe, les valeurs par défaut restent.
+    """
+    global PREDICTION_CHANNEL_ID3, PREDICTION_CHANNEL_ID4
+    global DISTRIBUTION_CHANNEL_ID, COMPTEUR2_CHANNEL_ID
+    global MIN_GAP_BETWEEN_PREDICTIONS
+    global COMPTEUR4_THRESHOLD, COMPTEUR7_THRESHOLD, COMPTEUR8_THRESHOLD, COMPTEUR13_THRESHOLD
+    global PREDICTION_HOURS
+    global compteur2_seuil_B, compteur2_seuil_B_per_suit
+    global B_LOSS_INCREMENT
+    global compteur2_active, compteur13_active, heures_favorables_active
+
+    try:
+        cfg = await db.db_load_kv('runtime_config')
+    except Exception as e:
+        logger.error(f"❌ Erreur load_runtime_config: {e}")
+        return
+
+    if not cfg:
+        logger.info("⚙️ Config runtime : aucune sauvegarde en DB — valeurs par défaut utilisées")
+        return
+
+    def _get(key, default):
+        val = cfg.get(key)
+        return val if val is not None else default
+
+    PREDICTION_CHANNEL_ID3      = _get('PREDICTION_CHANNEL_ID3',      PREDICTION_CHANNEL_ID3)
+    PREDICTION_CHANNEL_ID4      = _get('PREDICTION_CHANNEL_ID4',      PREDICTION_CHANNEL_ID4)
+    DISTRIBUTION_CHANNEL_ID     = _get('DISTRIBUTION_CHANNEL_ID',     DISTRIBUTION_CHANNEL_ID)
+    COMPTEUR2_CHANNEL_ID        = _get('COMPTEUR2_CHANNEL_ID',        COMPTEUR2_CHANNEL_ID)
+    MIN_GAP_BETWEEN_PREDICTIONS = _get('MIN_GAP_BETWEEN_PREDICTIONS', MIN_GAP_BETWEEN_PREDICTIONS)
+    COMPTEUR4_THRESHOLD         = _get('COMPTEUR4_THRESHOLD',         COMPTEUR4_THRESHOLD)
+    COMPTEUR7_THRESHOLD         = _get('COMPTEUR7_THRESHOLD',         COMPTEUR7_THRESHOLD)
+    COMPTEUR8_THRESHOLD         = _get('COMPTEUR8_THRESHOLD',         COMPTEUR8_THRESHOLD)
+    COMPTEUR13_THRESHOLD        = _get('COMPTEUR13_THRESHOLD',        COMPTEUR13_THRESHOLD)
+    PREDICTION_HOURS            = _get('PREDICTION_HOURS',            PREDICTION_HOURS)
+    compteur2_seuil_B           = _get('compteur2_seuil_B',           compteur2_seuil_B)
+    compteur2_seuil_B_per_suit  = _get('compteur2_seuil_B_per_suit',  compteur2_seuil_B_per_suit)
+    B_LOSS_INCREMENT            = _get('B_LOSS_INCREMENT',            B_LOSS_INCREMENT)
+    compteur2_active            = _get('compteur2_active',            compteur2_active)
+    compteur13_active           = _get('compteur13_active',           compteur13_active)
+    heures_favorables_active    = _get('heures_favorables_active',    heures_favorables_active)
+
+    logger.info(
+        f"⚙️ Config runtime restaurée depuis DB — "
+        f"C3:{PREDICTION_CHANNEL_ID3} | C4:{PREDICTION_CHANNEL_ID4} | "
+        f"Dist:{DISTRIBUTION_CHANNEL_ID} | C2ch:{COMPTEUR2_CHANNEL_ID} | "
+        f"Écart:{MIN_GAP_BETWEEN_PREDICTIONS} | "
+        f"C4seuil:{COMPTEUR4_THRESHOLD} | C7seuil:{COMPTEUR7_THRESHOLD} | "
+        f"C13wx:{COMPTEUR13_THRESHOLD} | B:{compteur2_seuil_B} | "
+        f"C2actif:{compteur2_active} | C13actif:{compteur13_active}"
+    )
+
+
 async def compteur11_fire(entry: Dict, current_game: int):
     """Lance une prédiction C11 dans le canal (perdu hier → prédit aujourd'hui).
     C11 est indépendant de C2 et C6 : il prédit directement le costume perdu hier,
@@ -5455,13 +5547,15 @@ async def auto_watchdog_task():
 
 async def keep_alive_task():
     """
-    Anti-spin-down pour Render.com (plan gratuit).
-    Ping le propre endpoint /health toutes les 3 minutes pour maintenir le service actif.
-    Premier ping immédiat au démarrage (pas d'attente initiale).
-    Utilise RENDER_EXTERNAL_URL si disponible, sinon localhost.
+    Anti-spin-down pour Render.com.
+    - Ping /health toutes les 60 secondes (< délai de spin-down de 15 min)
+    - Utilise RENDER_EXTERNAL_URL (URL publique externe) pour que Render compte la requête
+    - Fallback local si l'URL externe n'est pas disponible
     """
+    import gc
     ping_url = f"{RENDER_EXTERNAL_URL}/health" if RENDER_EXTERNAL_URL else f"http://localhost:{PORT}/health"
-    logger.info(f"💓 Keep-alive démarré → {ping_url} (toutes les 3 min)")
+    logger.info(f"💓 Keep-alive démarré → {ping_url} (toutes les 60s)")
+    ping_count = 0
 
     while True:
         try:
@@ -5470,10 +5564,18 @@ async def keep_alive_task():
                     if resp.status == 200:
                         logger.debug("💓 Keep-alive OK")
                     else:
-                        logger.warning(f"⚠️ Keep-alive: status {resp.status}")
+                        logger.warning(f"⚠️ Keep-alive: status inattendu {resp.status}")
         except Exception as e:
-            logger.debug(f"Keep-alive ping ignoré: {e}")
-        await asyncio.sleep(180)  # 3 minutes — ping d'abord, attente ensuite
+            logger.warning(f"⚠️ Keep-alive ping échoué: {e}")
+
+        ping_count += 1
+        if ping_count % 10 == 0:
+            gc.collect()
+            logger.debug(f"🧹 GC collecté (ping #{ping_count})")
+        # ── Sauvegarde automatique de la config runtime toutes les 60s ──────
+        db.db_schedule(save_runtime_config())
+
+        await asyncio.sleep(60)  # 60 secondes — bien en dessous du seuil de 15 min
 
 async def perform_full_reset(reason: str):
     global pending_predictions, last_prediction_time
@@ -6293,6 +6395,7 @@ async def cmd_gap(event):
         old = MIN_GAP_BETWEEN_PREDICTIONS
         MIN_GAP_BETWEEN_PREDICTIONS = val
         await event.respond(f"✅ **Écart modifié: {old} → {val}**")
+        db.db_schedule(save_runtime_config())
     except Exception as e:
         await event.respond(f"❌ Erreur: {e}")
 
@@ -6375,9 +6478,11 @@ async def cmd_compteur2(event):
         if arg == 'off':
             compteur2_active = False
             await event.respond("❌ **Compteur2 OFF**")
+            db.db_schedule(save_runtime_config())
         elif arg == 'on':
             compteur2_active = True
             await event.respond("✅ **Compteur2 ON**")
+            db.db_schedule(save_runtime_config())
         elif arg == 'reset':
             for tracker in compteur2_trackers.values():
                 tracker.counter = 0
@@ -6405,6 +6510,7 @@ async def cmd_compteur2(event):
                 suffix = f" (+{losses} perte(s))" if losses > 0 else " ✅"
                 lines.append(f"  {sd}: **{new_val}**{suffix}")
             await event.respond("\n".join(lines), parse_mode='markdown')
+            db.db_schedule(save_runtime_config())
     except Exception as e:
         await event.respond(f"❌ Erreur: {e}")
 
@@ -6445,9 +6551,11 @@ async def cmd_compteur13(event):
         if arg == 'off':
             compteur13_active = False
             await event.respond("❌ **Compteur13 OFF** — prédictions C13 désactivées")
+            db.db_schedule(save_runtime_config())
         elif arg == 'on':
             compteur13_active = True
             await event.respond("✅ **Compteur13 ON** — prédictions C13 activées")
+            db.db_schedule(save_runtime_config())
         elif arg == 'reset':
             for suit in ALL_SUITS:
                 compteur13_trackers[suit] = 0
@@ -6469,6 +6577,7 @@ async def cmd_compteur13(event):
                 f"C13 se déclenchera après **{wx_val}** apparitions consécutives du même costume.",
                 parse_mode='markdown'
             )
+            db.db_schedule(save_runtime_config())
         else:
             await event.respond(
                 "❓ **Usage Compteur13:**\n"
@@ -6564,6 +6673,7 @@ async def cmd_canaux(event):
                     await event.respond(f"❌ Canal `{new_id}` inaccessible"); return
                 old = DISTRIBUTION_CHANNEL_ID; DISTRIBUTION_CHANNEL_ID = new_id
                 await event.respond(f"✅ **Canal distribution: {old} → {new_id}**")
+            db.db_schedule(save_runtime_config())
             return
 
         if sub == 'compteur2':
@@ -6581,6 +6691,7 @@ async def cmd_canaux(event):
                     await event.respond(f"❌ Canal `{new_id}` inaccessible"); return
                 old = COMPTEUR2_CHANNEL_ID; COMPTEUR2_CHANNEL_ID = new_id
                 await event.respond(f"✅ **Canal compteur2: {old} → {new_id}**")
+            db.db_schedule(save_runtime_config())
             return
 
         if sub == 'canal3':
@@ -6607,6 +6718,7 @@ async def cmd_canaux(event):
                     f"✅ **Canal 3 activé : {old or 'inactif'} → `{new_id}`**\n"
                     f"Toutes les prédictions + résultats seront redirigés vers ce canal."
                 )
+            db.db_schedule(save_runtime_config())
             return
 
         if sub == 'canal4':
@@ -6633,6 +6745,7 @@ async def cmd_canaux(event):
                     f"✅ **Canal 4 activé : {old or 'inactif'} → `{new_id}`**\n"
                     f"Toutes les prédictions + résultats seront redirigés vers ce canal."
                 )
+            db.db_schedule(save_runtime_config())
             return
 
         c3_st = f"`{PREDICTION_CHANNEL_ID3}`" if PREDICTION_CHANNEL_ID3 else "❌ inactif"
@@ -8822,6 +8935,7 @@ async def cmd_b(event):
             f"✅ Incrément B après perte : **{old_inc}** → **{inc_val}**\n"
             f"_(0 = pas d'augmentation automatique du B après une perte)_"
         )
+        db.db_schedule(save_runtime_config())
         return
 
     # ── /b reset all ─────────────────────────────────────────────────────────
@@ -8942,11 +9056,13 @@ async def cmd_favorables(event):
         if sub == 'off':
             heures_favorables_active = False
             await event.respond("🔕 Fenêtres favorables **désactivées**.")
+            db.db_schedule(save_runtime_config())
             return
 
         if sub == 'on':
             heures_favorables_active = True
             await event.respond("✅ Fenêtres favorables **réactivées** — déclenchement par 2 événements C4.")
+            db.db_schedule(save_runtime_config())
             return
 
         # Affichage statut
@@ -10206,6 +10322,7 @@ async def handle_callback(event):
             old = PREDICTION_CHANNEL_ID3
             PREDICTION_CHANNEL_ID3 = None
             await event.answer(f"❌ Canal 3 désactivé (était : {old})", alert=True)
+            db.db_schedule(save_runtime_config())
 
         elif data == 'cn_4s':
             pending_input[event.sender_id] = {'action': 'set_cn_4', 'cid': cid}
@@ -10222,6 +10339,7 @@ async def handle_callback(event):
             old = PREDICTION_CHANNEL_ID4
             PREDICTION_CHANNEL_ID4 = None
             await event.answer(f"❌ Canal 4 désactivé (était : {old})", alert=True)
+            db.db_schedule(save_runtime_config())
 
         elif data == 'cn_ds':
             pending_input[event.sender_id] = {'action': 'set_cn_dist', 'cid': cid}
@@ -10233,6 +10351,7 @@ async def handle_callback(event):
             old = DISTRIBUTION_CHANNEL_ID
             DISTRIBUTION_CHANNEL_ID = None
             await event.answer(f"❌ Canal distribution désactivé (était : {old})", alert=True)
+            db.db_schedule(save_runtime_config())
 
         elif data == 'cn_cs':
             pending_input[event.sender_id] = {'action': 'set_cn_c2', 'cid': cid}
@@ -10244,6 +10363,7 @@ async def handle_callback(event):
             old = COMPTEUR2_CHANNEL_ID
             COMPTEUR2_CHANNEL_ID = None
             await event.answer(f"❌ Canal compteur2 désactivé (était : {old})", alert=True)
+            db.db_schedule(save_runtime_config())
 
         # ── Analyse ───────────────────────────────────────────────────────────
         elif data == 'strat_v':
@@ -10279,10 +10399,12 @@ async def handle_callback(event):
             now    = datetime.now()
             next_h = (now.hour + (3 - now.hour % 3)) % 24
             await event.answer(f"✅ Heures favorables ON — prochain : {next_h:02d}h00", alert=True)
+            db.db_schedule(save_runtime_config())
 
         elif data == 'fv_off':
             heures_favorables_active = False
             await event.answer("🔕 Heures favorables OFF", alert=True)
+            db.db_schedule(save_runtime_config())
 
         elif data == 'fv_c':
             await event.answer("📤 Envoi dans le canal…")
@@ -10418,6 +10540,7 @@ async def handle_admin_input(event):
             old = COMPTEUR4_THRESHOLD
             COMPTEUR4_THRESHOLD = val
             await event.respond(f"✅ **Seuil Compteur4 : {old} → {val}**")
+            db.db_schedule(save_runtime_config())
 
         elif action == 'set_c7s':
             val = int(text)
@@ -10427,6 +10550,7 @@ async def handle_admin_input(event):
             old = COMPTEUR7_THRESHOLD
             COMPTEUR7_THRESHOLD = val
             await event.respond(f"✅ **Seuil Compteur7 : {old} → {val}**")
+            db.db_schedule(save_runtime_config())
 
         elif action == 'set_cn_3':
             global PREDICTION_CHANNEL_ID3
@@ -10445,6 +10569,7 @@ async def handle_admin_input(event):
                 f"✅ **Canal 3 activé : {old or 'inactif'} → `{new_id}`**\n"
                 f"Toutes les prédictions + résultats seront redirigés vers ce canal."
             )
+            db.db_schedule(save_runtime_config())
 
         elif action == 'set_cn_4':
             global PREDICTION_CHANNEL_ID4
@@ -10463,6 +10588,7 @@ async def handle_admin_input(event):
                 f"✅ **Canal 4 activé : {old or 'inactif'} → `{new_id}`**\n"
                 f"Toutes les prédictions + résultats seront redirigés vers ce canal."
             )
+            db.db_schedule(save_runtime_config())
 
         elif action == 'set_cn_dist':
             new_id = int(text)
@@ -10472,6 +10598,7 @@ async def handle_admin_input(event):
             old = DISTRIBUTION_CHANNEL_ID
             DISTRIBUTION_CHANNEL_ID = new_id
             await event.respond(f"✅ **Canal distribution : {old} → {new_id}**")
+            db.db_schedule(save_runtime_config())
 
         elif action == 'set_cn_c2':
             new_id = int(text)
@@ -10481,6 +10608,7 @@ async def handle_admin_input(event):
             old = COMPTEUR2_CHANNEL_ID
             COMPTEUR2_CHANNEL_ID = new_id
             await event.respond(f"✅ **Canal Compteur2 : {old} → {new_id}**")
+            db.db_schedule(save_runtime_config())
 
         elif action == 'raison_n':
             if not text.isdigit():
@@ -10550,6 +10678,9 @@ async def start_bot():
 
     # ── Initialiser PostgreSQL en premier pour charger la session persistée ──
     await db.init_db()
+
+    # ── Charger la configuration runtime depuis la DB (canaux, seuils, écart…) ──
+    await load_runtime_config()
 
     # ── Charger la session depuis la DB (aucune variable d'environnement requise) ──
     saved = await db.db_load_kv('bot_session')
