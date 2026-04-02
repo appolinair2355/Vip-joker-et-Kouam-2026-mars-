@@ -23,7 +23,10 @@ from fpdf.enums import XPos, YPos
 
 from config import (
     API_ID, API_HASH, BOT_TOKEN, ADMIN_ID,
-    PREDICTION_CHANNEL_ID, PORT, RENDER_EXTERNAL_URL,
+    PREDICTION_CHANNEL_ID, PREDICTION_CHANNEL_ID2,
+    DISTRIBUTION_CHANNEL_ID as _DIST_CH_INIT,
+    COMPTEUR2_CHANNEL_ID    as _C2_CH_INIT,
+    PORT, RENDER_EXTERNAL_URL,
     ALL_SUITS, SUIT_DISPLAY, API_SILENCE_ALERT_MINUTES,
     PREDICTION_DF_DEFAULT,
     B_INCREMENT_DEFAULT,
@@ -83,6 +86,9 @@ recently_predicted: Set[int] = set()  # Anti-doublon : game_numbers déjà envoy
 # Proposition de stratégie en attente de confirmation ("Oui")
 pending_strategy_proposal: Dict = {}   # {name, changes, description, expires}
 
+# Dernier résultat de simulation silencieuse (cmd_strategie → /raison2)
+last_strategy_simulation: Dict = {}    # stocke les combos + scores + recommandation
+
 # Compteur2 - Gestion des costumes manquants
 compteur2_trackers: Dict[str, 'Compteur2Tracker'] = {}
 compteur2_seuil_B = 3                        # B défini par l'admin (référence de base)
@@ -136,9 +142,9 @@ B_LOSS_INCREMENT: int = B_INCREMENT_DEFAULT  # incrément du B après un PERDU
 # Tâches d'animation en cours (original_game → asyncio.Task)
 animation_tasks: Dict[int, asyncio.Task] = {}
 
-# Canaux secondaires
-DISTRIBUTION_CHANNEL_ID = None
-COMPTEUR2_CHANNEL_ID = None
+# Canaux secondaires (initialisés depuis config.py — modifiables via /canaux)
+DISTRIBUTION_CHANNEL_ID = _DIST_CH_INIT
+COMPTEUR2_CHANNEL_ID    = _C2_CH_INIT
 
 # Compteur 11 — Perdu hier → prédit demain
 compteur11_perdu_hier:   List[Dict] = []   # [{game_number, suit, date}] prédictions perdues HIER
@@ -147,13 +153,14 @@ compteur11_triggered:    set = set()        # Jeux déjà déclenchés ce cycle 
 COMPTEUR11_FILE = 'compteur11_data.json'
 
 # ============================================================================
-# SYSTÈME COMPTEUR13 — CONSÉCUTIFS + MIROIR VALIDÉ PAR C2
+# SYSTÈME COMPTEUR13 — CONSÉCUTIFS + MIROIR (FILTRE C2)
 # Compteur13 compte les apparitions CONSÉCUTIVES du même costume.
 # Quand le streak atteint le seuil wx :
-#   → Demande à C2 si le miroir du costume consécutif est son costume absent
-#   → OUI : prédit le miroir (confirmé C2)
-#   → NON : prédit le miroir (signal C13 pur)
-# Paires miroir C13 : ♦↔♥  |  ♣↔♠
+#   → Calcule le miroir de X selon COMPTEUR13_MIRROR
+#   → Consulte C2 : le miroir a-t-il atteint le seuil B (manque bloqué) ?
+#       OUI → ne prédit pas, on attend un autre signal
+#       NON → prédit le miroir au jeu suivant (df)
+# Paires miroir par défaut (P1) : ♦↔♥  |  ♣↔♠
 # ============================================================================
 COMPTEUR13_THRESHOLD: int = 5              # Seuil wx (modifiable par admin)
 compteur13_active: bool   = True
@@ -2193,22 +2200,15 @@ def update_compteur8(game_number: int, player_suits: Set[str]) -> List[Dict]:
 
 def update_compteur13(game_number: int, player_suits: Set[str]) -> List[Dict]:
     """
-    Compteur13 — Consécutifs + décision C2.
+    Compteur13 — Consécutifs + Miroir filtré par C2.
 
     Pour chaque costume X qui atteint wx apparitions consécutives :
-
-      Paires MIROIR   (prédiction de secours) : ♦↔♥  |  ♣↔♠
-      Paires INVERSE  (pour interroger C2)    : ♦↔♠  |  ♥↔♣
-
-      C13 interroge C2 : l'inverse de X a-t-il atteint le seuil B (absent B fois) ?
-        OUI → prédit inverse(X) au jeu current + df + 1  (saut d'un jeu)
-        NON → prédit miroir(X)  au jeu current + df       (pas de saut)
+      1. Calcule miroir(X) selon COMPTEUR13_MIRROR actif.
+      2. Consulte C2 : le miroir a-t-il atteint le seuil B (manque bloqué) ?
+           OUI → bloque la prédiction (c2_mirror_blocked=True) — on attend un autre signal
+           NON → prédit miroir(X) au jeu current + df
     """
     global compteur13_trackers, compteur13_start, COMPTEUR13_THRESHOLD
-
-    # Paires inverses : costume qu'on demande à C2
-    # ♦↔♠  |  ♥↔♣
-    C13_INVERSE: Dict[str, str] = {'♦': '♠', '♠': '♦', '♥': '♣', '♣': '♥'}
 
     triggers = []
     for suit in ALL_SUITS:
@@ -2219,33 +2219,34 @@ def update_compteur13(game_number: int, player_suits: Set[str]) -> List[Dict]:
             logger.debug(f"🎯 C13 {suit}: {compteur13_trackers[suit]} consécutif(s) (jeu #{game_number})")
 
             if compteur13_trackers[suit] >= COMPTEUR13_THRESHOLD:
-                inverse = C13_INVERSE[suit]       # costume à vérifier dans C2
-                miroir  = COMPTEUR13_MIRROR[suit] # costume de secours
+                miroir      = COMPTEUR13_MIRROR[suit]  # costume prédit = miroir de X
+                suit_pred   = miroir
+                game_offset = PREDICTION_DF
 
-                # Interroger C2 : l'inverse a-t-il atteint B absences consécutives ?
-                c2_tracker   = compteur2_trackers.get(inverse)
-                b_val        = compteur2_seuil_B_per_suit.get(inverse, compteur2_seuil_B)
-                c2_confirmed = (c2_tracker is not None and c2_tracker.check_threshold(b_val))
-
-                # Décision : inverse si C2 confirme (saut +1), miroir sinon (df normal)
-                suit_pred   = inverse if c2_confirmed else miroir
-                game_offset = PREDICTION_DF + 1 if c2_confirmed else PREDICTION_DF
+                # Consulter C2 : le miroir est-il un manque bloqué (absent ≥ B fois) ?
+                c2_miroir_tracker = compteur2_trackers.get(miroir)
+                b_val_miroir      = compteur2_seuil_B_per_suit.get(miroir, compteur2_seuil_B)
+                c2_mirror_blocked = (
+                    c2_miroir_tracker is not None
+                    and c2_miroir_tracker.check_threshold(b_val_miroir)
+                )
 
                 triggers.append({
-                    'suit_consec':  suit,
-                    'suit_pred':    suit_pred,
-                    'suit_inverse': inverse,
-                    'suit_miroir':  miroir,
-                    'game_start':   compteur13_start[suit],
-                    'game_trigger': game_number,
-                    'count':        compteur13_trackers[suit],
-                    'c2_confirmed': c2_confirmed,
-                    'game_offset':  game_offset,
+                    'suit_consec':       suit,
+                    'suit_pred':         suit_pred,
+                    'suit_miroir':       miroir,
+                    'game_start':        compteur13_start[suit],
+                    'game_trigger':      game_number,
+                    'count':             compteur13_trackers[suit],
+                    'game_offset':       game_offset,
+                    'c2_mirror_blocked': c2_mirror_blocked,
+                    'b_val_miroir':      b_val_miroir,
+                    'c2_absence_count':  c2_miroir_tracker.counter if c2_miroir_tracker else 0,
                 })
                 logger.info(
                     f"🎯 C13: {suit} {compteur13_trackers[suit]}x consécutif(s) "
-                    f"→ inverse={inverse} C2_ok={c2_confirmed} "
-                    f"| prédit={suit_pred} (offset={game_offset})"
+                    f"→ miroir={miroir} | C2_absent={c2_miroir_tracker.counter if c2_miroir_tracker else 0}"
+                    f"/B={b_val_miroir} | miroir_bloqué={c2_mirror_blocked}"
                 )
                 compteur13_trackers[suit] = 0
                 compteur13_start[suit] = 0
@@ -2260,48 +2261,33 @@ def update_compteur13(game_number: int, player_suits: Set[str]) -> List[Dict]:
 async def send_compteur13_alert(trigger: Dict, current_game: int):
     """Envoie la prédiction C13 au canal (sans filtre C6)."""
     try:
-        suit_consec  = trigger['suit_consec']
-        suit_pred    = trigger['suit_pred']
-        suit_inverse = trigger['suit_inverse']
-        suit_miroir  = trigger['suit_miroir']
-        game_start   = trigger['game_start']
-        game_trigger = trigger['game_trigger']
-        count        = trigger['count']
-        c2_confirmed = trigger['c2_confirmed']
+        suit_consec   = trigger['suit_consec']
+        suit_pred     = trigger['suit_pred']
+        suit_miroir   = trigger['suit_miroir']
+        game_start    = trigger['game_start']
+        game_trigger  = trigger['game_trigger']
+        count         = trigger['count']
+        game_offset   = trigger.get('game_offset', PREDICTION_DF)
+        b_val_miroir  = trigger.get('b_val_miroir', compteur2_seuil_B)
+        c2_absence    = trigger.get('c2_absence_count', 0)
 
-        consec_disp  = SUIT_DISPLAY.get(suit_consec,  suit_consec)
-        inverse_disp = SUIT_DISPLAY.get(suit_inverse, suit_inverse)
-        miroir_disp  = SUIT_DISPLAY.get(suit_miroir,  suit_miroir)
-        pred_disp    = SUIT_DISPLAY.get(suit_pred,    suit_pred)
-
-        # Offset : df+1 (saut) si C2 confirme, df normal sinon
-        game_offset = trigger.get('game_offset', PREDICTION_DF)
+        consec_disp = SUIT_DISPLAY.get(suit_consec, suit_consec)
+        miroir_disp = SUIT_DISPLAY.get(suit_miroir, suit_miroir)
         pred_game   = current_game + game_offset
-
-        if c2_confirmed:
-            c2_line = (
-                f"C2 confirme : {inverse_disp} a atteint le seuil B "
-                f"→ C13 prédit {inverse_disp} au #{pred_game} (saut d'un jeu)."
-            )
-        else:
-            c2_line = (
-                f"C2 : {inverse_disp} n'a pas atteint le seuil B "
-                f"→ C13 prédit le miroir {miroir_disp} au #{pred_game}."
-            )
 
         reason = (
             f"C13 : {consec_disp} apparu {count} fois de suite "
             f"(jeux #{game_start}→#{game_trigger}, seuil wx={COMPTEUR13_THRESHOLD}). "
-            f"Costume prédit : {pred_disp} au jeu #{pred_game}. "
-            f"{c2_line}"
+            f"Miroir prédit : {miroir_disp} au jeu #{pred_game}. "
+            f"C2 vérifié : {miroir_disp} absent {c2_absence}x (seuil B={b_val_miroir}) → non bloqué, prédiction lancée."
         )
 
         c13_meta = {
-            'suit_consec':   suit_consec,
-            'suit_inverse':  suit_inverse,
-            'suit_miroir':   suit_miroir,
-            'c2_confirmed':  c2_confirmed,
-            'game_offset':   game_offset,
+            'suit_consec':      suit_consec,
+            'suit_miroir':      suit_miroir,
+            'game_offset':      game_offset,
+            'count':            count,           # nb d'apparitions consécutives au déclenchement
+            'c2_absence_count': c2_absence,      # nb d'absences C2 du miroir au moment du déclenchement
         }
         added = add_to_prediction_queue(
             pred_game, suit_pred, 'compteur13', reason,
@@ -3452,7 +3438,8 @@ async def _run_animation(original_game: int, check_game: int, start_frame: int =
     global pending_predictions, animation_tasks
 
     try:
-        prediction_entity = await resolve_channel(PREDICTION_CHANNEL_ID)
+        prediction_entity  = await resolve_channel(PREDICTION_CHANNEL_ID)
+        prediction_entity2 = await resolve_channel(PREDICTION_CHANNEL_ID2) if PREDICTION_CHANNEL_ID2 else None
         if not prediction_entity:
             return
 
@@ -3462,7 +3449,8 @@ async def _run_animation(original_game: int, check_game: int, start_frame: int =
             if not pred or pred.get('status') != 'en_cours':
                 break
 
-            msg_id = pred.get('message_id')
+            msg_id  = pred.get('message_id')
+            msg_id2 = pred.get('channel2_message_id')
             if not msg_id:
                 break
 
@@ -3472,11 +3460,8 @@ async def _run_animation(original_game: int, check_game: int, start_frame: int =
 
             bar = build_anim_bar(rattrapage, frame)
 
-            # Légende du niveau actuel
             level_labels = ['🟦 R0', '🟩 R1', '🟨 R2', '🟥 R3']
             level_label  = level_labels[min(rattrapage, 3)]
-
-            # Petits points animés
             dots = '.' * ((frame % 3) + 1)
 
             msg = (
@@ -3492,6 +3477,12 @@ async def _run_animation(original_game: int, check_game: int, start_frame: int =
                 label=f"anim #{original_game}",
                 max_retries=2
             )
+            if prediction_entity2 and msg_id2:
+                await safe_edit_message(
+                    prediction_entity2, msg_id2, msg,
+                    label=f"anim2 #{original_game}",
+                    max_retries=2
+                )
 
             frame += 1
             await asyncio.sleep(ANIM_INTERVAL)
@@ -3677,6 +3668,15 @@ async def send_prediction_multi_channel(game_number: int, suit: str, prediction_
             start_animation(game_number, game_number)
             save_pending_predictions()  # Persistance : survit aux redémarrages
 
+            # ── Canal 2 (toujours, peu importe le type) ──────────────────────
+            if PREDICTION_CHANNEL_ID2:
+                ch2_msg_id = await send_prediction_to_channel(
+                    PREDICTION_CHANNEL_ID2, game_number, suit, prediction_type, is_secondary=True
+                )
+                if ch2_msg_id:
+                    pending_predictions[game_number]['channel2_message_id'] = ch2_msg_id
+                    logger.info(f"✅ Canal2 #{game_number} {suit} envoyé")
+
             secondary_channel_id = None
             if prediction_type == 'distribution' and DISTRIBUTION_CHANNEL_ID:
                 secondary_channel_id = DISTRIBUTION_CHANNEL_ID
@@ -3716,20 +3716,23 @@ async def notify_b_augmente(suit: str, old_b: int, new_b: int, game_number: int,
         logger.error(f"❌ Notif B augmenté: {e}")
 
 async def send_parole_auto_delete(statut_key: str, game_number: int):
-    """Envoie une parole biblique sur le canal et la supprime automatiquement après 30s."""
-    try:
-        entity = await resolve_channel(PREDICTION_CHANNEL_ID)
-        if not entity:
-            return
-        texte = get_parole(statut_key, game_number, count=1)
-        msg = await client.send_message(entity, texte, parse_mode='markdown')
-        await asyncio.sleep(30)
+    """Envoie une parole biblique sur les deux canaux et la supprime automatiquement après 30s."""
+    texte = get_parole(statut_key, game_number, count=1)
+    for ch_id in [PREDICTION_CHANNEL_ID, PREDICTION_CHANNEL_ID2]:
+        if not ch_id:
+            continue
         try:
-            await client.delete_messages(entity, [msg.id])
+            entity = await resolve_channel(ch_id)
+            if not entity:
+                continue
+            msg = await client.send_message(entity, texte, parse_mode='markdown')
+            await asyncio.sleep(30)
+            try:
+                await client.delete_messages(entity, [msg.id])
+            except Exception as e:
+                logger.debug(f"Suppression parole #{game_number} canal {ch_id} ignorée: {e}")
         except Exception as e:
-            logger.debug(f"Suppression parole #{game_number} ignorée: {e}")
-    except Exception as e:
-        logger.debug(f"send_parole_auto_delete #{game_number}: {e}")
+            logger.debug(f"send_parole_auto_delete #{game_number} canal {ch_id}: {e}")
 
 
 async def auto_delete_canal_message(msg_id: int, delay_seconds: int = 1800):
@@ -3793,7 +3796,6 @@ async def update_prediction_message(game_number: int, status: str, rattrapage: i
             edited = await safe_edit_message(prediction_entity, msg_id, new_msg,
                                              label=f"finale #{game_number}")
             if not edited:
-                # Édition échouée → tenter de supprimer l'ancien message et envoyer le résultat
                 logger.warning(
                     f"⚠️ Édition finale #{game_number} échouée "
                     f"(msg_id={msg_id}) → envoi du résultat en nouveau message"
@@ -3815,6 +3817,29 @@ async def update_prediction_message(game_number: int, status: str, rattrapage: i
                 await client.send_message(prediction_entity, new_msg, parse_mode='markdown')
             except Exception as _se:
                 logger.error(f"❌ Fallback send #{game_number} (msg_id None): {_se}")
+
+    # ── Canal 2 — mise à jour résultat ───────────────────────────────────────
+    ch2_msg_id = pred.get('channel2_message_id')
+    if PREDICTION_CHANNEL_ID2:
+        prediction_entity2 = await resolve_channel(PREDICTION_CHANNEL_ID2)
+        if prediction_entity2:
+            if ch2_msg_id:
+                edited2 = await safe_edit_message(prediction_entity2, ch2_msg_id, new_msg,
+                                                  label=f"finale2 #{game_number}")
+                if not edited2:
+                    try:
+                        await client.delete_messages(prediction_entity2, [ch2_msg_id])
+                    except Exception:
+                        pass
+                    try:
+                        await client.send_message(prediction_entity2, new_msg, parse_mode='markdown')
+                    except Exception as _se2:
+                        logger.error(f"❌ Fallback send canal2 #{game_number}: {_se2}")
+            else:
+                try:
+                    await client.send_message(prediction_entity2, new_msg, parse_mode='markdown')
+                except Exception as _se2:
+                    logger.error(f"❌ Fallback send canal2 #{game_number} (msg_id None): {_se2}")
 
     sec_msg_id = pred.get('secondary_message_id')
     sec_channel_id = pred.get('secondary_channel_id')
@@ -3846,6 +3871,14 @@ async def update_prediction_progress(game_number: int, current_check: int):
     if prediction_entity:
         await safe_edit_message(prediction_entity, msg_id, msg,
                                 label=f"progress #{game_number}")
+
+    # ── Canal 2 — mise à jour progression ────────────────────────────────────
+    ch2_msg_id = pred.get('channel2_message_id')
+    if PREDICTION_CHANNEL_ID2 and ch2_msg_id:
+        prediction_entity2 = await resolve_channel(PREDICTION_CHANNEL_ID2)
+        if prediction_entity2:
+            await safe_edit_message(prediction_entity2, ch2_msg_id, msg,
+                                    label=f"progress2 #{game_number}")
 
     sec_msg_id = pred.get('secondary_message_id')
     sec_channel_id = pred.get('secondary_channel_id')
@@ -3917,14 +3950,16 @@ async def check_prediction_result(game_number: int, player_suits: Set[str], is_f
                 f"sans résolution → suppression du canal"
             )
             stop_animation(original_game)
-            msg_id = pred.get('message_id')
-            if msg_id and PREDICTION_CHANNEL_ID:
-                try:
-                    prediction_entity = await resolve_channel(PREDICTION_CHANNEL_ID)
-                    if prediction_entity:
-                        await client.delete_messages(prediction_entity, [msg_id])
-                except Exception as _e:
-                    logger.debug(f"Suppression message timeout #{original_game}: {_e}")
+            msg_id  = pred.get('message_id')
+            msg_id2 = pred.get('channel2_message_id')
+            for _ch_id, _mid in [(PREDICTION_CHANNEL_ID, msg_id), (PREDICTION_CHANNEL_ID2, msg_id2)]:
+                if _ch_id and _mid:
+                    try:
+                        _ent = await resolve_channel(_ch_id)
+                        if _ent:
+                            await client.delete_messages(_ent, [_mid])
+                    except Exception as _e:
+                        logger.debug(f"Suppression message timeout #{original_game} canal {_ch_id}: {_e}")
             del pending_predictions[original_game]
             save_pending_predictions()
             update_prediction_in_history(original_game, target_suit, game_number, rattrapage, 'perdu')
@@ -4244,14 +4279,17 @@ async def send_bilan_and_reset_at_1440():
         concours_last_pct    = _current_pct
         logger.info(f"💾 Vainqueur concours sauvegardé : {_current_winner} ({_current_pct:.1f}%)")
 
-        canal_entity = await resolve_channel(PREDICTION_CHANNEL_ID)
-        if canal_entity:
-            await client.send_message(canal_entity, concours_txt1, parse_mode='markdown')
-            await asyncio.sleep(2)
-            await client.send_message(canal_entity, concours_txt2, parse_mode='markdown')
-            logger.info("🏆 Messages concours par costume envoyés dans le canal (2 messages).")
-        else:
-            logger.warning("⚠️ Canal introuvable — concours non envoyé dans le canal.")
+        for _ch_id in [PREDICTION_CHANNEL_ID, PREDICTION_CHANNEL_ID2]:
+            if not _ch_id:
+                continue
+            canal_entity = await resolve_channel(_ch_id)
+            if canal_entity:
+                await client.send_message(canal_entity, concours_txt1, parse_mode='markdown')
+                await asyncio.sleep(2)
+                await client.send_message(canal_entity, concours_txt2, parse_mode='markdown')
+                logger.info(f"🏆 Messages concours envoyés dans le canal {_ch_id}.")
+            else:
+                logger.warning(f"⚠️ Canal {_ch_id} introuvable — concours non envoyé.")
     except Exception as e:
         logger.error(f"❌ Erreur envoi concours #1440 canal: {e}")
 
@@ -4531,6 +4569,15 @@ async def process_game_result(game_number: int, player_suits: Set[str], player_c
                         f"⛔ C13 #{game_number} {_sp13} refusée : "
                         f"présent {_pres_count}x consécutif (seuil {PRES_BLOCK_SEUIL})"
                     )
+                elif trig13.get('c2_mirror_blocked'):
+                    # Filtre miroir bloqué : le costume que C13 veut prédire est déjà
+                    # un manque bloqué dans C2 (absent ≥ B fois) → prédiction annulée
+                    _b_pred = compteur2_seuil_B_per_suit.get(_sp13, compteur2_seuil_B)
+                    logger.info(
+                        f"⛔ C13 #{game_number} {_sp13} bloquée : "
+                        f"miroir prédit est manque bloqué C2 "
+                        f"(absent {compteur2_trackers[_sp13].counter}x ≥ B={_b_pred})"
+                    )
                 else:
                     asyncio.create_task(send_compteur13_alert(trig13, game_number))
                     c13_firing = True   # C13 s'impose → C2 bloqué ce jeu
@@ -4692,12 +4739,17 @@ async def cleanup_stale_predictions():
             suit = pred.get('suit', '?')
             logger.warning(f"🧹 #{game_number} ({suit}) expiré (timeout)")
             stop_animation(game_number)
-            prediction_entity = await resolve_channel(PREDICTION_CHANNEL_ID)
-            if prediction_entity and pred.get('message_id'):
-                suit_display = SUIT_DISPLAY.get(suit, suit)
-                expired_msg = f"⏰ **PRÉDICTION #{game_number}**\n🎯 {suit_display}\n⌛ **EXPIRÉE**"
-                await safe_edit_message(prediction_entity, pred['message_id'], expired_msg,
-                                        label=f"expirée #{game_number}", max_retries=2)
+            suit_display = SUIT_DISPLAY.get(suit, suit)
+            expired_msg = f"⏰ **PRÉDICTION #{game_number}**\n🎯 {suit_display}\n⌛ **EXPIRÉE**"
+            for _ch_id, _mid in [
+                (PREDICTION_CHANNEL_ID,  pred.get('message_id')),
+                (PREDICTION_CHANNEL_ID2, pred.get('channel2_message_id')),
+            ]:
+                if _ch_id and _mid:
+                    _ent = await resolve_channel(_ch_id)
+                    if _ent:
+                        await safe_edit_message(_ent, _mid, expired_msg,
+                                                label=f"expirée #{game_number}", max_retries=2)
             del pending_predictions[game_number]
             save_pending_predictions()
 
@@ -4765,13 +4817,17 @@ async def auto_watchdog_task():
                         stop_animation(gn)
                         suit = pred.get('suit', '?')
                         actions.append(f"🧹 Prédiction #{gn} ({suit}) forcée hors mémoire")
-                        entity = await resolve_channel(PREDICTION_CHANNEL_ID)
-                        if entity and pred.get('message_id'):
-                            sd = SUIT_DISPLAY.get(suit, suit)
-                            await safe_edit_message(
-                                entity, pred['message_id'],
-                                f"⏰ **PRÉDICTION #{gn}**\n🎯 {sd}\n⌛ **EXPIRÉE (watchdog)**",
-                                label=f"watchdog #{gn}", max_retries=2)
+                        sd = SUIT_DISPLAY.get(suit, suit)
+                        wd_msg = f"⏰ **PRÉDICTION #{gn}**\n🎯 {sd}\n⌛ **EXPIRÉE (watchdog)**"
+                        for _ch_id, _mid in [
+                            (PREDICTION_CHANNEL_ID,  pred.get('message_id')),
+                            (PREDICTION_CHANNEL_ID2, pred.get('channel2_message_id')),
+                        ]:
+                            if _ch_id and _mid:
+                                _ent = await resolve_channel(_ch_id)
+                                if _ent:
+                                    await safe_edit_message(_ent, _mid, wd_msg,
+                                                            label=f"watchdog #{gn}", max_retries=2)
 
             # ── 2. Tous les costumes simultanément bloqués ──────────────────
             blocked_suits = [s for s in ALL_SUITS if s in suit_block_until and now < suit_block_until[s]]
@@ -6105,6 +6161,10 @@ async def cmd_help(event):
         f"`/raison` — 15 dernières prédictions + raison détaillée\n"
         f"`/raison N` — Raison pour le jeu #N\n"
         f"`/raison pdf` — PDF complet de toutes les prédictions\n"
+        f"`/raison2` — Top 10 meilleures combinaisons (miroir × wx × B)\n"
+        f"`/raison2 pdf` — PDF complet de la simulation (108 combinaisons)\n"
+        f"`/raison2 P1` `/raison2 P2` `/raison2 P3` — Tableau détaillé par miroir\n"
+        f"`/raison2 tout` — Toutes les 108 combinaisons triées\n"
         f"`/pending` — Prédictions en vérification\n"
         f"`/queue` — File d'attente\n"
         f"`/status` — Statut complet\n"
@@ -6132,7 +6192,7 @@ async def cmd_strategie(event):
     combinaisons miroir/inverse possibles, recommande la meilleure et demande
     confirmation ('Oui N') pour l'appliquer immédiatement.
     """
-    global pending_strategy_proposal
+    global pending_strategy_proposal, last_strategy_simulation
 
     if event.is_group or event.is_channel:
         return
@@ -6233,41 +6293,31 @@ async def cmd_strategie(event):
         by_type[t][r['class']] += 1
         by_type[t]['total']    += 1
 
-    # ── Toutes les combinaisons miroir + inverse possibles ──────────────────
-    # Il existe exactement 3 façons de former des paires parfaites avec 4 costumes :
-    #   P1 : ♦↔♥ / ♣↔♠
+    # ── 3 combinaisons miroir possibles entre les 4 costumes ────────────────
+    # Il existe exactement 3 façons de former des paires miroir parfaites :
+    #   P1 : ♦↔♥ / ♣↔♠  (miroir par défaut)
     #   P2 : ♦↔♣ / ♥↔♠
     #   P3 : ♦↔♠ / ♥↔♣
-    # Chaque combo = miroir=Px + inverse=Py (x≠y) → 3×2 = 6 combos
-    _PAIRINGS = [
-        {'id':'P1','dict':{'♦':'♥','♥':'♦','♣':'♠','♠':'♣'},'disp':'♦️↔️❤️ / ♣️↔️♠️'},
-        {'id':'P2','dict':{'♦':'♣','♣':'♦','♥':'♠','♠':'♥'},'disp':'♦️↔️♣️ / ❤️↔️♠️'},
-        {'id':'P3','dict':{'♦':'♠','♠':'♦','♥':'♣','♣':'♥'},'disp':'♦️↔️♠️ / ❤️↔️♣️'},
+    COMBOS = [
+        {
+            'num':    1,
+            'name':   'Joker Alpha (P1)',
+            'mirror': {'♦':'♥','♥':'♦','♣':'♠','♠':'♣'},
+            'disp':   '♦️↔️❤️ / ♣️↔️♠️',
+        },
+        {
+            'num':    2,
+            'name':   'Kouamé Standard (P2)',
+            'mirror': {'♦':'♣','♣':'♦','♥':'♠','♠':'♥'},
+            'disp':   '♦️↔️♣️ / ❤️↔️♠️',
+        },
+        {
+            'num':    3,
+            'name':   'Kouamé Delta (P3)',
+            'mirror': {'♦':'♠','♠':'♦','♥':'♣','♣':'♥'},
+            'disp':   '♦️↔️♠️ / ❤️↔️♣️',
+        },
     ]
-    _COMBO_NAMES = {
-        ('P1','P2'): 'Joker Alpha',
-        ('P1','P3'): 'Joker Bêta',
-        ('P2','P1'): 'Kouamé Standard',
-        ('P2','P3'): 'Kouamé Alpha',
-        ('P3','P1'): 'Kouamé Delta',
-        ('P3','P2'): 'Kouamé Sigma',
-    }
-    COMBOS = []
-    n = 1
-    for _mir in _PAIRINGS:
-        for _inv in _PAIRINGS:
-            if _mir['id'] == _inv['id']:
-                continue
-            _key  = (_mir['id'], _inv['id'])
-            COMBOS.append({
-                'num':      n,
-                'name':     _COMBO_NAMES.get(_key, f"Combo {n}"),
-                'mirror':   _mir['dict'],
-                'inverse':  _inv['dict'],
-                'disp_mir': _mir['disp'],
-                'disp_inv': _inv['disp'],
-            })
-            n += 1
 
     # ── Propositions supplémentaires (paramètres wx / df) ──────────────────
     PARAM_PROPOSALS = []
@@ -6305,14 +6355,14 @@ async def cmd_strategie(event):
         if losing_suits:
             ls_disp = '/'.join(SUIT_DISPLAY.get(s, s) for s in losing_suits)
             if has_sp and not has_dc:
-                recommended_num    = _combo_num_by_name('Kouamé Alpha')
-                recommended_reason = f"{ls_disp} perdent → miroirs ♦↔♣/❤↔♠ suggérés"
+                recommended_num    = _combo_num_by_name('Kouamé Standard (P2)')
+                recommended_reason = f"{ls_disp} perdent → essayer ♦↔♣/❤↔♠"
             elif has_dc and not has_sp:
-                recommended_num    = _combo_num_by_name('Kouamé Standard')
-                recommended_reason = f"{ls_disp} perdent → renforcer wx C13"
+                recommended_num    = _combo_num_by_name('Kouamé Delta (P3)')
+                recommended_reason = f"{ls_disp} perdent → essayer ♦↔♠/❤↔♣"
             else:
-                recommended_num    = _combo_num_by_name('Kouamé Delta')
-                recommended_reason = f"{ls_disp} perdent → paires croisées"
+                recommended_num    = _combo_num_by_name('Joker Alpha (P1)')
+                recommended_reason = f"{ls_disp} perdent → revenir au miroir par défaut ♦↔♥/♣↔♠"
         elif PARAM_PROPOSALS:
             recommended_num    = PARAM_PROPOSALS[0]['num']
             recommended_reason = PARAM_PROPOSALS[0]['name']
@@ -6379,8 +6429,21 @@ async def cmd_strategie(event):
                          f"{v['gagnes']} gagnées / {v['perdus']} perdues{flag}")
         lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
-    # ── Test silencieux : simuler chaque combo sur l'historique C13 ─────────
-    cur_mirror  = dict(COMPTEUR13_MIRROR)
+    # ── Test silencieux 108 combinaisons (miroir × wx × B) ──────────────────
+    # Dimensions :
+    #   - 3 combinaisons miroir (P1, P2, P3)
+    #   - wx (seuil C13) de 3 à 8
+    #   - B  (seuil C2)  de 3 à 8
+    # Pour chaque (miroir, wx, B) :
+    #   Filtrer les prédictions C13 où count >= wx
+    #   sim_suit = miroir[suit_consec]
+    #   Si c2_absence >= B → C2 confirme → offset +1 (prédit un jeu plus tard)
+    #   Comparer sim_suit à actual_pred, lire le statut → score
+
+    _WX_RANGE = range(3, 9)   # 3,4,5,6,7,8
+    _B_RANGE  = range(3, 9)   # 3,4,5,6,7,8
+
+    cur_mirror = dict(COMPTEUR13_MIRROR)
     c13_sim_items = [
         p for p in prediction_history
         if p.get('type') == 'compteur13'
@@ -6388,45 +6451,90 @@ async def cmd_strategie(event):
         and p.get('status') not in ('en_cours', 'sending', None)
     ]
 
-    # Score par combo : compter prédictions identiques/différentes vs historique
+    # sim_matrix[(combo_num, wx, b)] = {wins, losses, c2_conf_wins, c2_conf_losses, total, score}
+    sim_matrix = {}
+    for c in COMBOS:
+        for wx in _WX_RANGE:
+            for b in _B_RANGE:
+                wins = losses = c2_conf_wins = c2_conf_losses = total_wx = 0
+                for p in c13_sim_items:
+                    meta        = p.get('meta', {})
+                    sc          = meta.get('suit_consec', '')
+                    p_count     = meta.get('count', 0)
+                    c2_absence  = meta.get('c2_absence_count', 0)
+                    actual_pred = p.get('suit', '')
+                    st          = p.get('status', '')
+
+                    if p_count < wx:
+                        continue   # ce wx ne se serait pas déclenché
+
+                    sim_suit    = c['mirror'].get(sc, '?')
+                    c2_confirms = (c2_absence >= b)
+
+                    if sim_suit == actual_pred:
+                        if 'gagne' in st:
+                            wins += 1
+                            if c2_confirms:
+                                c2_conf_wins += 1
+                        else:
+                            losses += 1
+                            if c2_confirms:
+                                c2_conf_losses += 1
+                    total_wx += 1
+
+                score_val = (wins - losses) if total_wx > 0 else -99
+                sim_matrix[(c['num'], wx, b)] = {
+                    'wins':           wins,
+                    'losses':         losses,
+                    'c2_conf_wins':   c2_conf_wins,
+                    'c2_conf_losses': c2_conf_losses,
+                    'total':          total_wx,
+                    'score':          score_val,
+                }
+
+    # ── Trouver la meilleure combinaison globale ─────────────────────────────
+    # Parmi les entrées avec au moins 3 prédictions qualifiantes
+    valid_entries = {k: v for k, v in sim_matrix.items() if v['total'] >= 3}
+    best_combo_key = None
+    best_combo_val = None
+    if valid_entries:
+        best_combo_key, best_combo_val = max(valid_entries.items(), key=lambda x: x[1]['score'])
+
+    # Recommandation basée sur le test silencieux 108 combos
+    if best_combo_key and not recommended_num:
+        bck_mirror, bck_wx, bck_b = best_combo_key
+        bck_name = next((c['name'] for c in COMBOS if c['num'] == bck_mirror), f"P{bck_mirror}")
+        recommended_num    = bck_mirror   # on recommande la combinaison miroir
+        recommended_reason = (
+            f"Meilleur score ({best_combo_val['score']:+d} pts) avec {bck_name} "
+            f"wx={bck_wx} B={bck_b} sur {best_combo_val['total']} prédictions C13"
+        )
+
+    # ── Pour chaque combo miroir : meilleur (wx, B) et score résumé ─────────
+    # combo_scores garde le résumé par miroir pour l'affichage simple
     combo_scores = {}
     for c in COMBOS:
-        same_win = same_loss = diff_from_loss = diff_from_win = 0
-        for p in c13_sim_items:
-            sc  = p['meta']['suit_consec']
-            c2c = p['meta'].get('c2_confirmed', False)
-            actual_pred = p['suit']
-            st  = p.get('status', '')
-            sim_suit = c['inverse'].get(sc, '?') if c2c else c['mirror'].get(sc, '?')
-            if sim_suit == actual_pred:
-                if 'gagne' in st:
-                    same_win  += 1
-                else:
-                    same_loss += 1
-            else:
-                if 'perdu' in st:
-                    diff_from_loss += 1   # était perdu → diff combo aurait pu récupérer
-                else:
-                    diff_from_win  += 1   # était gagné → diff combo aurait pu rater
-        total_sim = len(c13_sim_items)
-        # Score = wins confirmés + bonus récupérations potentielles - malus pertes potentielles
-        # (score pondéré pour classer les combos)
-        score_val = same_win + 0.5 * diff_from_loss - 0.5 * diff_from_win if total_sim > 0 else -1
-        combo_scores[c['num']] = {
-            'same_win': same_win, 'same_loss': same_loss,
-            'diff_from_loss': diff_from_loss, 'diff_from_win': diff_from_win,
-            'total': total_sim, 'score': score_val,
-        }
+        entries_for_c = {(wx, b): sim_matrix[(c['num'], wx, b)]
+                         for wx in _WX_RANGE for b in _B_RANGE}
+        valid_c = {k: v for k, v in entries_for_c.items() if v['total'] >= 3}
+        if valid_c:
+            best_wb, best_v = max(valid_c.items(), key=lambda x: x[1]['score'])
+            combo_scores[c['num']] = {
+                'best_wx':    best_wb[0],
+                'best_b':     best_wb[1],
+                'best_score': best_v['score'],
+                'best_wins':  best_v['wins'],
+                'best_losses':best_v['losses'],
+                'best_total': best_v['total'],
+                'c2_conf_wins':   best_v['c2_conf_wins'],
+                'c2_conf_losses': best_v['c2_conf_losses'],
+            }
+        else:
+            combo_scores[c['num']] = None
 
-    # Recommandation basée sur le score silencieux (si assez de données)
-    if len(c13_sim_items) >= 3 and not recommended_num:
-        best = max(combo_scores.items(), key=lambda x: x[1]['score'])
-        recommended_num = best[0]
-        recommended_reason = f"Meilleur score test silencieux ({best[1]['score']:.1f} pts sur {best[1]['total']} prédictions C13)"
-
-    # ── Tableau de toutes les combinaisons ──────────────────────────────────
-    lines.append("🔄 **COMBINAISONS MIROIR / INVERSE — TEST SILENCIEUX**")
-    lines.append(f"_(6 combinaisons possibles · {len(c13_sim_items)} prédictions C13 analysées)_")
+    # ── Tableau des 3 combinaisons miroir ───────────────────────────────────
+    lines.append("🔄 **COMBINAISONS MIROIR — TEST SILENCIEUX**")
+    lines.append(f"_(3 combinaisons × wx3-8 × B3-8 = 108 tests · {len(c13_sim_items)} prédictions C13)_")
     lines.append("")
     for c in COMBOS:
         is_active = (c['mirror'] == cur_mirror)
@@ -6437,19 +6545,21 @@ async def cmd_strategie(event):
         if is_reco:
             tag += " ⭐ RECOMMANDÉ"
         lines.append(f"**{c['num']}. {c['name']}**{tag}")
-        lines.append(f"   Miroir  : {c['disp_mir']}")
-        lines.append(f"   Inverse : {c['disp_inv']}")
-        sc = combo_scores.get(c['num'])
-        if sc and sc['total'] > 0:
+        lines.append(f"   Paires : {c['disp']}")
+        sc_data = combo_scores.get(c['num'])
+        if sc_data:
             lines.append(
-                f"   🔬 Simulation : ✅{sc['same_win']} confirmés | "
-                f"❌{sc['same_loss']} perdus | "
-                f"⬆️{sc['diff_from_loss']} récup. potentielles | "
-                f"⬇️{sc['diff_from_win']} gains potentiels perdus | "
-                f"Score: {sc['score']:.1f}"
+                f"   🔬 Meilleur : wx={sc_data['best_wx']} B={sc_data['best_b']} → "
+                f"✅{sc_data['best_wins']} gagnés | ❌{sc_data['best_losses']} perdus | "
+                f"Score: {sc_data['best_score']:+d} sur {sc_data['best_total']} prédictions"
             )
+            if sc_data['c2_conf_wins'] + sc_data['c2_conf_losses'] > 0:
+                lines.append(
+                    f"   📊 Quand C2 confirme (B atteint) : "
+                    f"✅{sc_data['c2_conf_wins']} / ❌{sc_data['c2_conf_losses']}"
+                )
         else:
-            lines.append("   🔬 Simulation : données insuffisantes (accumulation en cours)")
+            lines.append("   🔬 Données insuffisantes (accumulation en cours)")
         lines.append("")
 
     if PARAM_PROPOSALS:
@@ -6481,6 +6591,24 @@ async def cmd_strategie(event):
         'combos':        COMBOS,
         'param_props':   PARAM_PROPOSALS,
         'expires':       datetime.now().timestamp() + 300,  # 5 min
+    }
+
+    # ── Sauvegarder la simulation silencieuse pour /raison2 ─────────────────
+    last_strategy_simulation = {
+        'timestamp':          datetime.now(),
+        'combos':             COMBOS,
+        'combo_scores':       combo_scores,       # résumé par miroir (meilleur wx/B)
+        'sim_matrix':         sim_matrix,          # matrice complète 108 combinaisons
+        'best_combo_key':     best_combo_key,      # (combo_num, wx, b) global best
+        'best_combo_val':     best_combo_val,
+        'param_proposals':    PARAM_PROPOSALS,
+        'recommended_num':    recommended_num,
+        'recommended_reason': recommended_reason,
+        'total_c13':          len(c13_sim_items),
+        'total_analysed':     total,
+        'verdict':            verdict,
+        'vd':                 vd,
+        'r0c': r0c, 'r1c': r1c, 'r2c': r2c, 'r3c': r3c, 'pdc': pdc,
     }
 
     await event.respond("\n".join(lines))
@@ -6536,10 +6664,7 @@ async def cmd_oui(event):
         COMPTEUR13_MIRROR.clear()
         COMPTEUR13_MIRROR.update(combo_match['mirror'])
         changes_applied.append(
-            f"✅ Miroir C13 → **{combo_match['disp_mir']}**"
-        )
-        changes_applied.append(
-            f"✅ Inverse C13 → **{combo_match['disp_inv']}**"
+            f"✅ Combinaison miroir C13 → **{combo_match['disp']}**"
         )
         logger.info(
             f"🔄 Stratégie '{combo_match['name']}' appliquée : "
@@ -6707,6 +6832,276 @@ def pdf_safe(text: str) -> str:
     for old, new in subs:
         text = text.replace(old, new)
     return text
+
+
+def generate_raison2_pdf(sim: dict) -> bytes:
+    """Génère un PDF rapport complet de la simulation C13 (108 combinaisons miroir × wx × B)."""
+    combos     = sim.get('combos', [])
+    sim_matrix = sim.get('sim_matrix', {})
+    ts         = sim['timestamp'].strftime('%d/%m/%Y %H:%M:%S')
+    total_c13  = sim.get('total_c13', 0)
+    total_an   = sim.get('total_analysed', 0)
+    verdict    = sim.get('verdict', '')
+    best_key   = sim.get('best_combo_key')
+    best_val   = sim.get('best_combo_val')
+    rec_num    = sim.get('recommended_num')
+    rec_reason = sim.get('recommended_reason', '')
+
+    _COMBO_NAMES = {c['num']: c['name'] for c in combos}
+    _COMBO_DISP  = {c['num']: c.get('disp', '?') for c in combos}
+
+    VIOLET  = (90, 0, 160)
+    PURPLE2 = (130, 50, 200)
+    WHITE   = (255, 255, 255)
+    DARK    = (30, 30, 30)
+    GREY    = (100, 100, 100)
+    GREEN   = (0, 130, 0)
+    RED     = (190, 0, 0)
+    GOLD    = (180, 130, 0)
+    BG_ALT  = (245, 240, 255)
+    BG_P1   = (230, 245, 255)
+    BG_P2   = (230, 255, 230)
+    BG_P3   = (255, 245, 225)
+    BG_BEST = (255, 248, 200)
+
+    COMBO_COLORS = {1: BG_P1, 2: BG_P2, 3: BG_P3}
+
+    pdf = FPDF(orientation='L', format='A4')
+    pdf.set_auto_page_break(auto=True, margin=12)
+    pdf.set_margins(8, 8, 8)
+    pdf.add_page()
+
+    # ── Titre ─────────────────────────────────────────────────────────────────
+    pdf.set_font('Helvetica', 'B', 17)
+    pdf.set_fill_color(*VIOLET)
+    pdf.set_text_color(*WHITE)
+    pdf.cell(0, 13, 'BACCARAT AI  -  SIMULATION C13  (108 COMBINAISONS)', new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C', fill=True)
+    pdf.ln(2)
+
+    pdf.set_font('Helvetica', '', 9)
+    pdf.set_text_color(*GREY)
+    pdf.cell(0, 6,
+        f"Genere le {datetime.now().strftime('%d/%m/%Y %H:%M')}  |  "
+        f"Derniere simulation : {ts}  |  "
+        f"{total_c13} predictions C13 simulees  |  "
+        f"{total_an} predictions totales analysees",
+        new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C')
+    pdf.ln(3)
+
+    # ── Verdict global ─────────────────────────────────────────────────────────
+    pdf.set_font('Helvetica', 'B', 10)
+    pdf.set_text_color(*DARK)
+    pdf.cell(0, 7, pdf_safe(verdict), new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C')
+    pdf.ln(2)
+
+    # ── Meilleure configuration ────────────────────────────────────────────────
+    if best_key and best_val:
+        bm, bwx, bb = best_key
+        pdf.set_fill_color(*BG_BEST)
+        pdf.set_draw_color(*GOLD)
+        pdf.set_font('Helvetica', 'B', 10)
+        pdf.set_text_color(*GOLD)
+        txt = (f"MEILLEURE CONFIGURATION GLOBALE :  {_COMBO_NAMES.get(bm,'?')}  |  "
+               f"wx={bwx}  |  B={bb}  |  Paires : {pdf_safe(_COMBO_DISP.get(bm,'?'))}")
+        pdf.cell(0, 8, txt, border=1, new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C', fill=True)
+        pdf.set_font('Helvetica', '', 9)
+        pdf.set_text_color(*DARK)
+        stats = (f"Gagnes : {best_val['wins']}   |   Perdus : {best_val['losses']}   |   "
+                 f"Score : {best_val['score']:+d}   |   Predictions qualifiees : {best_val['total']}")
+        pdf.cell(0, 6, stats, new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C', fill=True)
+        pdf.ln(4)
+
+    if rec_num:
+        pdf.set_font('Helvetica', 'B', 9)
+        pdf.set_text_color(*PURPLE2)
+        pdf.cell(0, 6, f"Recommandation : Oui {rec_num}  -  {pdf_safe(rec_reason)}",
+                 new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C')
+        pdf.ln(3)
+
+    # ── TABLE PRINCIPALE — toutes les 108 combinaisons ─────────────────────────
+    # Trier par score décroissant
+    sorted_entries = sorted(
+        [(k, v) for k, v in sim_matrix.items() if v['total'] >= 1],
+        key=lambda x: x[1]['score'],
+        reverse=True
+    )
+
+    # Colonnes (paysage A4 = 277mm, marges 16 → 261 mm utiles)
+    cw = [8, 42, 38, 14, 14, 20, 20, 22, 18, 22, 20, 25]
+    headers = ['#', 'Miroir', 'Paires', 'wx', 'B', 'Gagnes', 'Perdus',
+               'Score', 'C2 wins', 'C2 losses', 'Total pred.', 'Score/Total']
+
+    pdf.set_font('Helvetica', 'B', 8)
+    pdf.set_fill_color(*VIOLET)
+    pdf.set_text_color(*WHITE)
+    for h, w in zip(headers, cw):
+        pdf.cell(w, 8, h, border=1, fill=True, align='C')
+    pdf.ln()
+
+    pdf.set_font('Helvetica', '', 8)
+    for rank, (key, val) in enumerate(sorted_entries, 1):
+        combo_n, wx, b = key
+        is_best = (key == best_key)
+        bg = BG_BEST if is_best else COMBO_COLORS.get(combo_n, (255, 255, 255))
+        wins      = val['wins']
+        losses    = val['losses']
+        score     = val['score']
+        total     = val['total']
+        c2w       = val.get('c2_conf_wins', 0)
+        c2l       = val.get('c2_conf_losses', 0)
+        score_pct = f"{score/total*100:+.0f}%" if total else '--'
+
+        pdf.set_fill_color(*bg)
+        pdf.set_text_color(*DARK)
+        row = [
+            str(rank),
+            _COMBO_NAMES.get(combo_n, f'P{combo_n}'),
+            pdf_safe(_COMBO_DISP.get(combo_n, '?')),
+            str(wx),
+            str(b),
+            str(wins),
+            str(losses),
+            f"{score:+d}",
+            str(c2w),
+            str(c2l),
+            str(total),
+            score_pct,
+        ]
+        aligns = ['C', 'L', 'L', 'C', 'C', 'C', 'C', 'C', 'C', 'C', 'C', 'C']
+        for val_txt, w, align in zip(row, cw, aligns):
+            # Colore le score
+            if val_txt.startswith('+') and val_txt != '+0':
+                pdf.set_text_color(*GREEN)
+            elif val_txt.startswith('-'):
+                pdf.set_text_color(*RED)
+            else:
+                pdf.set_text_color(*DARK)
+            pdf.cell(w, 7, val_txt, border=1, fill=True, align=align)
+        pdf.ln()
+
+    # ── TABLEAUX DÉTAILLÉS PAR MIROIR (une section par miroir) ─────────────────
+    for cnum in [1, 2, 3]:
+        cname = _COMBO_NAMES.get(cnum, f'P{cnum}')
+        cdisp = pdf_safe(_COMBO_DISP.get(cnum, '?'))
+        bg_hdr = COMBO_COLORS.get(cnum, (240, 240, 240))
+
+        pdf.add_page()
+        pdf.set_font('Helvetica', 'B', 12)
+        pdf.set_fill_color(*VIOLET)
+        pdf.set_text_color(*WHITE)
+        pdf.cell(0, 10, f"DETAIL — {cname}  |  Paires : {cdisp}",
+                 new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C', fill=True)
+        pdf.ln(4)
+
+        # Tableau croisé wx (lignes) × B (colonnes)
+        cell_w = 36
+        cell_h = 9
+        b_vals  = list(range(3, 9))
+        wx_vals = list(range(3, 9))
+
+        # En-tête colonnes B
+        pdf.set_font('Helvetica', 'B', 9)
+        pdf.set_fill_color(*VIOLET)
+        pdf.set_text_color(*WHITE)
+        pdf.cell(14, cell_h, 'wx \\ B', border=1, fill=True, align='C')
+        for b in b_vals:
+            pdf.cell(cell_w, cell_h, f"B = {b}", border=1, fill=True, align='C')
+        pdf.ln()
+
+        for wx in wx_vals:
+            # Numéro de ligne
+            pdf.set_fill_color(*bg_hdr)
+            pdf.set_font('Helvetica', 'B', 9)
+            pdf.set_text_color(*DARK)
+            pdf.cell(14, cell_h, f"wx={wx}", border=1, fill=True, align='C')
+
+            for b in b_vals:
+                v = sim_matrix.get((cnum, wx, b))
+                if v and v['total'] >= 1:
+                    sc = v['score']
+                    tot = v['total']
+                    label = f"Score:{sc:+d}  ({tot} pred.)"
+                    txt2  = f"V:{v['wins']} / D:{v['losses']}"
+                    is_b  = ((cnum, wx, b) == best_key)
+                    cell_bg = BG_BEST if is_b else (
+                        (220, 255, 220) if sc > 0 else
+                        (255, 220, 220) if sc < 0 else
+                        (245, 245, 245)
+                    )
+                    pdf.set_fill_color(*cell_bg)
+                    pdf.set_font('Helvetica', 'B', 8)
+                    sc_color = GREEN if sc > 0 else (RED if sc < 0 else GREY)
+                    pdf.set_text_color(*sc_color)
+                    # Cellule multi-ligne (simulée avec 2 cellules empilées)
+                    x0 = pdf.get_x()
+                    y0 = pdf.get_y()
+                    pdf.cell(cell_w, cell_h // 2 + 1, label, border='LTR', fill=True, align='C')
+                    pdf.ln()
+                    pdf.set_x(x0)
+                    pdf.set_font('Helvetica', '', 7)
+                    pdf.set_text_color(*DARK)
+                    pdf.cell(cell_w, cell_h // 2, txt2, border='LBR', fill=True, align='C')
+                    pdf.set_xy(x0 + cell_w, y0)
+                else:
+                    pdf.set_fill_color(250, 250, 250)
+                    pdf.set_font('Helvetica', '', 8)
+                    pdf.set_text_color(*GREY)
+                    pdf.cell(cell_w, cell_h, '--', border=1, fill=True, align='C')
+            pdf.ln()
+
+        pdf.ln(4)
+        pdf.set_font('Helvetica', 'I', 8)
+        pdf.set_text_color(*GREY)
+        pdf.cell(0, 5,
+            'Score = Victoires - Defaites  |  pred. = predictions qualifiees (count >= wx)  |  '
+            'Jaune = meilleure configuration globale',
+            new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C')
+
+    # ── Pied de page final ────────────────────────────────────────────────────
+    pdf.add_page()
+    pdf.set_font('Helvetica', 'B', 13)
+    pdf.set_fill_color(*VIOLET)
+    pdf.set_text_color(*WHITE)
+    pdf.cell(0, 10, 'RESUME GLOBAL', new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C', fill=True)
+    pdf.ln(5)
+
+    # Résumé par miroir
+    for cnum in [1, 2, 3]:
+        cname = _COMBO_NAMES.get(cnum, f'P{cnum}')
+        cdisp = pdf_safe(_COMBO_DISP.get(cnum, '?'))
+        # Trouver le meilleur (wx, B) pour ce miroir
+        best_sub = None
+        best_sub_val = None
+        for wx in range(3, 9):
+            for b in range(3, 9):
+                v = sim_matrix.get((cnum, wx, b))
+                if v and v['total'] >= 1:
+                    if best_sub_val is None or v['score'] > best_sub_val['score']:
+                        best_sub = (wx, b)
+                        best_sub_val = v
+        pdf.set_fill_color(*COMBO_COLORS.get(cnum, (240, 240, 240)))
+        pdf.set_font('Helvetica', 'B', 10)
+        pdf.set_text_color(*DARK)
+        pdf.cell(0, 8, f"{cname}  |  {cdisp}",
+                 new_x=XPos.LMARGIN, new_y=YPos.NEXT, border=1, fill=True)
+        if best_sub and best_sub_val:
+            wx_b, b_b = best_sub
+            pdf.set_font('Helvetica', '', 9)
+            pdf.cell(0, 7,
+                f"  Meilleur wx={wx_b}  B={b_b}  |  "
+                f"Gagnes:{best_sub_val['wins']}  Perdus:{best_sub_val['losses']}  "
+                f"Score:{best_sub_val['score']:+d}  sur {best_sub_val['total']} predictions",
+                new_x=XPos.LMARGIN, new_y=YPos.NEXT, border=1)
+        pdf.ln(3)
+
+    pdf.ln(6)
+    pdf.set_font('Helvetica', 'I', 8)
+    pdf.set_text_color(*GREY)
+    pdf.cell(0, 5,
+        f"Rapport genere le {datetime.now().strftime('%d/%m/%Y  %H:%M')}  -  BACCARAT AI",
+        new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C')
+
+    return pdf.output()
 
 
 def generate_raison_pdf() -> bytes:
@@ -7023,6 +7418,192 @@ async def cmd_raison(event):
         lines.append(format_pred_block(pred, index=i))
         lines.append("")
     lines.append("📄 `/raison pdf` — PDF complet | 🔎 `/raison N` — Jeu #N")
+    await event.respond("\n".join(lines), parse_mode='markdown')
+
+
+async def cmd_raison2(event):
+    """
+    /raison2        — Top 10 des meilleures combinaisons (miroir × wx × B)
+    /raison2 pdf    — PDF complet de la simulation (108 combinaisons + tableaux détaillés)
+    /raison2 tout   — Toutes les 108 combinaisons triées par score
+    /raison2 P1     — Détail complet de la combinaison miroir P1 (toutes ses wx/B)
+    /raison2 P2     — Idem pour P2
+    /raison2 P3     — Idem pour P3
+    """
+    if event.is_group or event.is_channel:
+        return
+    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+        await event.respond("🔒 Admin uniquement")
+        return
+
+    if not last_strategy_simulation:
+        await event.respond(
+            "❌ Aucun test silencieux disponible.\n"
+            "Lance `/strategie` d'abord pour générer la simulation."
+        )
+        return
+
+    sim        = last_strategy_simulation
+    ts         = sim['timestamp'].strftime('%d/%m/%Y %H:%M:%S')
+    combos     = sim.get('combos', [])
+    sim_matrix = sim.get('sim_matrix', {})
+    total_c13  = sim.get('total_c13', 0)
+    total_an   = sim.get('total_analysed', 0)
+    verdict    = sim.get('verdict', '')
+    vd         = sim.get('vd', '')
+    rec_num    = sim.get('recommended_num')
+    rec_reason = sim.get('recommended_reason', '')
+    best_key   = sim.get('best_combo_key')
+    best_val   = sim.get('best_combo_val')
+    cur_mirror = dict(COMPTEUR13_MIRROR)
+
+    _COMBO_NAMES = {c['num']: c['name'] for c in combos}
+    _COMBO_DISP  = {c['num']: c.get('disp', '?') for c in combos}
+    _COMBO_MIR   = {c['num']: c['mirror'] for c in combos}
+
+    parts = event.message.message.strip().split()
+    sub   = parts[1].upper() if len(parts) > 1 else ''
+
+    # ── En-tête commun ───────────────────────────────────────────────────────
+    lines = [
+        "╔══════════════════════════════╗",
+        "║  🔬 RAISON2 — TEST SILENCIEUX ║",
+        "╚══════════════════════════════╝",
+        f"🕒 {ts}  |  {total_c13} prédictions C13  |  108 combinaisons testées",
+        f"📊 {total_an} prédictions totales analysées",
+        f"**{verdict}** — _{vd}_",
+        "",
+    ]
+
+    if best_key:
+        bm, bwx, bb = best_key
+        lines.append(
+            f"🏆 **MEILLEURE CONFIGURATION GLOBALE :**"
+        )
+        lines.append(
+            f"   {_COMBO_NAMES.get(bm,'?')} | wx={bwx} | B={bb}"
+        )
+        lines.append(
+            f"   Paires : {_COMBO_DISP.get(bm,'?')}"
+        )
+        if best_val:
+            lines.append(
+                f"   ✅{best_val['wins']} gagnés | ❌{best_val['losses']} perdus | "
+                f"Score: {best_val['score']:+d} sur {best_val['total']} prédictions"
+            )
+        lines.append("")
+        lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        lines.append("")
+
+    if not sim_matrix:
+        lines.append("_Données insuffisantes — accumulation en cours._")
+        await event.respond("\n".join(lines), parse_mode='markdown')
+        return
+
+    # ── Mode PDF ─────────────────────────────────────────────────────────────
+    if sub == 'PDF':
+        if not sim_matrix:
+            await event.respond(
+                "❌ Données insuffisantes pour générer le PDF.\n"
+                "Lance `/strategie` d'abord."
+            )
+            return
+        await event.respond("⏳ Génération du PDF en cours…")
+        try:
+            pdf_bytes = generate_raison2_pdf(sim)
+            buf = io.BytesIO(pdf_bytes)
+            buf.name = f"simulation_c13_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+            await event.respond(
+                file=buf,
+                message=(
+                    f"📄 **Rapport Simulation C13 — {datetime.now().strftime('%d/%m/%Y %H:%M')}**\n"
+                    f"108 combinaisons (miroir × wx × B) — {total_c13} prédictions C13 simulées"
+                )
+            )
+        except Exception as e:
+            await event.respond(f"❌ Erreur génération PDF : {e}")
+        return
+
+    # ── Mode détail par combinaison miroir (P1 / P2 / P3) ──────────────────
+    if sub in ('P1', 'P2', 'P3'):
+        pnum = {'P1': 1, 'P2': 2, 'P3': 3}[sub]
+        cname = _COMBO_NAMES.get(pnum, sub)
+        cdisp = _COMBO_DISP.get(pnum, '?')
+        c_active = (_COMBO_MIR.get(pnum) == cur_mirror)
+        act_tag  = " ◀ ACTIF" if c_active else ""
+        lines.append(f"**📋 DÉTAIL — {cname}{act_tag}**")
+        lines.append(f"Paires : {cdisp}")
+        lines.append("")
+        lines.append(f"{'wx\\B':>5}  " + "  ".join(f"B={b}" for b in range(3, 9)))
+        lines.append("─" * 50)
+        for wx in range(3, 9):
+            row_parts = []
+            for b in range(3, 9):
+                v = sim_matrix.get((pnum, wx, b))
+                if v and v['total'] >= 1:
+                    row_parts.append(f"{v['score']:+3d}({v['total']})")
+                else:
+                    row_parts.append("  --  ")
+            lines.append(f"wx={wx}:  " + "  ".join(row_parts))
+        lines.append("")
+        lines.append("_Format : Score(nb prédictions qualifiantes)_")
+        lines.append(f"_Score = victoires − défaites_")
+        await event.respond("\n".join(lines), parse_mode='markdown')
+        return
+
+    # ── Mode liste complète (/raison2 tout) ──────────────────────────────────
+    show_all = (sub == 'TOUT')
+
+    # Trier toutes les entrées par score décroissant
+    sorted_entries = sorted(
+        [(k, v) for k, v in sim_matrix.items() if v['total'] >= 3],
+        key=lambda x: x[1]['score'],
+        reverse=True
+    )
+
+    limit = len(sorted_entries) if show_all else min(10, len(sorted_entries))
+    title = "TOUTES LES COMBINAISONS" if show_all else "TOP 10 MEILLEURES COMBINAISONS"
+
+    lines.append(f"🏅 **{title}** _(miroir × wx × B · min. 3 prédictions)_")
+    lines.append("")
+
+    for rank, (key, val) in enumerate(sorted_entries[:limit], 1):
+        combo_n, wx, b = key
+        cname   = _COMBO_NAMES.get(combo_n, f"P{combo_n}")
+        cdisp   = _COMBO_DISP.get(combo_n, '?')
+        c_active= (_COMBO_MIR.get(combo_n) == cur_mirror and
+                   wx == COMPTEUR13_THRESHOLD and
+                   b  == compteur2_seuil_B)
+        act_tag = " ◀ ACTIF" if c_active else ""
+        is_best = (key == best_key)
+        best_tag= " 🏆" if is_best else ""
+        lines.append(
+            f"**#{rank}{best_tag}{act_tag}** {cname} | wx={wx} | B={b}"
+        )
+        lines.append(
+            f"   {cdisp}"
+        )
+        lines.append(
+            f"   ✅{val['wins']} gagnés | ❌{val['losses']} perdus | "
+            f"Score: **{val['score']:+d}** | {val['total']} prédictions"
+        )
+        if val.get('c2_conf_wins', 0) + val.get('c2_conf_losses', 0) > 0:
+            lines.append(
+                f"   📊 C2 confirme : ✅{val['c2_conf_wins']} / ❌{val['c2_conf_losses']}"
+            )
+        lines.append("")
+
+    if not show_all and len(sorted_entries) > 10:
+        lines.append(f"_... et {len(sorted_entries) - 10} autres. Tape `/raison2 tout` pour tout voir._")
+
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    if rec_num:
+        lines.append(f"💡 **Recommandation : Oui {rec_num}**")
+        lines.append(f"   {rec_reason}")
+    lines.append("")
+    lines.append("_Lance `/strategie` pour actualiser._")
+    lines.append("_Détail par miroir : `/raison2 P1` `/raison2 P2` `/raison2 P3`_")
+
     await event.respond("\n".join(lines), parse_mode='markdown')
 
 
@@ -8589,7 +9170,8 @@ async def handle_callback(event):
             dist = f"`{DISTRIBUTION_CHANNEL_ID}`" if DISTRIBUTION_CHANNEL_ID else "❌ inactif"
             c2ch = f"`{COMPTEUR2_CHANNEL_ID}`"    if COMPTEUR2_CHANNEL_ID    else "❌ inactif"
             txt  = (f"📡 **CONFIGURATION DES CANAUX**\n\n"
-                    f"📤 Principal   : `{PREDICTION_CHANNEL_ID}`\n"
+                    f"📤 Canal 1     : `{PREDICTION_CHANNEL_ID}`\n"
+                    f"📤 Canal 2     : `{PREDICTION_CHANNEL_ID2}`\n"
                     f"🎯 Distribution : {dist}\n"
                     f"📊 Compteur2   : {c2ch}")
             await event.answer()
@@ -8840,7 +9422,8 @@ def setup_handlers():
     client.add_event_handler(cmd_resetdb,   events.NewMessage(pattern=r'^/resetdb'))
     client.add_event_handler(cmd_debloquer, events.NewMessage(pattern=r'^/debloquer$'))
     client.add_event_handler(cmd_help,      events.NewMessage(pattern=r'^/help$'))
-    client.add_event_handler(cmd_raison,    events.NewMessage(pattern=r'^/raison'))
+    client.add_event_handler(cmd_raison,    events.NewMessage(pattern=r'^/raison(?!2)'))
+    client.add_event_handler(cmd_raison2,   events.NewMessage(pattern=r'^/raison2'))
     client.add_event_handler(cmd_perdus,    events.NewMessage(pattern=r'^/perdus$'))
     client.add_event_handler(cmd_bilan,     events.NewMessage(pattern=r'^/bilan'))
     client.add_event_handler(cmd_b,         events.NewMessage(pattern=r'^/b($|\s)'))

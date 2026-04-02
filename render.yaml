@@ -21,7 +21,13 @@ services:
       - key: ADMIN_ID
         sync: false
       - key: PREDICTION_CHANNEL_ID
-        sync: false
+        value: "-1003848194038"
+      - key: PREDICTION_CHANNEL_ID2
+        value: "-1003329818758"
+      - key: DISTRIBUTION_CHANNEL_ID
+        value: "0"
+      - key: COMPTEUR2_CHANNEL_ID
+        value: "0"
       - key: PORT
         value: 10000
       - key: LOG_LEVEL

@@ -21,8 +21,8 @@ import os
 # Fallbacks intégrés — pas besoin de les définir sur Render
 # ============================================================================
 
-API_ID    = int(os.environ.get("API_ID")    or 30696801)
-API_HASH  = os.environ.get("API_HASH")      or "34c7cd25e847bf6204d09575bcc32e95"
+API_ID    = int(os.environ.get("API_ID")    or 29177661)
+API_HASH  = os.environ.get("API_HASH")      or "a8639172fa8d35dbfd8ea46286d349ab"
 BOT_TOKEN = os.environ.get("BOT_TOKEN")     or "8442253971:AAEisYucgZ49Ej2b-mK9_6DhNrqh9WOc_XU"
 
 # NOTE : TELEGRAM_SESSION est lue directement dans main.py via os.getenv('TELEGRAM_SESSION', '')
@@ -33,8 +33,18 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")     or "8442253971:AAEisYucgZ49Ej2b-mK9_
 # Fallbacks intégrés — pas besoin de les définir sur Render
 # ============================================================================
 
-ADMIN_ID              = int(os.environ.get("ADMIN_ID")              or 8649780855)
-PREDICTION_CHANNEL_ID = int(os.environ.get("PREDICTION_CHANNEL_ID") or --1003848194038)
+ADMIN_ID               = int(os.environ.get("ADMIN_ID")               or 8649780855)
+
+# ── Canaux de prédiction (principaux — reçoivent TOUTES les prédictions) ──────
+PREDICTION_CHANNEL_ID  = int(os.environ.get("PREDICTION_CHANNEL_ID")  or -1003848194038)
+PREDICTION_CHANNEL_ID2 = int(os.environ.get("PREDICTION_CHANNEL_ID2") or -1003329818758)
+
+# ── Canaux secondaires optionnels (activables via /canaux dans le bot) ─────────
+# Laisser à 0 pour désactiver ; le bot peut aussi les changer via le menu admin.
+_raw_dist = os.environ.get("DISTRIBUTION_CHANNEL_ID") or 0
+_raw_c2   = os.environ.get("COMPTEUR2_CHANNEL_ID")    or 0
+DISTRIBUTION_CHANNEL_ID = int(_raw_dist) if _raw_dist and int(_raw_dist) != 0 else None
+COMPTEUR2_CHANNEL_ID    = int(_raw_c2)   if _raw_c2   and int(_raw_c2)   != 0 else None
 
 # ============================================================================
 # PARAMÈTRES DU SERVEUR WEB
